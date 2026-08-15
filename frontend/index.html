@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SessionAtlas</title>
+  <!-- Set data-theme on <html> synchronously, BEFORE styles.css paints, so the
+       stored/system theme is correct on the first frame (no dark flash when
+       the user has chosen light, and no light flash when they haven't).
+       External file (not inline) so the app's script-src CSP can stay strict
+       'self'-only rather than allowing 'unsafe-inline'. -->
+  <script src="theme-init.js"></script>
+  <script src="lang-init.js"></script>
+  <link rel="stylesheet" href="vendor/xterm.css" />
+  <script src="vendor/highlight.min.js"></script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- film grain atmosphere (uniform noise; no color gradient) -->
+  <div class="grain" aria-hidden="true"></div>
+
+  <div class="console">
+
+    <!-- ───────── CONTROL DECK ───────── -->
+    <section class="deck">
+      <div class="deck__top">
+        <div class="brand" aria-label="SessionAtlas">
+          <span class="brand__mark" aria-hidden="true">&gt;_</span>
+          <span class="brand__copy">
+            <strong class="brand__name">SessionAtlas</strong>
+            <span class="brand__subtitle" data-i18n="brand.subtitle">AI CLI project workspace</span>
+          </span>
+        </div>
+
+        <div class="search">
+          <span class="search__prompt" aria-hidden="true">⌕</span>
+          <input id="searchInput" class="search__input" type="text" autocomplete="off" spellcheck="false"
+                 data-i18n-placeholder="search.placeholder" />
+          <kbd class="search__kbd">Ctrl K</kbd>
+          <button id="scanBtn" class="scan-btn" data-i18n-title="search.rescan">
+            <span class="scan-btn__dot"></span><span data-i18n="search.rescanLabel">RESCAN</span>
+          </button>
+          <button id="settingsBtn" class="scan-btn scan-btn--ghost" data-i18n-title="search.settingsTitle" data-i18n-aria="search.settingsAria">
+            <span class="scan-btn__dot scan-btn__dot--ember"></span><span data-i18n="search.settingsLabel">SETTINGS</span>
+          </button>
+          <button id="themeBtn" class="scan-btn scan-btn--ghost scan-btn--icon"
+                  data-i18n-aria="search.themeAria">
+            <!-- icon injected by JS based on current theme -->
+          </button>
+        </div>
+      </div>
+
+      <div class="deck__filters">
+        <div class="filter-cluster">
+          <span class="filter-cluster__label" data-i18n="filter.toolsLabel">Tools</span>
+          <nav class="filters" id="filters" data-i18n-aria="filter.byInstrument">
+            <button class="chip is-active" data-tool="all" data-i18n="filter.all">ALL</button>
+            <!-- additional chips injected from the index via list_tools -->
+          </nav>
+        </div>
+        <div class="filter-cluster filter-cluster--recency">
+          <span class="filter-cluster__label" data-i18n="filter.recencyLabel">Activity</span>
+          <nav class="filters filters--recency" id="recencyFilters" data-i18n-aria="filter.byRecency">
+            <button class="chip is-active" data-recency="all" data-i18n="filter.recencyAll">all</button>
+            <button class="chip" data-recency="24h" data-i18n="filter.recency24h">24h</button>
+            <button class="chip" data-recency="7d" data-i18n="filter.recency7d">7d</button>
+            <button class="chip" data-recency="30d" data-i18n="filter.recency30d">30d</button>
+          </nav>
+        </div>
+      </div>
+
+      <!-- Indeterminate scan progress bar (shown only while a rescan runs).
+           Kept inside .deck so it pins to its bottom edge. -->
+      <div class="deck__progress" id="scanProgress" hidden>
+        <div class="deck__progress__bar"></div>
+      </div>
+    </section>
+
+    <!-- ───────── MAIN: PROJECTS + OVERVIEW + TERMINAL ───────── -->
+    <main class="stage">
+      <section class="stage__left">
+        <div class="stage__left__view" data-view="ledger">
+          <div class="ledger__count" id="ledgerCount"></div>
+          <div class="ledger" id="ledger">
+            <!-- entries injected here -->
+          </div>
+        </div>
+        <div class="stage__left__view stage__left__files" data-view="files" hidden>
+          <div class="stage__left__files__head">
+            <button class="files-back-btn" id="filesBackBtn" type="button"
+                    data-i18n-title="files.backTitle" disabled>←</button>
+            <span class="stage__left__files__kicker" data-i18n="files.kicker">FILES</span>
+            <span class="stage__left__files__name" id="stageLeftFilesName">—</span>
+          </div>
+          <div class="stage__left__files__tree" id="stageLeftFilesTree">
+            <span class="docs-status" data-i18n="files.emptyProject">select a project first</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="stage__overview" data-i18n-aria="overview.aria">
+        <header class="overview__bar">
+          <span class="overview__bar-dot" aria-hidden="true"></span>
+          <span data-i18n="overview.kicker">PROJECT OVERVIEW</span>
+          <span class="overview__bar-status" data-i18n="workspace.ready">READY</span>
+        </header>
+        <div class="terms__selected-launch" id="termsSelectedLaunch">
+          <div class="overview__empty">
+            <span class="overview__empty-mark">A</span>
+            <strong data-i18n="overview.emptyTitle">Select a project</strong>
+            <span data-i18n="overview.emptyBody">Project activity and launch actions appear here.</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="stage__right">
+        <header class="workspace__head">
+          <div class="workspace__head-title">
+            <span class="workspace__head-dot" aria-hidden="true"></span>
+            <span data-i18n="workspace.terminal">TERMINAL WORKSPACE</span>
+          </div>
+          <span class="workspace__head-state" data-i18n="workspace.ready">READY</span>
+        </header>
+        <div class="terms__main">
+          <div class="terms__bar" id="termsBar">
+            <span class="terms__title" data-i18n="terms.title">SESSIONS</span>
+            <span class="terms__spacer"></span>
+            <span class="terms__count" id="termsCount">0</span>
+          </div>
+          <div class="terms__viewport" id="termsViewport">
+            <div class="terms__empty" id="termsEmpty">
+              <div class="terms__empty-glyph">⌘</div>
+              <div class="terms__empty-title" data-i18n="terms.emptyTitle">No active session</div>
+              <div class="terms__empty-body" data-i18n="terms.emptyBody">Pick a project on the left and open an instrument to start an interactive terminal here. Open several and switch between tabs.</div>
+            </div>
+            <!-- xterm containers injected here -->
+          </div>
+        </div>
+        <aside class="terms__commands" id="termsCommands" data-i18n-aria="terms.common">
+          <span class="terms__commands__title" data-i18n="terms.common">COMMON</span>
+          <!-- preset buttons injected by JS -->
+        </aside>
+      </section>
+    </main>
+
+    <!-- ───────── FOOT (brand + meta + status + keys) ───────── -->
+    <footer class="foot">
+      <div class="foot__rule"></div>
+      <div class="foot__row">
+        <div class="foot__health"><span class="foot__health-dot"></span><span data-i18n="foot.health">Healthy</span></div>
+        <div class="foot__git-inline foot__row--git" id="footGit" hidden>
+          <button class="foot__git-branch" id="footGitBranch" type="button" data-i18n-title="foot.gitBranchTitle">⎇ —</button>
+          <div class="foot__git-head" id="footGitHead"></div>
+          <div class="foot__git-remotes" id="footGitRemotes"></div>
+          <button class="foot__git-add" id="footGitAdd" hidden data-i18n="foot.addRemote">+ add remote</button>
+        </div>
+        <div class="meta-strip" id="metaStrip">
+          <div class="meta"><span class="meta__n" id="metaTools">0</span><span class="meta__l" data-i18n="foot.meta.instr">instr</span></div>
+          <div class="meta"><span class="meta__n" id="metaProjects">0</span><span class="meta__l" data-i18n="foot.meta.proj">proj</span></div>
+          <div class="meta"><span class="meta__n" id="metaSessions">0</span><span class="meta__l" data-i18n="foot.meta.sess">sess</span></div>
+          <div class="meta meta--accent"><span class="meta__n" id="metaRecent">—</span><span class="meta__l" data-i18n="foot.meta.last">last</span></div>
+          <div class="meta"><span class="meta__n meta__n--text" id="syncStamp">—</span><span class="meta__l" data-i18n="foot.meta.sync">sync</span></div>
+        </div>
+        <span class="foot__item foot__item--mid" id="footStatus" data-i18n="foot.statusIdle">idle</span>
+        <span class="foot__item foot__item--right" data-i18n="foot.keys">↑↓ nav · ⏎ open · / search · g settings · esc clear</span>
+      </div>
+    </footer>
+  </div>
+
+  <!-- ───────── ENTRY MODAL (⋯ on a project) ───────── -->
+  <div class="entry-modal" id="entryModal" hidden>
+    <div class="entry-modal__backdrop" data-entry-modal-close></div>
+    <div class="entry-modal__panel" role="dialog" aria-modal="true" aria-labelledby="entryModalTitle">
+      <header class="entry-modal__head">
+        <div class="entry-modal__title" id="entryModalTitle" data-i18n="modal.projectTitle">Project</div>
+        <button class="entry-modal__close" data-entry-modal-close data-i18n-aria="common.close">✕</button>
+      </header>
+      <div class="entry-modal__body" id="entryModalBody">
+        <!-- injected -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ───────── DOC VIEWER MODAL (markdown preview) ───────── -->
+  <div class="doc-modal" id="docModal" hidden>
+    <div class="doc-modal__backdrop" data-doc-modal-close></div>
+    <div class="doc-modal__panel" role="dialog" aria-modal="true" aria-labelledby="docModalTitle">
+      <header class="doc-modal__head">
+        <div class="doc-modal__title" id="docModalTitle" data-i18n="modal.docTitle">Doc</div>
+        <button class="doc-modal__close" data-doc-modal-close data-i18n-aria="common.close">✕</button>
+      </header>
+      <div class="doc-modal__body" id="docModalBody">
+        <!-- rendered markdown injected by JS -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ───────── SETTINGS DRAWER ───────── -->
+  <div class="drawer" id="drawer" hidden>
+    <div class="drawer__backdrop" data-drawer-close></div>
+    <aside class="drawer__panel" role="dialog" aria-labelledby="drawerTitle" aria-modal="true">
+      <header class="drawer__head">
+        <button class="drawer__back" id="drawerBackBtn" data-settings-view="menu" data-i18n-aria="drawer.backAria" data-i18n-title="drawer.backTitle" hidden>←</button>
+        <span class="drawer__kicker" data-i18n="drawer.kickerMenu">Console</span>
+        <h2 class="drawer__title" id="drawerTitle" data-i18n="drawer.titleMenu">Settings</h2>
+        <button class="drawer__close" data-drawer-close data-i18n-aria="common.close">✕</button>
+      </header>
+      <div class="drawer__body" id="drawerBody">
+        <!-- group rows + opener rows + their add-forms injected here -->
+      </div>
+    </aside>
+  </div>
+
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/xterm-addon-web-links.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+# ── Rust / Tauri (SessionAtlas desktop console) ──
+src-tauri/target/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*.user
+*.suo
+
+# Local SQLite WAL/SHM files (defensive — sessionatlas writes them next to the DB)
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Node (defensive — project doesn't use npm, but if it ever does)
+node_modules/
+frontend/playwright-report/
+frontend/test-results/
+frontend/dist/
+artifacts/
+src-tauri/binaries/sessionatlas-*
+
+# Tauri-generated artifacts that we DO commit (gen/schemas/) intentionally stay tracked.
+# Cargo.lock: commit for binary apps (this is a Tauri app), so it's also intentionally tracked.
+
+# Local verification screenshots (never tracked)
+.verify/
+
+# One-time icon backup before regeneration (git history is the real backup)
+src-tauri/icons/backup_prev/
+
+# ── C# / .NET (sessionatlas CLI scanner) ──
+bin/
+obj/
+*.db
+publish/
+*.log
+*.tmp

@@ -1,0 +1,1 @@
+{"type":"user","uuid":"message-demo","timestamp":"2026-07-30T09:00:00.000Z","cwd":"{{PROJECT_PATH}}","sessionId":"session-claude-demo","version":"0.0.0-fixture","gitBranch":"main","message":{"role":"user","content":"fixture"}}

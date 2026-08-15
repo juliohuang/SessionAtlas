@@ -1,0 +1,87 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:SessionAtlas.Desktop.ViewModels"
+        xmlns:views="using:SessionAtlas.Desktop.Views"
+        x:Class="SessionAtlas.Desktop.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="SessionAtlas - AI CLI 项目工作台"
+        Width="1200"
+        Height="800"
+        MinWidth="800"
+        MinHeight="600"
+        Background="#1e1e1e">
+
+  <Design.DataContext>
+    <vm:MainWindowViewModel />
+  </Design.DataContext>
+
+  <Grid RowDefinitions="Auto,*,Auto">
+    <!-- 顶部工具栏 -->
+    <Border Grid.Row="0" Background="#2d2d2d" Padding="12,8" BorderBrush="#3a3a3a" BorderThickness="0,0,0,1">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBox Grid.Column="0"
+                 Text="{Binding SearchQuery, Mode=TwoWay}"
+                 PlaceholderText="🔍 搜索项目名称、路径..."
+                 FontSize="14"
+                 Padding="10,6"
+                 Background="#1e1e1e"
+                 Foreground="White"
+                 BorderBrush="#3a3a3a"
+                 Margin="0,0,12,0" />
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+          <Button Content="🔄 扫描" Command="{Binding ScanCommand}" Padding="12,6" Background="#0e639c" Foreground="White" />
+          <Button Content="📂 刷新" Command="{Binding SearchCommand}" Padding="12,6" Background="#3a3a3a" Foreground="White" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- 主内容区分割 -->
+    <Grid Grid.Row="1" ColumnDefinitions="420,*">
+      <!-- 左侧项目列表 -->
+      <Border Grid.Column="0" Background="#1e1e1e" BorderBrush="#3a3a3a" BorderThickness="0,0,1,0">
+        <Grid RowDefinitions="Auto,*">
+          <Border Grid.Row="0" Background="#252526" Padding="12,8" BorderBrush="#3a3a3a" BorderThickness="0,0,0,1">
+            <TextBlock Text="📁 项目列表" FontWeight="Bold" FontSize="14" Foreground="#cccccc" />
+          </Border>
+          <ScrollViewer Grid.Row="1">
+            <views:ProjectListView DataContext="{Binding}" />
+          </ScrollViewer>
+        </Grid>
+      </Border>
+
+      <!-- 右侧 Tab 区域 -->
+      <Border Grid.Column="1" Background="#1e1e1e">
+        <TabControl ItemsSource="{Binding AgentTabs}"
+                    SelectedItem="{Binding SelectedTab}"
+                    Background="Transparent"
+                    TabStripPlacement="Top">
+          <TabControl.ItemTemplate>
+            <DataTemplate x:DataType="vm:AgentSessionViewModel">
+              <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                <TextBlock Text="{Binding DisplayTitle}"
+                           FontSize="12" />
+                <Button Content="✕"
+                        Command="{Binding CloseCommand}"
+                        Padding="4,0"
+                        Background="Transparent"
+                        Foreground="#e0e0e0"
+                        FontSize="10"
+                        Margin="4,0,0,0" />
+              </StackPanel>
+            </DataTemplate>
+          </TabControl.ItemTemplate>
+          <TabControl.ContentTemplate>
+            <DataTemplate x:DataType="vm:AgentSessionViewModel">
+              <views:AgentSessionView DataContext="{Binding}" />
+            </DataTemplate>
+          </TabControl.ContentTemplate>
+        </TabControl>
+      </Border>
+    </Grid>
+
+    <!-- 底部状态栏 -->
+    <Border Grid.Row="2" Background="#007acc" Padding="12,4">
+      <TextBlock Text="{Binding StatusMessage}" FontSize="12" Foreground="White" />
+    </Border>
+  </Grid>
+</Window>

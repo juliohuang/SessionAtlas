@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a reproducible SessionAtlas defect without exposing private data.
+title: "[Bug]: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remove project names, paths, session contents, tokens, SSH details, and other private data. Do not use this form for security vulnerabilities.
+  - type: input
+    id: version
+    attributes:
+      label: SessionAtlas version
+      placeholder: 0.1.0-beta.1 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Windows desktop console
+        - CLI scanner
+        - Remote SSH
+        - Avalonia legacy reference
+        - Build or packaging
+        - Documentation
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and environment
+      placeholder: Windows 11 24H2 x64; affected AI CLI and version
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Prefer a temporary SESSIONATLAS_HOME and synthetic data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Paste short redacted logs or attach sanitized screenshots. Never attach a real database or session history.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed secrets and personal/session data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

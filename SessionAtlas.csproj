@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>SessionAtlas</RootNamespace>
+    <AssemblyName>sessionatlas</AssemblyName>
+    <Version>0.1.0</Version>
+    <Authors>SessionAtlas contributors</Authors>
+    <Description>Local-first workspace for finding and resuming AI coding sessions across multiple CLI tools.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/juliohuang/SessionAtlas</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <Copyright>Copyright © 2026 SessionAtlas contributors</Copyright>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+  </PropertyGroup>
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 排除 Desktop 子项目的源码，避免被默认 glob 编入 CLI -->
+    <Compile Remove="SessionAtlas.Desktop\**" />
+    <!-- 测试项目独立编译，避免 SDK 默认递归 glob 把测试源码编入 CLI。 -->
+    <Compile Remove="SessionAtlas.Tests\**" />
+    <Compile Remove="SessionAtlas.Desktop.Tests\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Spectre.Console" Version="0.49.1" />
+    <PackageReference Include="Spectre.Console.Cli" Version="0.49.1" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.29" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
+    <PackageReference Include="System.Text.Json" Version="8.0.6" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,2 @@
+{"timestamp":"2026-07-30T10:00:00.000Z","type":"session_meta","payload":{"id":"session-codex-demo","timestamp":"2026-07-30T10:00:00.000Z","cwd":"{{PROJECT_PATH}}","originator":"codex_cli_rs","cli_version":"0.0.0-fixture","source":"cli","model_provider":"fixture"}}
+{"timestamp":"2026-07-30T10:00:01.000Z","type":"event_msg","payload":{"type":"fixture-event"}}
