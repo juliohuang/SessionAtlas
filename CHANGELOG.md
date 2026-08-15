@@ -20,6 +20,6 @@ All notable changes to SessionAtlas will be documented here. The project follows
 - Claude task queues retain normal permission checks instead of passing a permission-bypass flag.
 - Tauri scanning invokes the bundled sidecar with structured arguments and an explicit `SESSIONATLAS_HOME`.
 
-## [0.1.0-beta.1] - Unreleased
+## [0.1.0-beta.1] - 2026-08-15
 
 First public beta candidate: unified AI CLI project scanning, search, grouping, real PTY terminals, opener preferences, and passwordless remote SSH indexing.
