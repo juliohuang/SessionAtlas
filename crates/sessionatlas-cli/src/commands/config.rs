@@ -261,19 +261,19 @@ mod tests {
 
     #[test]
     fn data_directory_expands_tilde_against_the_supplied_home() {
-        let home = PathBuf::from("C:\\Users\\test");
-        assert_eq!(resolve_data_directory("~", &home), "C:\\Users\\test");
+        let home = PathBuf::from("home").join("test");
+        assert_eq!(resolve_data_directory("~", &home), home.to_string_lossy());
         assert_eq!(
             resolve_data_directory("~/agent", &home),
-            "C:\\Users\\test\\agent"
+            home.join("agent").to_string_lossy()
         );
         assert_eq!(
             resolve_data_directory("~\\agent", &home),
-            "C:\\Users\\test\\agent"
+            home.join("agent").to_string_lossy()
         );
         assert_eq!(
             resolve_data_directory("~/a/b", &home),
-            "C:\\Users\\test\\a/b",
+            home.join("a/b").to_string_lossy(),
             "embedded separators are preserved like Path.Combine"
         );
     }
