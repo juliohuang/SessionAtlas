@@ -111,7 +111,8 @@ fn normalize_windows(candidate: &str) -> Option<String> {
             let root = format!("{drive}:\\");
             let rest = value[3..].split('\\').filter(|s| !s.is_empty()).collect();
             (root, rest)
-        } else if let Some(stripped) = value.strip_prefix("\\\\") {
+        } else {
+            let stripped = value.strip_prefix("\\\\")?;
             let parts: Vec<&str> = stripped.split('\\').filter(|s| !s.is_empty()).collect();
             if parts.len() < 2
                 || parts[0] == "."
@@ -125,8 +126,6 @@ fn normalize_windows(candidate: &str) -> Option<String> {
             let share = parts[1];
             let root = format!("\\\\{server}\\{share}");
             (root, parts[2..].to_vec())
-        } else {
-            return None;
         }
     };
 
