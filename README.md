@@ -92,7 +92,13 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 
 ## 本地开发
 
-需要 Rust stable、Node.js 22+、Tauri 2 的系统依赖。
+需要 Rust stable、Node.js 22+、Tauri 2 的系统依赖。在 Ubuntu/Debian 上可先安装桌面开发库：
+
+```bash
+sudo apt-get update
+sudo apt-get install --no-install-recommends \
+  libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
+```
 
 ```bash
 # Rust CLI 与测试

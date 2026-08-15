@@ -57,6 +57,26 @@ jobs:
         run: npm run check && npm test
         working-directory: frontend
 
+  linux-desktop:
+    name: Linux desktop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev
+      - name: Update stable Rust
+        run: rustup update stable --no-self-update
+      - name: Lint desktop crate
+        run: cargo clippy -p sessionatlas-tauri --all-targets -- -D warnings
+      - name: Test desktop crate
+        run: cargo test -p sessionatlas-tauri
+
   windows-desktop:
     name: Windows desktop
     runs-on: windows-latest
