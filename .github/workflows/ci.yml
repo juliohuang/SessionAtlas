@@ -74,6 +74,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
         working-directory: frontend
+      - name: Stage frontend assets
+        run: npm run build:static
+        working-directory: frontend
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version 2.11.4 --locked
       - name: Check formatting
