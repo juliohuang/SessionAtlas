@@ -1,16 +1,16 @@
 # SessionAtlas 手工验收执行清单
 
-本清单用于 R12.4 的原生桌面验收。它不替代自动化测试，也不要求真实
+本清单用于 R14 之前的原生桌面验收。它不替代自动化测试，也不要求真实
 AI CLI、SSH 凭据或生产数据。每个场景都必须记录“通过/失败/不适用”、平台、
 版本、时间和截图或日志位置。
 
 ## 0. 前置检查
 
-1. 在仓库根目录执行 `dotnet build --nologo`、`dotnet build SessionAtlas.Desktop --nologo`。
+1. 在仓库根目录执行 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --no-fail-fast`。
 2. 在 `frontend/` 执行 `npm test`。
-3. 在 `src-tauri/` 执行 `cargo test`。
-4. 使用临时 `SESSIONATLAS_HOME`，只放测试 SQLite 数据；不要配置真实凭据。
-5. 启动待验收程序前记录 OS、WebView2、Rust/Tauri 或 Avalonia 版本。
+3. 在仓库根目录执行 `cargo tauri build` 构建候选程序。
+4. 使用临时 `SESSIONATLAS_HOME`，只放合成工具历史和可丢弃的 SQLite 数据；不要配置真实凭据。
+5. 启动待验收程序前记录 OS、WebView2、Rust 和 Tauri 版本。
 
 前置条件任何一项失败，都先记录并停止手工矩阵，不得用“看起来能用”替代。
 
@@ -28,18 +28,7 @@ AI CLI、SSH 凭据或生产数据。每个场景都必须记录“通过/失败
 | T8 | 在搜索、tool/recency 筛选后拖动组内项目 | 隐藏成员不丢失；清除筛选并重启后完整顺序一致 | 前后截图 |
 | T9 | 使一个扫描根失败，再执行批量扫描 | 单服务器旧快照保留，失败原因可见，不能报告全量成功 | 日志 |
 
-## 2. Avalonia 原生矩阵
-
-| 编号 | 操作 | 通过标准 | 证据 |
-| --- | --- | --- | --- |
-| A1 | 打开 A、B 两个终端 tab，往返切换 20 次 | 两个 PTY 都保持运行，输出不串 tab | 录屏 |
-| A2 | 只关闭 A tab | A 进程终止，B 仍可输入输出 | 截图 + 进程记录 |
-| A3 | 关闭窗口 | 所有 tab 幂等关闭，没有悬挂 PTY | 进程记录 |
-| A4 | 选择一个历史 session 并启动 | CLI 收到精确的旧 session ID，不是项目名或模糊匹配 | 脱敏日志 |
-| A5 | 快速输入两个不同搜索词并反向完成 | 只显示最后查询结果，集合更新发生在 UI dispatcher | 截图 + 日志 |
-| A6 | 使用根目录项目（`C:\`、UNC 或 Unix `/`） | 路径可写入、查回，显示非空名称 | 截图 |
-
-## 3. 记录模板
+## 2. 记录模板
 
 ```text
 日期/时间：
@@ -56,9 +45,9 @@ AI CLI、SSH 凭据或生产数据。每个场景都必须记录“通过/失败
 后续动作：
 ```
 
-## 4. 结束判定
+## 3. 结束判定
 
-- 所有适用的 T1–T9、A1–A6 均为 PASS。
+- 所有适用的 T1–T9 均为 PASS。
 - N/A 必须说明平台原因和替代自动化证据。
 - 任一失败都要记录复现步骤、保留状态和回滚动作，并回到对应工作包修复。
 - 手工矩阵完成后，将记录附加到 `docs/test-baseline.md`，再由维护者决定是否发布。

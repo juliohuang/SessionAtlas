@@ -16,7 +16,7 @@ Before launch, make an explicit keep-or-rename decision for `SessionAtlas`. An u
 
 - Make the repository public only after the final secret/history scan.
 - Set the description to: `Local-first workspace for finding and resuming projects across Claude Code, Codex, Kimi, OpenCode, and Aider.`
-- Add topics: `ai-cli`, `developer-tools`, `tauri`, `dotnet`, `rust`, `terminal`, `claude-code`, `codex`, `local-first`.
+- Add topics: `ai-cli`, `developer-tools`, `tauri`, `rust`, `terminal`, `claude-code`, `codex`, `local-first`.
 - Use `docs/images/sessionatlas-browser-demo.png` or a purpose-built 1280×640 derivative as the social preview.
 - Enable Issues and Discussions; seed a welcome/roadmap discussion.
 - Enable private vulnerability reporting, secret scanning, push protection, Dependabot alerts, dependency graph, and CodeQL.

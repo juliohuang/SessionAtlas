@@ -11,9 +11,8 @@ Describe the user-visible result and why this change is needed.
 
 List exact commands and results. Mark failures, skips, and unverified behavior explicitly.
 
-- [ ] C# build/tests
+- [ ] Rust fmt/clippy/tests (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`)
 - [ ] Frontend syntax/unit/browser tests
-- [ ] Rust fmt/clippy/tests
 - [ ] Native or packaging checks when affected
 - [ ] User-facing Chinese and English text updated when affected
 

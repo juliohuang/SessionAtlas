@@ -22,7 +22,6 @@ body:
         - Windows desktop console
         - CLI scanner
         - Remote SSH
-        - Avalonia legacy reference
         - Build or packaging
         - Documentation
     validations:

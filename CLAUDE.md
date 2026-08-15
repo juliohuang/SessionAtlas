@@ -4,33 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`SessionAtlas` aggregates projects that have been worked on by multiple AI CLI coding tools (Claude Code, Codex, Kimi, OpenCode, Aider). The repo contains **three cooperating components** sharing one data directory (`~/.sessionatlas/`):
+`SessionAtlas` aggregates projects that have been worked on by multiple AI CLI coding tools (Claude Code, Codex, Kimi, OpenCode, Aider). The repo is a **pure Rust workspace** with two cooperating components sharing one data directory (`~/.sessionatlas/`):
 
-1. **`sessionatlas` CLI** (C# / .NET 8, repo root `*.csproj`) — the canonical scanner. Walks each AI tool's data directory, deduplicates by normalized path, and writes a unified index to `~/.sessionatlas/index.db` (SQLite + FTS5). Also launches AI CLIs in project dirs via `sessionatlas open`.
-2. **Tauri desktop console** (`src-tauri/` + `frontend/`, Rust + plain HTML/JS) — the **current primary GUI**. Reads the CLI's SQLite index, browses/searches projects, and runs interactive AI-CLI terminals in-app via PTY. This is the actively-developed frontend.
-3. **Avalonia desktop GUI** (`SessionAtlas.Desktop/`, C# / Avalonia 12) — an earlier desktop frontend that re-uses the same `Core/`/`Models/` source. Retained for reference; the Tauri console supersedes it as the main UI.
+1. **`sessionatlas` CLI** (`crates/sessionatlas-cli`, Rust) — the canonical scanner. Walks each AI tool's data directory, deduplicates by normalized path, and writes a unified index to `~/.sessionatlas/index.db` (SQLite + FTS5). Also launches AI CLIs in project dirs via `sessionatlas open`.
+2. **Tauri desktop console** (`src-tauri/` + `frontend/`, Rust + plain HTML/JS) — the **current primary GUI**. Opens the CLI's SQLite index read-only, browses/searches projects, and runs interactive AI-CLI terminals in-app via PTY. This is the actively-developed frontend.
 
-The Tauri console **does not own its data** — it opens a read-only view of the index the C# CLI maintains. If the DB is missing, every Tauri command returns *"run `sessionatlas scan` first"*.
+Both binaries link the shared `crates/sessionatlas-core` library in-process. The Tauri console **does not own its data** — it opens a read-only view of the index the CLI maintains. If the DB is missing, every Tauri command returns *"run `sessionatlas scan` first"*.
 
 **Identity contract:** the only supported identities are the `sessionatlas` CLI,
-`SessionAtlas.*` C# namespaces/project paths, Tauri crate `sessionatlas-tauri`,
+`SessionAtlas` product identifiers, Tauri crate `sessionatlas-tauri`,
 identifier `com.sessionatlas.console`, `sessionatlas.*` localStorage keys,
 `SESSIONATLAS_HOME`, and `~/.sessionatlas/`. There are no fallback aliases and
 earlier data roots are not read or migrated automatically.
 
 ## Build & run
 
-### C# CLI (`sessionatlas`) — from repo root
+### `sessionatlas` CLI — from repository root
 ```bash
-dotnet build
-dotnet run -- scan         # scan all known sources, atomically update the index
-dotnet run                 # no args → list --interactive
-dotnet publish -c Release -r win-x64 --self-contained true   # single-file publish
+cargo run -p sessionatlas-cli -- scan         # scan all tools, atomically update the index
+cargo run -p sessionatlas-cli --              # no args → list --interactive
+cargo run -p sessionatlas-cli -- --help
+cargo install --path crates/sessionatlas-cli --locked   # install to Cargo bin dir
 ```
-Target framework `net8.0`. No `.sln`; isolated xUnit tests live in
-`SessionAtlas.Tests/`.
+`cargo test -p sessionatlas-cli` runs the CLI test suite.
 
-### Tauri console — from repo root
+### Tauri console — from repository root
 ```bash
 cargo tauri dev            # run with hot frontend reload
 cargo tauri build          # distributable bundle
@@ -39,45 +37,84 @@ cd src-tauri && cargo check   # type-check Rust only (fast)
 No JS bundler — `frontend/` is plain static HTML/CSS/JS served directly.
 `frontend/package.json` only defines the Node test and syntax-check commands.
 
-### Avalonia GUI (legacy)
-```bash
-dotnet build SessionAtlas.Desktop
-dotnet run --project SessionAtlas.Desktop
-```
-
 ## Architecture
 
-### C# CLI pipeline (`scan` is the canonical example)
+### Workspace layout
 ```
-ScannerRegistry.All → each IProjectScanner.Scan() → successful ScanOutcome only
-→ ProjectIndexer.BuildIndex() → SqliteStore.ReplaceToolSnapshots()
+Cargo workspace
+├─ crates/sessionatlas-core   # shared library: model, path, scanner, indexer,
+│                             # store, config, process/security, launcher
+├─ crates/sessionatlas-cli    # `sessionatlas` executable (clap commands)
+└─ src-tauri                  # Tauri 2 app, depends on sessionatlas-core
 ```
-- **`Core/Scanner/`** — one `IProjectScanner` per AI tool; each returns a
-  structured `ScanOutcome` so a trustworthy empty snapshot is distinct from
-  unavailable or failed input. Historical sources are scanned even when their
-  CLI executable is no longer launchable. `ScannerRegistry` also loads
-  `AppConfig.CustomTools` (runtime-configured tools via `sessionatlas config
-  add-tool`, wrapped in `CustomToolScanner`).
-- **`Core/Indexer/ProjectIndexer.cs`** — dedup/merge keyed by `NormalizePath`; same project touched by multiple tools collapses into one `Project` with multiple `ToolUsage` entries. Reads `.git/HEAD` for `GitBranch`.
-- **`Core/Store/SqliteStore.cs`** — `~/.sessionatlas/index.db`. Tables: `projects`, `tool_usages`, `sessions`, plus FTS5 `projects_fts`. Schema created idempotently on construction.
-- **`Core/Config/AppConfig.cs`** — `~/.sessionatlas/config.json` (custom tools, per-path preferred tool, default terminal).
-- **`Core/Process/CommandSecurity.cs` + `Core/Launcher/CliLauncher.cs`** —
-  validate tool/session identifiers, parse only non-shell command templates,
-  keep the project path in `WorkingDirectory` or a dedicated terminal
-  argument, and launch through `ProcessStartInfo.ArgumentList`.
-- **`CLI/`** — Spectre.Console.Cli commands (`scan`, `list`, `search`, `open`, `recent`, `config`) registered in `Program.cs`. `EscapeMarkup` user strings before rendering in Spectre tables.
+The core crate has no dependency on Tauri, the frontend, or CLI display
+libraries. CLI and Tauri are I/O adapters over the same core.
 
-The two C# apps (CLI + Avalonia Desktop) share `Core/`/`Models/` via `<Compile Include>` globs, **not** a project reference — there is no `.sln`. Any change to `Core/`/`Models/` compiles into both. Do **not** add CLI-only (Spectre) or Desktop-only (Avalonia) dependencies into `Core/`/`Models/`; keep those layers dependency-free.
+### `sessionatlas-core` (`crates/sessionatlas-core`)
+- **`src/model.rs`** — `Project`, `ToolUsage`, `Session`, `ToolSource`; identity and defaults.
+- **`src/path.rs`** — path normalization, root-path display, and same-or-child
+  parent/child semantics (Windows case-insensitive, Unix byte-sensitive).
+- **`src/scanner/`** — one `Scanner` per AI tool (`claude`, `codex`, `kimi`,
+  `opencode`, `aider`) plus a runtime-configured `custom` scanner; `base.rs`
+  holds the shared driver, `parsing.rs` the shared time/record parsers. A
+  structured `ScanOutcome` keeps a trustworthy empty snapshot distinct from
+  unavailable or failed input.
+- **`src/indexer.rs`** — dedup/merge keyed by normalized path; same project
+  touched by multiple tools collapses into one `Project` with multiple
+  `ToolUsage` entries. Reads `.git/HEAD` for `GitBranch`.
+- **`src/store.rs`** — `~/.sessionatlas/index.db`. Tables: `projects`,
+  `tool_usages`, `sessions`, plus FTS5 `projects_fts`. Snapshot replacement,
+  orphan cleanup, activity-time recomputation, and FTS rebuild happen in one
+  SQLite transaction. Schema created/migrated idempotently.
+- **`src/config.rs`** — `~/.sessionatlas/config.json` (custom tools, per-path
+  preferred tool, default terminal) with case-insensitive reads, a bounded
+  cross-process lock, fingerprint conflict detection, and atomic replacement.
+- **`src/process.rs`** — injectable process runner for git, SSH, and browser
+  launch; keeps every external invocation as an argument array.
+- **`src/security.rs`** — validation/quoting for tool/session IDs, SSH,
+  remote paths, URLs, and opener templates.
+- **`src/launcher.rs`** — builds `<tool>{sessionId}` command lines and opens a
+  platform terminal for `open`.
+
+### `sessionatlas-cli` (`crates/sessionatlas-cli`)
+Clap commands (`scan`, `list`, `search`, `recent`, `open`, `config`, `tools`)
+in `src/commands/`; rendering and safe selection in `src/render.rs` /
+`src/select.rs`. User strings are rendered as plain text, never markup.
 
 ### Tauri console (`src-tauri/src/lib.rs` + `frontend/`)
 
-**Data source**: opens the CLI's `~/.sessionatlas/index.db` read-only (see `db_path()`). Expected tables: `projects`, `tool_usages`, `projects_fts` (FTS5). `scan_projects` shells out to `sessionatlas scan`, then returns `COUNT(*)` — the console only refreshes its view of an index the CLI maintains.
+**Data source**: opens the CLI's `~/.sessionatlas/index.db` read-only (see
+`db_path()`); expected tables `projects`, `tool_usages`, `projects_fts` (FTS5).
+`scan_projects` invokes the `sessionatlas-core` scan pipeline **in-process** on
+`spawn_blocking` — it does not spawn a sidecar or subprocess — then returns
+`COUNT(*)`. CLI and Tauri share the same `index.db`; reads are read-only and
+successful scans replace snapshots atomically.
 
-**Tauri commands**: registered in `run()`'s `generate_handler!`. Structs use `#[serde(rename = "camelCase")]` so Rust snake_case arrives in JS as `lastAccessedAt` etc. — keep this mapping when adding fields. Notable commands: `list_projects`, `search_projects` (FTS5 `MATCH`), `list_tools`, `scan_projects`, `pty_spawn`/`pty_attach`/`pty_write`/`pty_resize`/`pty_kill`, the remote-SSH set (`test_remote_connection`/`add_remote_server`/`scan_remote_server`), opener prefs, groups, git info, and the tray-sync commands.
+**Tauri commands**: registered in `run()`'s `generate_handler!`. Structs use
+`#[serde(rename = "camelCase")]` so Rust snake_case arrives in JS as
+`lastAccessedAt` etc. — keep this mapping when adding fields. Notable commands:
+`list_projects`, `search_projects` (FTS5 `MATCH`), `list_tools`,
+`scan_projects`, `pty_spawn`/`pty_attach`/`pty_write`/`pty_resize`/`pty_kill`,
+the remote-SSH set (`test_remote_connection`/`add_remote_server`/`scan_remote_server`),
+opener prefs, groups, git info, and the tray-sync commands.
 
-**In-app terminals (PTY)**: the right pane hosts multiple interactive terminal tabs, one PTY each. `pty_spawn` creates and registers an unattached pseudo-terminal; after the frontend has registered its tab, `pty_attach` receives structured `toolKey` / `sessionId` metadata. Rust validates and converts it to the optional tool command exactly once, then starts the output reader. Natural exit, read failure, explicit close, and app exit all remove the registry entry and reap the child. The registry uses a short map lock plus separate reader/writer/resize/child locks. xterm.js + addon-fit are **vendored locally** in `frontend/vendor/` — do NOT switch to a CDN.
+**In-app terminals (PTY)**: the right pane hosts multiple interactive terminal
+tabs, one PTY each. `pty_spawn` creates and registers an unattached
+pseudo-terminal; after the frontend has registered its tab, `pty_attach`
+receives structured `toolKey` / `sessionId` metadata. Rust validates and
+converts it to the optional tool command exactly once, then starts the output
+reader. Natural exit, read failure, explicit close, and app exit all remove the
+registry entry and reap the child. The registry uses a short map lock plus
+separate reader/writer/resize/child locks. xterm.js + addon-fit are **vendored
+locally** in `frontend/vendor/` — do NOT switch to a CDN.
 
-**Remote SSH**: servers are added via the Settings drawer; `test_remote_connection` pre-checks passwordless (key/agent) login *before* persisting, and `classify_ssh_failure` turns ssh errors into actionable bilingual hints. `BatchMode=yes` is enforced everywhere (pure passwordless). User/host values reject option and shell syntax, `--` terminates SSH options, identity files are canonical absolute regular files, and remote paths use lossless POSIX quoting.
+**Remote SSH**: servers are added via the Settings drawer;
+`test_remote_connection` pre-checks passwordless (key/agent) login *before*
+persisting, and `classify_ssh_failure` turns ssh errors into actionable
+bilingual hints. `BatchMode=yes` is enforced everywhere (pure passwordless).
+User/host values reject option and shell syntax, `--` terminates SSH options,
+identity files are canonical absolute regular files, and remote paths use
+lossless POSIX quoting.
 
 **Execution boundary**: `src-tauri/src/security.rs` owns validation and quoting
 for PTY metadata, SSH, remote paths, URLs, and custom opener templates. Prefer
@@ -100,6 +137,7 @@ is in `docs/execution-security-contract.md`.
 
 - Data dir for all components: `~/.sessionatlas/` (`index.db`, `config.json`, `prefs.db`). `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
 - Tool keys are lowercase short strings (`claude`, `codex`, `kimi`, `opencode`, `aider`) — keep consistent across CLI scanners, launcher templates, config, and the Tauri `TOOL_COLOR`/`TOOL_DOT` maps.
-- C#: Nullable reference types enabled. Implicit usings enabled in both csprojs (shared Core/Models files rely on them).
+- Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` must stay green; use `#![deny(...)]`/strict clippy where the code already does.
 - Tauri frontend: keyboard is first-class (`/` search, `Esc` clear, `↑↓` nav, `Enter` launch) — don't break these. Match existing CSS tokens in `styles.css` rather than introducing new design primitives.
-- `DESIGN.md` holds the original C# design (tool matrix, TUI mockups, roadmap); this file is the shorter engineering reference.
+- `DESIGN.md` holds the current Rust architecture/data-flow/security design; this file is the shorter engineering reference.
+- Migration from the retired implementation is recorded in `docs/rust-migration-plan.md`; it is the only document that may retain retired stack references.

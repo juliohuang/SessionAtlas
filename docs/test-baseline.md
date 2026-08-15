@@ -1,7 +1,10 @@
 # SessionAtlas test baseline
 
 This baseline exists so scanner, index, remote, and launcher fixes can be made
-without reading real user data or starting real external programs.
+without reading real user data or starting real external programs. It
+**distinguishes verified local automation from unverified manual/live gates**;
+evidence is recorded with the exact command that produced it, and nothing is
+invented that was not actually rerun.
 
 The supported identity is consistently `SessionAtlas` / `sessionatlas` across
 product, code, packaging and persistence. No legacy aliases are exercised by
@@ -9,17 +12,16 @@ the tests, and earlier data roots are not read or migrated automatically.
 
 ## Isolation guarantees
 
-- C# scanner tests set `SESSIONATLAS_HOME` to a unique temporary directory.
-- `SqliteStore` accepts an explicit database path; tests place it under a
-  unique temporary directory with connection pooling disabled.
-- Tests never call the parameterless `SqliteStore` constructor.
+- Rust scanner tests set `SESSIONATLAS_HOME` to a unique temporary directory.
+- `Store` accepts an explicit database path; tests place it under a unique
+  temporary directory with connection pooling disabled.
+- Tests never read or mutate the real `~/.sessionatlas/`.
 - Fixture paths, IDs, timestamps, versions, and content are invented.
 - Frontend tests import `frontend/core.js`, which has no DOM, Tauri, storage,
   or network access.
-- External commands cross an injectable boundary:
-  - C#: `IProcessRunner` covers command discovery and terminal launching.
-  - Rust: `ProcessRunner` covers git reads, SSH command execution, and browser
-    launching. Tests use a recording runner.
+- External commands cross an injectable boundary: `ProcessRunner` covers git
+  reads, SSH command execution, and browser launching. Tests use a recording
+  runner.
 - PTY tests do not start an interactive shell. The session-runtime suite
   exercises the registry, lifecycle primitives, size/input bounds, and
   streaming UTF-8 decoder without touching the user's terminal.
@@ -42,37 +44,102 @@ Fixtures deliberately describe the current formats even when a production
 scanner does not support that format yet. Parser behavior for those fixtures
 is added in the scanner-repair phase.
 
-## Test commands
+## Test commands (current Rust + frontend)
 
 From the repository root:
 
 ```powershell
-dotnet test SessionAtlas.Tests\SessionAtlas.Tests.csproj --nologo
-Push-Location frontend
-npm test
-npm run check
-Pop-Location
-Push-Location src-tauri
-cargo test
-Pop-Location
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+npm --prefix frontend run check
+npm --prefix frontend test
+git diff --check
 ```
 
-Expected baseline:
+Focused suites:
 
-- C#: 44 tests
-- Frontend: 7 tests
-- Rust: 20 tests
-- No skipped tests
+```powershell
+cargo test -p sessionatlas-core       # model/path/scanner/indexer/store/config/security/launcher/process contracts
+cargo test -p sessionatlas-cli        # read-only, scan/config, and open command tests
+cargo test -p sessionatlas-tauri      # Tauri read-only index, in-process scan, PTY/registry, SSH validation
+```
 
-## Contracts protected now
+## Verified local automation (pre-R13 / R13)
 
-- ProjectIndexer merges tool observations, counts distinct native session IDs,
-  and keeps the session ID belonging to the latest activity.
+Counts are the proven local results recorded before R13 and confirmed again by
+the R13 verification reruns; they are not reruns of installer-build or
+browser-test steps, which are left to R14:
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p sessionatlas-cli` | 96 passed, 0 failed/ignored |
+| `cargo test -p sessionatlas-core` | 238 passed across its test binaries, 0 failed/ignored |
+| `cargo test -p sessionatlas-tauri` | 60 passed, 0 failed/ignored |
+| Rust total | 394 passed, 0 failed/ignored |
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | passed |
+| frontend syntax check (`npm --prefix frontend run check`) | passed |
+| R12 isolated Rust CLI scan | isolated `SESSIONATLAS_HOME`; `cargo run -p sessionatlas-cli -- scan` indexed 2 synthetic projects and exited 0, creating only `index.db` with no database sidecars |
+| `git diff --check` | passed; only Windows LF→CRLF notices |
+
+The R13 isolation scan used a unique temporary `SESSIONATLAS_HOME`, did not
+launch an AI CLI or SSH process, and the temporary directory was removed after
+checking its resolved path. Trackable-file audit found no database, `.env`,
+test-report, or generated config-temp file.
+
+## Verified local automation (R14, 2026-08-15, Windows x64)
+
+R14 reran every locally available command listed below on the current tree.
+Evidence is from the commands actually executed; nothing is reused from earlier
+phases. The unavailable local dependency audit is listed separately below.
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | passed (exit 0) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | passed (exit 0) |
+| `cargo test --workspace --no-fail-fast` | 394 passed, 0 failed/ignored (exit 0) |
+| `npm --prefix frontend run check` | passed (exit 0) |
+| `npm --prefix frontend test` | 16 unit + 24 Playwright browser tests passed (exit 0) |
+| `cargo tauri build --ci` | passed (exit 0); MSI + NSIS produced |
+| `cargo build --locked -p sessionatlas-cli --release` | passed (exit 0) |
+| isolated acceptance on the release CLI | passed (exit 0); `index.db` 86016 bytes, `list` 2 projects, `search` shows UTC `2026-08-15 01:00`/`02:00` |
+| `git diff --check` | passed (only Windows LF→CRLF notices) |
+
+Release CLI isolation evidence (unique root under the repository's git-ignored
+`.verify/`, removed after recording):
+
+- Scanner exited 0; `index.db` created (86016 bytes), persisted both synthetic
+  session IDs, and left no `-journal`/`-wal`/`-shm` sidecars.
+- `sessionatlas list` returned exactly 2 rows containing `atlas-alpha` and `atlas-beta`.
+- `sessionatlas search atlas` printed both projects with absolute UTC times
+  `2026-08-15 01:00` and `2026-08-15 02:00`.
+- `fixture-manifest.json` (schemaVersion 2) recorded both synthetic project
+  paths, both session IDs (`acceptance-alpha`, `acceptance-beta`) and both UTC
+  timestamps, plus SHA-256 of every file.
+
+The acceptance fixture was enhanced for R14: it now reads the index back through
+the same release binary (`list` for the project count, `search` for the UTC
+times), verifies both session-ID markers in the newly created database, and
+records the seeded projects/IDs/timestamps in the manifest. It stays
+PowerShell 5 compatible, uses no `sqlite3`/Python, starts no real AI CLI or SSH
+process, and verifies without any new user-facing CLI command.
+
+The workflow gap was closed: `release.yml` now installs Playwright Chromium
+before `npm test`, and both `ci.yml` (windows-desktop) and `release.yml` build
+`cargo build --locked -p sessionatlas-cli --release` explicitly and pass
+`target/release/sessionatlas.exe` to the acceptance script instead of relying on
+`cargo tauri build` to produce the CLI implicitly.
+
+### Contracts protected now
+
+- `ProjectIndexer` merges tool observations, counts distinct native session
+  IDs, and keeps the session ID belonging to the latest activity.
 - A database can be created and disposed entirely under a temporary root.
-- Scanner home resolution can be redirected without changing the process'
-  real user profile.
-- Fixtures match the sanitized format outlines and contain no current user
-  home path.
+- Scanner home resolution can be redirected without changing the process' real
+  user profile.
+- Fixtures match the sanitized format outlines and contain no current user home
+  path.
 - Frontend filtering, grouping, ordering, and structured PTY attach metadata
   are exercised as pure functions.
 - Frontend terminal deduplication distinguishes live/dead tabs and coalesces
@@ -100,173 +167,29 @@ The terminal lifecycle and failure behavior live in
 External process and untrusted-input rules live in
 [`execution-security-contract.md`](./execution-security-contract.md).
 
-## Final repair acceptance — 2026-08-03
+## Unverified manual/live gates (remaining)
 
-Host evidence was collected on Windows with .NET SDK 10.0.302 targeting
-net8.0, Node 24.15.0/npm 11.12.1, and Rust 1.95.0. The frontend rows were
-refreshed on 2026-08-14 after the three-column workspace UI update; the other
-rows retain their 2026-08-03 evidence date.
+These are **not** claimed to have passed by local automation. They remain
+release gates and must be executed before release:
 
-| Gate | Result |
-| --- | --- |
-| `dotnet test SessionAtlas.Tests\SessionAtlas.Tests.csproj --nologo` | 89 passed, 0 failed, 0 skipped |
-| `dotnet test SessionAtlas.Desktop.Tests\SessionAtlas.Desktop.Tests.csproj --nologo` | 7 passed, 0 failed, 0 skipped |
-| CLI build | succeeded, 0 warnings, 0 errors |
-| legacy Desktop build | succeeded, 0 warnings, 0 errors |
-| `npm ci` | succeeded from lockfile |
-| frontend syntax check | succeeded |
-| frontend unit tests | 16 passed, 0 failed/skipped |
-| Playwright Chromium | 24 passed, 0 failed/skipped |
-| `cargo fmt -- --check` | succeeded |
-| `cargo clippy --all-targets -- -D warnings` | succeeded |
-| Rust tests | 48 passed, 0 failed/skipped |
-| `git diff --check` | succeeded; only Windows LF→CRLF notices |
+- Real-user read-only scan of actually installed Claude/Codex/Kimi/OpenCode/
+  Aider data directories with project/session counts checked against the tool.
+- Cross-platform real terminal launch of `sessionatlas open` (Windows
+  Terminal/cmd, macOS Terminal, and at least one Linux terminal).
+- Native Tauri interaction matrix T1–T9 (rapid A/B switching, docs/files close
+  races, remote partial failure, group reorder, terminal link activation, and
+  settings write-failure state) — recorded in
+  [`manual-acceptance-checklist.md`](./manual-acceptance-checklist.md).
+- Windows/Ubuntu hosted CI on the current commit (including the hosted Security
+  workflow). Local R14 does not substitute for a hosted runner; RI-04 stays
+  BLOCKED until such evidence exists on a shared commit.
+- `cargo audit` rerun: R14 local did **not** rerun it (the tool is not installed
+  locally and was not installed per the R14 boundary). The hosted Security
+  workflow still pins `cargo-audit 0.22.2` and runs `cargo audit`; it remains a
+  release gate. RI-05's earlier scan evidence is historical, not R14 evidence.
+- Install in a sandbox without any extra language runtime and first scan.
 
-The 2026-08-14 frontend refresh added one Playwright regression covering the
-persistent project overview, selection updates, tool-activity and latest-session
-rows, the single-row status bar, terminal workspace region, and browser-demo
-launch fallback. The focused case passed
-`1/1`; the component suites then passed frontend unit `16/16` and Playwright
-Chromium `24/24`. Browser sample-mode screenshots are visual evidence only and
-do not close the native Tauri interaction matrix.
-
-The isolated integration used a unique temporary `SESSIONATLAS_HOME`. `sessionatlas
-scan` exited 0, created only `.sessionatlas/index.db`, produced no database
-sidecars, and did not launch an AI CLI or SSH process. The temporary directory
-was removed after its resolved path and prefix were checked.
-
-Trackable-file audit found no database, sidecar, `.env`, Playwright report,
-test-result, or generated config-temp file. A focused private-key/AWS/OpenAI
-token pattern scan found no matches.
-
-Known non-blocking warnings:
-
-- Playwright reports that `NO_COLOR` is ignored because `FORCE_COLOR` is set by
-  the environment; tests are unaffected.
-- MSVC prints import-library creation text during Rust test and release links;
-  Rust exposes it as a `linker_messages` warning. Strict clippy still passes
-  with `-D warnings`, so this is toolchain output rather than a source lint.
-- `cargo audit 0.22.2` reports zero vulnerabilities and 17 allowed upstream
-  maintenance/unsoundness warnings. Their exact reachability and upgrade
-  boundary are recorded in `execution-security-contract.md`.
-
-Hosted CI evidence and remaining native release checks:
-
-- PASS: GitHub Actions
-  [`path-semantics` run 31812198177](https://github.com/juliohuang/SessionAtlas/actions/runs/31812198177)
-  ran against exact commit `f2ce07c6245c0ee8fbf31bd84d9b9312beafb99c`.
-  `windows-latest` job `94805258666` and `ubuntu-latest` job `94805258752`
-  each passed 39/39 focused tests with 0 failed and 0 skipped; CLI and Desktop
-  builds succeeded on both runners with 0 warnings and 0 errors.
-- The earlier `mcr.microsoft.com/dotnet/sdk:8.0` run remains supplemental local
-  Linux evidence: 39 focused tests and both builds passed. It is no longer being
-  used as a substitute for hosted CI.
-- A native Tauri smoke run was completed with an empty index (startup,
-  malicious-search text safety, Escape clearing, and settings open/close).
-  The remaining Tauri interaction matrix and the Avalonia visual/manual matrix
-  still require interactive desktop evidence; browser/headless tests do not
-  replace that final acceptance.
-- `cargo tauri info` and `cargo tauri build` passed locally after installing
-  Tauri CLI 2.11.4. The build produced the release EXE, MSI, and NSIS installer;
-  the native smoke ran against the rebuilt EXE, while the full interaction
-  matrix remains open.
-
-The 2026-08-03 release-candidate artifacts predate the full identity migration.
-Their checksums are intentionally omitted from the current release table; they
-must not be presented as evidence for the renamed executable or installers.
-
-Native Tauri smoke evidence (2026-08-09, Windows 10/WebView2) predates the full
-identity migration. That build displayed the empty-index error without starting
-an AI CLI or SSH process, rendered malicious search input as text, and after
-Escape cleared both the query and the previous “matches” count. Settings
-drawer open/close also completed. The window was closed and the exact release
-process was terminated after the check; no user index was created.
-
-Avalonia startup follow-up (2026-08-09): the initial attempt exposed a startup
-deadlock risk in `MainWindowViewModel.LoadProjects`; it synchronously waited on
-the UI dispatcher during framework initialization. The implementation now
-publishes initial data directly on the initialization thread and uses
-`ConfigureAwait(false)` in the service query path, with regression test
-`InitialLoadPublishesOnTheCurrentUiThreadWithoutDispatcherWait`. A controlled
-launch produced a responsive window handle (`264098`) under the then-current
-identity; Desktop tests were 7/7 and the build was
-warning-free. A later window enumeration captured the real Avalonia window and
-its accessibility tree (search box, scan/refresh buttons, project list and
-close button). Both mouse and keyboard actions were then attempted, but the
-desktop-control layer returned `GetCursorPos` access denied; therefore search,
-tab and close behavior are not claimed as passed. Each test-created `index.db`
-was moved to five recoverable backups under the predecessor data root. At the
-start of the full identity migration, read-only snapshots found neither the
-supported nor predecessor data root; no database was deleted or moved.
-
-## SessionAtlas full-identity migration verification (2026-08-14)
-
-Status: **PASS**. The only supported identifiers are `sessionatlas`,
-`SessionAtlas.*`, `sessionatlas-tauri`, `com.sessionatlas.console`,
-`sessionatlas.*`, `SESSIONATLAS_HOME`, and `~/.sessionatlas/`.
-
-| Gate | Current result |
-| --- | --- |
-| C# Home/Config focused tests | 11 passed, 0 failed/skipped |
-| C# CLI correctness focused tests | 13 passed, 0 failed/skipped |
-| C# full tests | 89 passed, 0 failed/skipped |
-| Desktop tests | 7 passed, 0 failed/skipped |
-| CLI build | passed, 0 warnings/errors; output `sessionatlas.dll` |
-| Desktop build | passed, 0 warnings/errors |
-| Rust home/data-root focused tests | 5 passed, 0 failed/ignored |
-| `cargo metadata --no-deps --format-version 1` | crate and targets parsed with SessionAtlas identifiers |
-| `npm run check` | passed |
-| Playwright smoke file | 5 passed, 0 failed/skipped |
-| frontend unit tests | 16 passed, 0 failed/skipped |
-| Playwright full suite | 24 passed, 0 failed/skipped |
-| `cargo fmt -- --check` | passed |
-| Rust full tests | 54 passed, 0 failed/ignored |
-| `cargo clippy --all-targets -- -D warnings` | passed |
-| `cargo tauri build` from repository root | passed; EXE, MSI and NSIS produced |
-| tracked-text old-identity scan | 0 matches |
-| public README screenshot | 1440×900, synthetic names only; SHA-256 `F3E4696060C1D8B1C199A2A91FE51E6E54A2A749EF9E68BF1D7B48D2F05786AB` |
-| real-data snapshot before/after | identical; both data roots absent |
-
-Release artifacts from the current Windows beta build (2026-08-15):
-
-| Artifact | Size | SHA-256 |
-| --- | ---: | --- |
-| `src-tauri/target/release/sessionatlas-tauri.exe` | 8,419,840 bytes | `225F47676434D43C3D7187C4698B3CC2F4BBB757633B1380EDFFFE17EA798772` |
-| bundled `src-tauri/target/release/sessionatlas.exe` sidecar | 70,798,190 bytes | `C94DD1A31D9FD06EF58D600C623F503EF67BD1B506BB5AEDADEDF873E15CFC50` |
-| `src-tauri/target/release/bundle/msi/SessionAtlas_0.1.0_x64_en-US.msi` | 35,266,560 bytes | `0A916EA4FAAC00F85465881C4DE5517E26F41EEA0730879FD5E0DCC9A83722C5` |
-| `src-tauri/target/release/bundle/nsis/SessionAtlas_0.1.0_x64-setup.exe` | 26,360,383 bytes | `4630BDD21F75D929CEFA8A74FA69BC57FD9C013D6FE9D02E6AB163F20CBA7641` |
-
-The initial and final real-data snapshots both reported the supported and
-predecessor data roots absent. No native app, real AI CLI, SSH connection,
-credential, or production index was used. Five obsolete top-level release files
-were moved, not deleted, to the local Codex quarantine after deletion was denied
-by the safety policy. This identity migration does not close the pending native
-Tauri or Avalonia interaction matrices.
-
-## Open-source beta readiness verification (2026-08-15)
-
-| Gate | Result |
-| --- | --- |
-| C# full tests | 89 passed, 0 failed/skipped |
-| Desktop tests | 7 passed, 0 failed/skipped |
-| C# Release builds | CLI and Desktop passed, 0 warnings/errors |
-| Frontend syntax | passed, including sidecar/vendor scripts |
-| Frontend unit/browser | 16/16 and 24/24 passed, 0 skipped |
-| Rust fmt / strict clippy | passed |
-| Rust full tests | 54 passed, 0 failed/ignored |
-| Rust advisory scan | 0 vulnerabilities; 17 analyzed upstream warnings |
-| NuGet advisory scan | machine-readable audit passed for all 4 projects |
-| npm advisory scan | install-time registry audit and cached offline recheck reported 0 vulnerabilities |
-| Tauri release build | EXE, MSI and NSIS passed; both installers include `sessionatlas.exe` |
-| Bundled sidecar smoke | isolated fixture scanned 2 synthetic projects and exited 0 |
-| Runtime network boundary | Playwright observed no requests outside the local fixture server |
-| Public sample privacy | synthetic names only; legacy concept image removed |
-| Native UI interaction | BLOCKED: the unique release window launched, but Windows returned `GetCursorPos access denied` on both allowed capture attempts |
-| GitHub publication | BLOCKED: `gh` is not installed/authenticated; no commit, push, visibility, settings, tag, or release action was performed |
-
-The working tree and current content scan contain no tracked database/key/env
-filenames, no private-key/token-pattern matches, and no known private workspace
-paths. The two existing historical commits still contain the former sample and
-icon-source paths. The repository must therefore be republished from a sanitized
-root commit (or equivalently rewritten) before it is made public; a normal new
-commit does not remove those paths from Git history.
+Earlier implementation baselines are archived only in
+[`rust-migration-plan.md`](./rust-migration-plan.md). They are not part of the
+current baseline and must not be presented as evidence for the Rust-only
+release.

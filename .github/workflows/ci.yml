@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  dotnet:
-    name: .NET (${{ matrix.os }})
+  rust-core-cli:
+    name: Rust core and CLI (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -24,18 +24,10 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up .NET
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
-        with:
-          dotnet-version: 8.0.x
-      - name: Test CLI and shared core
-        run: dotnet test SessionAtlas.Tests/SessionAtlas.Tests.csproj --configuration Release --nologo
-      - name: Test legacy desktop reference
-        run: dotnet test SessionAtlas.Desktop.Tests/SessionAtlas.Desktop.Tests.csproj --configuration Release --nologo
-      - name: Build CLI
-        run: dotnet build SessionAtlas.csproj --configuration Release --nologo --no-restore
-      - name: Build legacy desktop reference
-        run: dotnet build SessionAtlas.Desktop/SessionAtlas.Desktop.csproj --configuration Release --nologo --no-restore
+      - name: Update stable Rust
+        run: rustup update stable --no-self-update
+      - name: Test core and CLI crates
+        run: cargo test -p sessionatlas-core -p sessionatlas-cli
 
   frontend:
     name: Frontend
@@ -71,10 +63,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up .NET
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
-        with:
-          dotnet-version: 8.0.x
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -89,25 +77,28 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version 2.11.4 --locked
       - name: Check formatting
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+        run: cargo fmt --all -- --check
       - name: Lint Rust
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test Rust
-        run: cargo test --manifest-path src-tauri/Cargo.toml
-      - name: Build installer with bundled CLI
+        run: cargo test --workspace
+      - name: Build installer
         run: cargo tauri build --ci
-      - name: Smoke-test the bundled scanner in an isolated home
+      - name: Build release CLI
+        run: cargo build --locked -p sessionatlas-cli --release
+      - name: Smoke-test the scanner in an isolated home
         shell: pwsh
         run: |
+          $scanner = (Resolve-Path target/release/sessionatlas.exe).Path
           ./scripts/New-AcceptanceFixture.ps1 `
-            -OutputRoot (Join-Path $env:RUNNER_TEMP "sessionatlas-acceptance") `
-            -ScannerPath ./src-tauri/binaries/sessionatlas-x86_64-pc-windows-msvc.exe
+            -ScannerPath $scanner `
+            -OutputRoot (Join-Path $env:RUNNER_TEMP "sessionatlas-acceptance")
       - name: Upload installer candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sessionatlas-windows-candidate
           path: |
-            src-tauri/target/release/bundle/msi/*.msi
-            src-tauri/target/release/bundle/nsis/*-setup.exe
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
           retention-days: 7

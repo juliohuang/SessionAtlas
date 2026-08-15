@@ -11,11 +11,10 @@
 
 ![SessionAtlas 浏览器演示界面](./docs/images/sessionatlas-browser-demo.png)
 
-SessionAtlas 由三个协作组件组成：
+SessionAtlas 由两个协作组件组成：
 
 - **Windows 桌面控制台（当前主界面）**：浏览项目、全文搜索、管理分组，并在多标签 PTY 终端中继续 AI CLI 会话。
 - **`sessionatlas` CLI（规范扫描器）**：扫描各工具的本地记录，按规范化路径去重，将索引写入 `~/.sessionatlas/index.db`。
-- **Avalonia 桌面端（历史参考）**：复用 C# 核心代码，但已不作为推荐界面。
 
 > SessionAtlas 是独立的开源项目，与 `sessionatlas.nl` 及其所有者没有关联、认可或合作关系。发布前请同时评估项目名称的商标风险。
 
@@ -27,7 +26,7 @@ SessionAtlas 由三个协作组件组成：
 
 ### Windows 桌面版（Beta）
 
-从 [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest) 下载最新的 `.msi` 或 `-setup.exe`。安装包已包含 `sessionatlas` 扫描 CLI；首次启动后点击“重新扫描”即可建立索引，无需另装 .NET Runtime。
+从 [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest) 下载最新的 `.msi` 或 `-setup.exe`。扫描由桌面版在进程内完成，安装包不捆绑独立扫描器，也无需安装 .NET Runtime；首次启动后点击“重新扫描”即可建立索引。
 
 要求：
 
@@ -39,15 +38,22 @@ SessionAtlas 由三个协作组件组成：
 
 ### 从源码运行 CLI
 
-需要 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)：
+需要稳定版 Rust 工具链（Tauri 2 系统前置要求见下文“本地开发”）：
 
 ```bash
-dotnet run -- scan
-dotnet run -- list
-dotnet run -- search <query>
-dotnet run -- open [path]
-dotnet run -- recent
-dotnet run -- config
+cargo run -p sessionatlas-cli -- scan
+cargo run -p sessionatlas-cli -- list
+cargo run -p sessionatlas-cli -- search <query>
+cargo run -p sessionatlas-cli -- open [path]
+cargo run -p sessionatlas-cli -- recent
+cargo run -p sessionatlas-cli -- config
+```
+
+也可以安装到 Cargo bin 目录后直接使用 `sessionatlas`：
+
+```bash
+cargo install --path crates/sessionatlas-cli --locked
+sessionatlas scan
 ```
 
 CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布的桌面安装包仅面向 Windows x64。
@@ -86,28 +92,26 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 
 ## 本地开发
 
-需要 .NET 8、Rust stable、Node.js 20+、Tauri 2 的系统依赖。
+需要 Rust stable、Node.js 22+、Tauri 2 的系统依赖。
 
 ```bash
-# C# CLI 与测试
-dotnet build
-dotnet test SessionAtlas.Tests
+# Rust CLI 与测试
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 
 # 前端
-cd frontend
-npm ci
-npm run check
-npm test
+npm --prefix frontend ci
+npm --prefix frontend run check
+npm --prefix frontend test
 
 # Tauri
-cd ../src-tauri
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test -p sessionatlas-tauri
+cargo tauri dev
 cargo tauri build
 ```
 
-`cargo tauri dev/build` 会先为当前平台发布自包含的 C# CLI，并将它作为 Tauri sidecar 打包。测试必须使用临时 `SESSIONATLAS_HOME`，不得读取或修改真实的 `~/.sessionatlas/`。
+桌面版 `scan_projects` 通过 `spawn_blocking` 在进程内调用 `sessionatlas-core` 扫描管线，不捆绑 sidecar，也不需要 .NET Runtime。测试必须使用临时 `SESSIONATLAS_HOME`，不得读取或修改真实的 `~/.sessionatlas/`。
 
 架构说明见 [AGENTS.md](./AGENTS.md)，扫描契约见 [`docs/scan-contract.md`](./docs/scan-contract.md)，测试基线见 [`docs/test-baseline.md`](./docs/test-baseline.md)。
 

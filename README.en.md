@@ -11,11 +11,10 @@ A searchable workspace map for projects and sessions scattered across Claude Cod
 
 ![SessionAtlas browser demo](./docs/images/sessionatlas-browser-demo.png)
 
-SessionAtlas has three cooperating components:
+SessionAtlas has two cooperating components:
 
 - **Windows desktop console (the primary UI):** browse, search, and group projects, then resume AI CLI sessions in real multi-tab PTY terminals.
 - **`sessionatlas` CLI (the canonical scanner):** scans local tool histories, deduplicates normalized project paths, and writes `~/.sessionatlas/index.db`.
-- **Avalonia desktop app (legacy reference):** shares the C# core but is no longer the recommended UI.
 
 > SessionAtlas is an independent open-source project. It is not affiliated with, endorsed by, or connected to `sessionatlas.nl` or its owners. Assess trademark risk before public release.
 
@@ -27,7 +26,7 @@ SessionAtlas helps people who use several AI coding CLIs and regularly lose trac
 
 ### Windows desktop beta
 
-Download the latest `.msi` or `-setup.exe` from [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest). The installer includes the `sessionatlas` scanning CLI; click **Rescan** after first launch to build the index. No separate .NET runtime is required.
+Download the latest `.msi` or `-setup.exe` from [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest). Scanning runs in-process inside the desktop app; the installer does not bundle a separate scanner binary and no .NET runtime is required. Click **Rescan** after first launch to build the index.
 
 Requirements:
 
@@ -39,15 +38,22 @@ The first public release is a beta. Keep a copy of `~/.sessionatlas/` before upg
 
 ### Run the CLI from source
 
-Install the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0):
+Install a stable Rust toolchain (Tauri 2 system prerequisites apply; see Development below):
 
 ```bash
-dotnet run -- scan
-dotnet run -- list
-dotnet run -- search <query>
-dotnet run -- open [path]
-dotnet run -- recent
-dotnet run -- config
+cargo run -p sessionatlas-cli -- scan
+cargo run -p sessionatlas-cli -- list
+cargo run -p sessionatlas-cli -- search <query>
+cargo run -p sessionatlas-cli -- open [path]
+cargo run -p sessionatlas-cli -- recent
+cargo run -p sessionatlas-cli -- config
+```
+
+Or install it into your Cargo bin directory and run `sessionatlas` directly:
+
+```bash
+cargo install --path crates/sessionatlas-cli --locked
+sessionatlas scan
 ```
 
 The CLI source is built and tested on Windows, macOS, and Linux. Automated desktop packages currently target Windows x64 only.
@@ -86,12 +92,13 @@ The execution boundary is documented in [`docs/execution-security-contract.md`](
 
 ## Development
 
-Development requires .NET 8, stable Rust, Node.js 20+, and the Tauri 2 system prerequisites.
+Development requires stable Rust, Node.js 22+, and the Tauri 2 system prerequisites.
 
 ```bash
-# C# CLI and tests
-dotnet build
-dotnet test SessionAtlas.Tests
+# Rust CLI and tests
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 
 # Frontend
 cd frontend
@@ -101,13 +108,11 @@ npm test
 
 # Tauri
 cd ../src-tauri
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
 cargo test
 cargo tauri build
 ```
 
-`cargo tauri dev/build` publishes a self-contained C# CLI for the host platform and bundles it as a Tauri sidecar. Tests must use a temporary `SESSIONATLAS_HOME` and must not read or mutate the real `~/.sessionatlas/`.
+The desktop `scan_projects` runs the `sessionatlas-core` scan pipeline in-process via `spawn_blocking`; no sidecar is bundled and no .NET runtime is required. Tests must use a temporary `SESSIONATLAS_HOME` and must not read or mutate the real `~/.sessionatlas/`.
 
 See [AGENTS.md](./AGENTS.md) for architecture, [`docs/scan-contract.md`](./docs/scan-contract.md) for scanner semantics, and [`docs/test-baseline.md`](./docs/test-baseline.md) for the verification baseline.
 

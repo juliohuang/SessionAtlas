@@ -1,8 +1,19 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sessionatlas_core::config as core_config;
+use sessionatlas_core::indexer::{build_index, IndexedToolScan};
+use sessionatlas_core::scanner::aider::AiderScanner;
+use sessionatlas_core::scanner::claude::ClaudeScanner;
+use sessionatlas_core::scanner::codex::CodexScanner;
+use sessionatlas_core::scanner::custom::CustomToolScanner;
+use sessionatlas_core::scanner::kimi::KimiScanner;
+use sessionatlas_core::scanner::opencode::OpenCodeScanner;
+use sessionatlas_core::scanner::{
+    ScanDiagnostic, ScanDiagnosticSeverity, Scanner, CONFIG_READ_FAILED, UNEXPECTED_SCANNER_FAILURE,
+};
+use sessionatlas_core::store::SqliteStore;
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -10,7 +21,6 @@ use tauri::menu::{IsMenuItem, MenuBuilder, MenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_notification::NotificationExt;
-use tauri_plugin_shell::ShellExt;
 
 mod process;
 mod pty;
@@ -27,7 +37,6 @@ use security::{
 
 const HOME_OVERRIDE_ENV: &str = "SESSIONATLAS_HOME";
 const DATA_DIRECTORY: &str = ".sessionatlas";
-const SCAN_SIDECAR_NAME: &str = "sessionatlas";
 
 fn resolve_home_directory(
     override_home: Option<&str>,
@@ -311,9 +320,9 @@ fn open_index_db() -> Result<Connection, String> {
     open_index_reader(&path)
 }
 
-/// Open the CLI-owned index strictly for reads. The Tauri console must never
-/// change the index database or create SQLite sidecar files; the C# CLI is the
-/// sole writer.
+/// Open the index strictly for reads. The console queries through this
+/// read-only handle; the index itself is written in-process by `scan_projects`
+/// (or by the `sessionatlas` CLI) through the core `SqliteStore`.
 fn open_index_reader(path: &std::path::Path) -> Result<Connection, String> {
     if !path.exists() {
         return Err(format!(
@@ -771,51 +780,157 @@ fn list_tools() -> Result<Vec<Tool>, String> {
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ScanSidecarSpec {
-    name: &'static str,
-    args: [&'static str; 1],
-    home_override: Option<OsString>,
-}
-
-fn build_scan_sidecar_spec(home_override: Option<&OsStr>) -> ScanSidecarSpec {
-    ScanSidecarSpec {
-        name: SCAN_SIDECAR_NAME,
-        args: ["scan"],
-        home_override: home_override.map(OsStr::to_os_string),
+/// Builds the canonical scanner set for the config file at `config_path`: the
+/// five built-in scanners in C# registration order (Claude, Kimi, Codex,
+/// OpenCode, Aider), then each enabled custom tool whose key does not collide
+/// with a built-in (case-insensitive). When the config cannot be read or
+/// parsed, built-ins remain available and a `config_read_failed` warning is
+/// returned, mirroring `ScannerRegistry` and `commands::scan::build_default_scanners`.
+fn build_scan_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec<ScanDiagnostic>) {
+    let mut scanners: Vec<Box<dyn Scanner>> = vec![
+        Box::new(ClaudeScanner::new()),
+        Box::new(KimiScanner::new()),
+        Box::new(CodexScanner::new()),
+        Box::new(OpenCodeScanner::new()),
+        Box::new(AiderScanner::new()),
+    ];
+    let mut diagnostics = Vec::new();
+    match core_config::load(config_path) {
+        Ok(config) => {
+            for tool in config.custom_tools.iter().filter(|tool| tool.is_enabled) {
+                if scanners
+                    .iter()
+                    .any(|scanner| scanner.tool_key().eq_ignore_ascii_case(&tool.key))
+                {
+                    continue;
+                }
+                scanners.push(Box::new(CustomToolScanner::new(tool.clone())));
+            }
+        }
+        Err(_) => diagnostics.push(ScanDiagnostic::new(
+            "config",
+            ScanDiagnosticSeverity::Warning,
+            CONFIG_READ_FAILED,
+            "The custom-tool configuration could not be read; built-in scanners remain available.",
+        )),
     }
+    (scanners, diagnostics)
 }
 
+/// Runs the configured local scan in-process, mirroring the CLI's
+/// `commands::scan::run_scan`: only successful outcomes feed
+/// `replace_tool_snapshots`; `Failed`/`Unavailable` outcomes and scanner panics
+/// preserve the previous snapshot. Zero successful tools returns a sanitized
+/// error and performs no snapshot writes (the index is neither created nor
+/// touched). On success the merged index is written through the core
+/// `SqliteStore` — schema, migrations and FTS are rebuilt — and the total
+/// project count is returned.
+fn run_local_scan(db_path: &Path, config_path: &Path) -> Result<i64, String> {
+    let (scanners, initial_diagnostics) = build_scan_scanners(config_path);
+    run_scan_with_scanners(db_path, &scanners, &initial_diagnostics)
+}
+
+fn run_scan_with_scanners(
+    db_path: &Path,
+    scanners: &[Box<dyn Scanner>],
+    initial_diagnostics: &[ScanDiagnostic],
+) -> Result<i64, String> {
+    let mut diagnostics: Vec<ScanDiagnostic> = initial_diagnostics.to_vec();
+    let mut successful: Vec<IndexedToolScan> = Vec::new();
+
+    for scanner in scanners {
+        let outcome =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner.scan())) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    diagnostics.push(ScanDiagnostic::new(
+                        scanner.tool_key(),
+                        ScanDiagnosticSeverity::Error,
+                        UNEXPECTED_SCANNER_FAILURE,
+                        "The scanner stopped unexpectedly; its previous index is preserved.",
+                    ));
+                    continue;
+                }
+            };
+        diagnostics.extend(outcome.diagnostics().iter().cloned());
+        if outcome.is_successful() {
+            successful.push(IndexedToolScan {
+                tool_key: scanner.tool_key().to_string(),
+                tool_name: scanner.tool_name().to_string(),
+                projects: outcome.into_projects(),
+            });
+        }
+    }
+
+    if successful.is_empty() {
+        return Err(sanitize_scan_error(scanners.len()));
+    }
+
+    let projects = build_index(&successful);
+    let scanned_keys: Vec<&str> = successful
+        .iter()
+        .map(|scan| scan.tool_key.as_str())
+        .collect();
+    let mut store = SqliteStore::new(db_path)
+        .map_err(|error| format!("could not open index {}: {error}", db_path.display()))?;
+    store
+        .replace_tool_snapshots(&projects, &scanned_keys)
+        .map_err(|error| format!("could not update index: {error}"))?;
+    count_index_projects(db_path)
+}
+
+/// Counts the project rows of the freshly written index. A new read-only
+/// connection observes the committed snapshot written by the scan worker's own
+/// writer connection, so the count never depends on the app's cached reader.
+fn count_index_projects(db_path: &Path) -> Result<i64, String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| {
+                format!(
+                    "could not open index {} for counting: {error}",
+                    db_path.display()
+                )
+            })?;
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .map_err(|error| format!("could not count indexed projects: {error}"))?;
+    Ok(count)
+}
+
+/// Builds the sanitized error returned when no tool produced a trustworthy
+/// snapshot. Only constant text and the tool count are included, then control
+/// characters (apart from newline/tab) are replaced so the message can never
+/// smuggle terminal escapes to the frontend.
+fn sanitize_scan_error(tool_count: usize) -> String {
+    let message = format!(
+        "No tool produced a trustworthy snapshot; the index was left unchanged \
+         ({tool_count} tool(s) scanned, all preserved previous data).\n\
+         没有工具产生可信快照，索引未发生变化（扫描 {tool_count} 个工具，全部保留了上一份索引）。"
+    );
+    message
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\r' || character == '\t' {
+                character
+            } else if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// Rescan every configured tool in-process and atomically replace the
+/// snapshots of the tools that succeeded. All scanning, filesystem and SQLite
+/// work runs on a blocking worker so the Tauri async executor is never blocked.
 #[tauri::command]
-async fn scan_projects(app: AppHandle) -> Result<i64, String> {
-    let home_override = std::env::var_os(HOME_OVERRIDE_ENV);
-    let spec = build_scan_sidecar_spec(home_override.as_deref());
-    let mut command = app
-        .shell()
-        .sidecar(spec.name)
-        .map_err(|e| format!("failed to locate bundled `sessionatlas` scanner: {e}"))?
-        .args(spec.args);
-    if let Some(home) = spec.home_override {
-        command = command.env(HOME_OVERRIDE_ENV, home);
-    }
-    let out = command
-        .output()
+async fn scan_projects() -> Result<i64, String> {
+    let db_path = db_path();
+    let config_path = cli_config_path();
+    tauri::async_runtime::spawn_blocking(move || run_local_scan(&db_path, &config_path))
         .await
-        .map_err(|e| format!("failed to invoke bundled `sessionatlas scan`: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "sessionatlas scan exited {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    // count resulting rows
-    with_index(|c| {
-        let n: i64 = c
-            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        Ok(n)
-    })
+        .map_err(|error| format!("local scan worker panicked: {error}"))?
 }
 
 /// Launch an AI CLI in the project directory via an external terminal.
@@ -4327,31 +4442,6 @@ mod baseline_tests {
     }
 
     #[test]
-    fn scan_sidecar_uses_the_bundled_cli_and_explicit_home_override() {
-        let home = std::ffi::OsStr::new("isolated-sessionatlas-home");
-        let spec = build_scan_sidecar_spec(Some(home));
-
-        assert_eq!(spec.name, "sessionatlas");
-        assert_eq!(spec.args, ["scan"]);
-        assert_eq!(spec.home_override.as_deref(), Some(home));
-
-        let config: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        assert_eq!(
-            config["bundle"]["externalBin"],
-            serde_json::json!(["binaries/sessionatlas"])
-        );
-        assert_eq!(
-            config["build"]["beforeBuildCommand"],
-            "npm run prepare:release"
-        );
-        assert_eq!(
-            config["build"]["beforeDevCommand"],
-            "npm run prepare:sidecar"
-        );
-    }
-
-    #[test]
     fn claude_queue_preserves_normal_permission_checks() {
         let argv = claude_print_argv("summarize the repository");
 
@@ -5269,5 +5359,410 @@ mod baseline_tests {
             )
             .unwrap();
         assert_eq!(matches, 1);
+    }
+}
+
+/// Deterministic isolated tests for the R11 in-process local scan. They drive
+/// `run_scan_with_scanners` with fake scanners against a throwaway temporary
+/// home so no test reads a real tool data directory, launches an external
+/// command, spawns a subprocess, or mutates the real `~/.sessionatlas`.
+/// `spawn_blocking` stays structural in the `scan_projects` wrapper — the pure
+/// synchronous scan logic below is what these tests exercise.
+#[cfg(test)]
+mod local_scan_tests {
+    use super::*;
+    use sessionatlas_core::model::{Project as CoreProject, ToolUsage as CoreUsage};
+    use sessionatlas_core::scanner::{ScanOutcome, ScannedProject};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    static SCAN_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Disposable `<temp>/sessionatlas-tauri-scan-<pid>-<ns>-<n>` root. Removed
+    /// on drop; never points at the real user home.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let nonce = SCAN_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                "sessionatlas-tauri-scan-{}-{}-{nonce}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        /// The production layout: `<root>/.sessionatlas/index.db`.
+        fn db(&self) -> PathBuf {
+            self.0.join(".sessionatlas").join("index.db")
+        }
+
+        /// Whether any `.sessionatlas` artifact exists yet.
+        fn data_created(&self) -> bool {
+            self.0.join(".sessionatlas").exists()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn abs_path(segments: &[&str]) -> String {
+        if cfg!(windows) {
+            format!("C:\\{}", segments.join("\\"))
+        } else {
+            format!("/{}", segments.join("/"))
+        }
+    }
+
+    fn now_minus(secs: u64) -> SystemTime {
+        SystemTime::now() - Duration::from_secs(secs)
+    }
+
+    fn core_usage(key: &str, last_used: SystemTime, count: i32) -> CoreUsage {
+        CoreUsage {
+            tool_name: key.to_string(),
+            tool_key: key.to_string(),
+            last_used_at: last_used.into(),
+            session_count: count,
+            last_session_id: None,
+        }
+    }
+
+    fn core_project(path_text: &str, id: &str, usages: &[CoreUsage]) -> CoreProject {
+        let last_accessed = usages.iter().map(|usage| usage.last_used_at).max().unwrap();
+        CoreProject {
+            id: id.to_string(),
+            path: path_text.to_string(),
+            last_accessed_at: last_accessed,
+            tool_usages: usages.to_vec(),
+            ..CoreProject::default()
+        }
+    }
+
+    fn scanned_project(
+        path_text: &str,
+        last_accessed: SystemTime,
+        session_id: &str,
+    ) -> ScannedProject {
+        ScannedProject {
+            path: path_text.to_string(),
+            last_accessed_at: last_accessed.into(),
+            session_id: Some(session_id.to_string()),
+            git_branch: None,
+        }
+    }
+
+    /// Injected fake scanner: returns a canned outcome (or panics) without ever
+    /// touching a real tool data directory or launching an AI CLI.
+    struct FakeScanner {
+        key: &'static str,
+        name: &'static str,
+        outcome: ScanOutcome,
+        panics: bool,
+    }
+
+    impl FakeScanner {
+        fn succeeded(key: &'static str, projects: Vec<ScannedProject>) -> Self {
+            Self {
+                key,
+                name: key,
+                outcome: ScanOutcome::succeeded(projects, []),
+                panics: false,
+            }
+        }
+
+        fn failed(key: &'static str) -> Self {
+            Self {
+                key,
+                name: key,
+                outcome: ScanOutcome::failed([ScanDiagnostic::new(
+                    key,
+                    ScanDiagnosticSeverity::Error,
+                    "source_read_failed",
+                    "unreadable source",
+                )]),
+                panics: false,
+            }
+        }
+
+        fn unavailable(key: &'static str) -> Self {
+            Self {
+                key,
+                name: key,
+                outcome: ScanOutcome::unavailable([ScanDiagnostic::new(
+                    key,
+                    ScanDiagnosticSeverity::Info,
+                    "source_unavailable",
+                    "no source",
+                )]),
+                panics: false,
+            }
+        }
+
+        fn panics(key: &'static str) -> Self {
+            Self {
+                key,
+                name: key,
+                outcome: ScanOutcome::unavailable([]),
+                panics: true,
+            }
+        }
+    }
+
+    impl Scanner for FakeScanner {
+        fn tool_key(&self) -> &str {
+            self.key
+        }
+
+        fn tool_name(&self) -> &str {
+            self.name
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn scan(&self) -> ScanOutcome {
+            if self.panics {
+                panic!("injected fake scanner panic");
+            }
+            self.outcome.clone()
+        }
+    }
+
+    fn boxed(scanner: FakeScanner) -> Box<dyn Scanner> {
+        Box::new(scanner)
+    }
+
+    /// Seeds `index.db` with the given tool snapshots through the real store.
+    fn seed(db_path: &Path, projects: &[CoreProject], keys: &[&str]) {
+        let mut store = SqliteStore::new(db_path).unwrap();
+        store.replace_tool_snapshots(projects, keys).unwrap();
+    }
+
+    fn read_projects(db_path: &Path) -> Vec<CoreProject> {
+        let store = SqliteStore::new(db_path).unwrap();
+        store.list_projects(None, None, 10_000).unwrap()
+    }
+
+    fn project_paths(db_path: &Path) -> Vec<String> {
+        read_projects(db_path)
+            .into_iter()
+            .map(|project| project.path)
+            .collect()
+    }
+
+    #[test]
+    fn scan_success_only_replaces_declared_tool_snapshots() {
+        let dir = TestDir::new();
+        seed(
+            &dir.db(),
+            &[
+                core_project(
+                    &abs_path(&["work", "old-codex"]),
+                    "old-codex-id",
+                    &[core_usage("codex", now_minus(7200), 3)],
+                ),
+                core_project(
+                    &abs_path(&["work", "old-claude"]),
+                    "old-claude-id",
+                    &[core_usage("claude", now_minus(7200), 2)],
+                ),
+            ],
+            &["codex", "claude"],
+        );
+
+        let scanners: Vec<Box<dyn Scanner>> = vec![
+            boxed(FakeScanner::succeeded(
+                "codex",
+                vec![scanned_project(
+                    &abs_path(&["work", "new-codex"]),
+                    now_minus(60),
+                    "codex-s2",
+                )],
+            )),
+            boxed(FakeScanner::unavailable("claude")),
+        ];
+        let count = run_scan_with_scanners(&dir.db(), &scanners, &[]).unwrap();
+        assert_eq!(count, 2);
+
+        let paths = project_paths(&dir.db());
+        assert!(
+            paths.iter().any(|p| p.ends_with("new-codex")),
+            "codex's new snapshot must be written: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.ends_with("old-codex")),
+            "codex's old snapshot must be cleared: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("old-claude")),
+            "claude's snapshot must be preserved: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn scan_failed_and_unavailable_tools_preserve_existing_rows() {
+        let dir = TestDir::new();
+        seed(
+            &dir.db(),
+            &[
+                core_project(
+                    &abs_path(&["work", "codex"]),
+                    "codex-id",
+                    &[core_usage("codex", now_minus(3600), 3)],
+                ),
+                core_project(
+                    &abs_path(&["work", "claude"]),
+                    "claude-id",
+                    &[core_usage("claude", now_minus(3600), 1)],
+                ),
+            ],
+            &["codex", "claude"],
+        );
+
+        let scanners: Vec<Box<dyn Scanner>> = vec![
+            boxed(FakeScanner::failed("codex")),
+            boxed(FakeScanner::unavailable("claude")),
+        ];
+        let error = run_scan_with_scanners(&dir.db(), &scanners, &[]).unwrap_err();
+        assert!(error.contains("trustworthy snapshot"), "{error}");
+
+        let paths = project_paths(&dir.db());
+        assert_eq!(paths.len(), 2, "failed tools must preserve old rows");
+        assert!(paths.iter().any(|p| p.ends_with("codex")), "{paths:?}");
+        assert!(paths.iter().any(|p| p.ends_with("claude")), "{paths:?}");
+    }
+
+    #[test]
+    fn scan_zero_success_never_creates_the_index() {
+        let dir = TestDir::new();
+        let scanners: Vec<Box<dyn Scanner>> = vec![
+            boxed(FakeScanner::failed("codex")),
+            boxed(FakeScanner::unavailable("claude")),
+        ];
+        let error = run_scan_with_scanners(&dir.db(), &scanners, &[]).unwrap_err();
+        assert!(error.contains("trustworthy snapshot"), "{error}");
+        assert!(
+            !dir.data_created(),
+            "zero successful tools must not create the data directory"
+        );
+        assert!(!dir.db().exists());
+    }
+
+    #[test]
+    fn scan_creates_a_missing_index_and_returns_project_count() {
+        let dir = TestDir::new();
+        let scanners: Vec<Box<dyn Scanner>> = vec![boxed(FakeScanner::succeeded(
+            "codex",
+            vec![
+                scanned_project(&abs_path(&["work", "a"]), now_minus(300), "s1"),
+                scanned_project(&abs_path(&["work", "b"]), now_minus(600), "s2"),
+            ],
+        ))];
+        let count = run_scan_with_scanners(&dir.db(), &scanners, &[]).unwrap();
+        assert_eq!(count, 2);
+        assert!(dir.db().is_file(), "the missing index must be created");
+        assert_eq!(read_projects(&dir.db()).len(), 2);
+    }
+
+    #[test]
+    fn existing_index_stays_queryable_after_scan() {
+        let dir = TestDir::new();
+        seed(
+            &dir.db(),
+            &[core_project(
+                &abs_path(&["work", "old"]),
+                "old-id",
+                &[core_usage("claude", now_minus(3600), 5)],
+            )],
+            &["claude"],
+        );
+
+        let scanners: Vec<Box<dyn Scanner>> = vec![boxed(FakeScanner::succeeded(
+            "codex",
+            vec![scanned_project(
+                &abs_path(&["work", "new"]),
+                now_minus(60),
+                "s1",
+            )],
+        ))];
+        let count = run_scan_with_scanners(&dir.db(), &scanners, &[]).unwrap();
+        assert_eq!(count, 2);
+
+        // A fresh read-only connection (like the console's reader) can still
+        // query both the preserved and the newly written rows after the scan.
+        let connection = rusqlite::Connection::open_with_flags(
+            dir.db(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let rows: Vec<(String, i64)> = connection
+            .prepare(
+                "SELECT path,
+                        (SELECT COUNT(*) FROM tool_usages u WHERE u.project_id = projects.id)
+                 FROM projects ORDER BY path",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().any(|(path, _)| path.ends_with("old")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(path, _)| path.ends_with("new")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn scan_scanner_panic_is_failure_and_preserves_old_data() {
+        let dir = TestDir::new();
+        seed(
+            &dir.db(),
+            &[core_project(
+                &abs_path(&["work", "keep"]),
+                "keep-id",
+                &[core_usage("codex", now_minus(3600), 2)],
+            )],
+            &["codex"],
+        );
+
+        let scanners: Vec<Box<dyn Scanner>> = vec![boxed(FakeScanner::panics("codex"))];
+        let error = run_scan_with_scanners(&dir.db(), &scanners, &[]).unwrap_err();
+        assert!(error.contains("trustworthy snapshot"), "{error}");
+        let projects = read_projects(&dir.db());
+        assert_eq!(projects.len(), 1, "panic must preserve the old snapshot");
+        assert!(projects[0].path.ends_with("keep"));
+    }
+
+    #[test]
+    fn sanitize_scan_error_strips_control_characters() {
+        // The sanitizer never receives tool data (only constant text + counts),
+        // but must still guarantee no terminal escapes can leak to the frontend.
+        let message = sanitize_scan_error(3);
+        assert!(message.contains("trustworthy snapshot"), "{message}");
+        assert!(message.contains('3'), "{message}");
+        // Newline/tab separators are intentional; any other control character
+        // (ESC, BEL, ...) must have been replaced.
+        assert!(
+            message.chars().all(|character| {
+                !character.is_control() || matches!(character, '\n' | '\r' | '\t')
+            }),
+            "{message:?}"
+        );
     }
 }

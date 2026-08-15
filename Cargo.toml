@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sessionatlas-core",
+    "crates/sessionatlas-cli",
+    "src-tauri",
+]
+
+# Release profile formerly owned by src-tauri/Cargo.toml; moved here because
+# profile settings in a non-root workspace member are ignored by Cargo.
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true

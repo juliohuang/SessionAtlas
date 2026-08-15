@@ -18,8 +18,6 @@ Use the bug-report template for reproducible defects and the feature template fo
 - the tools listed in the README;
 - current and previous `0.1.x` beta releases on a best-effort basis.
 
-The Avalonia GUI is retained as a legacy reference and is not a supported end-user frontend.
-
 ## Security
 
 Do not report suspected vulnerabilities in a public issue. Follow `SECURITY.md` once the repository's private reporting channel is enabled.

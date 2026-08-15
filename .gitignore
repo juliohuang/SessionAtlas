@@ -1,5 +1,6 @@
 # ── Rust / Tauri (SessionAtlas desktop console) ──
 src-tauri/target/
+/target/
 
 # OS junk
 .DS_Store
@@ -20,7 +21,7 @@ desktop.ini
 *.db-wal
 *.db-journal
 
-# Node (defensive — project doesn't use npm, but if it ever does)
+# Node / frontend
 node_modules/
 frontend/playwright-report/
 frontend/test-results/
@@ -37,7 +38,7 @@ src-tauri/binaries/sessionatlas-*
 # One-time icon backup before regeneration (git history is the real backup)
 src-tauri/icons/backup_prev/
 
-# ── C# / .NET (sessionatlas CLI scanner) ──
+# ── Generic build / runtime artifacts ──
 bin/
 obj/
 *.db

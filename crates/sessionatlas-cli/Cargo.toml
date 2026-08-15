@@ -1,0 +1,16 @@
+[package]
+name = "sessionatlas-cli"
+version = "0.1.0"
+description = "SessionAtlas command-line interface"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/juliohuang/SessionAtlas"
+
+[[bin]]
+name = "sessionatlas"
+path = "src/main.rs"
+
+[dependencies]
+sessionatlas-core = { path = "../sessionatlas-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"

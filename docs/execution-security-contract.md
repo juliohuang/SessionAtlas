@@ -22,8 +22,10 @@ data can cause an external process to start.
   whitespace, control characters, or shell punctuation.
 - Session IDs are bounded identifiers. `--resume` and the value are appended
   by trusted backend code.
-- C# applies the same rules before recording a session or launching a CLI.
-- C# launches only built-in identities or enabled custom tools from config;
+- The shared `crates/sessionatlas-core` `security.rs` and the Tauri
+  `src-tauri/src/security.rs` apply the same rules before recording a session
+  or launching a CLI.
+- Only built-in identities or enabled custom tools from config may be launched;
   unknown keys and attempts to override a built-in key are rejected.
 - Custom CLI commands may contain a program and ordinary quoted arguments, but
   not shell metacharacters, shell/script executables, or unbalanced quotes.
@@ -54,13 +56,14 @@ data can cause an external process to start.
 
 ## Display and dependency safety
 
-- Values originating in paths, config, scans, or errors are escaped before
-  entering Spectre.Console markup.
-- The .NET projects pin patched `System.Text.Json` and SQLite native packages.
-  Acceptance runs `scripts/Test-NuGetVulnerabilities.ps1`, which parses the
-  machine-readable `dotnet list package --vulnerable --include-transitive`
-  result and fails when any CLI, desktop, or test package contains an advisory.
-- The Rust lockfile uses `anyhow >=1.0.103`, `plist >=1.10.0` /
+- User strings originating in paths, config, scans, or errors are rendered as
+  plain text, never as markup: the CLI renders through `render.rs` /
+  `select.rs` (plain-text output, no markup library), and the frontend inserts
+  query/result text through `textContent`/text nodes rather than HTML sinks.
+- Dependency auditing covers the Rust workspace lockfile and the frontend
+  lockfile. Obsolete ecosystem audit scripts were removed during migration;
+  the history is recorded in [`rust-migration-plan.md`](./rust-migration-plan.md).
+- The workspace lockfile uses `anyhow >=1.0.103`, `plist >=1.10.0` /
   `quick-xml >=0.41.0`, and `portable-pty >=0.9.0`; these remove the actionable
   soundness, XML denial-of-service, and abandoned `serial` dependency findings
   present in the previous lockfile.

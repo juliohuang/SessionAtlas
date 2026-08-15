@@ -22,9 +22,9 @@ Exact asset hashes and the reproducible copy command are documented in
 
 ## Compiled dependencies
 
-The .NET, Rust, and development-only JavaScript dependencies used to build the
-application are declared in `*.csproj`, `src-tauri/Cargo.lock`, and
-`frontend/package-lock.json`. Their upstream copyright and license terms
+The Rust and development-only JavaScript dependencies used to build the
+application are declared in `Cargo.lock` and `frontend/package-lock.json`.
+Their upstream copyright and license terms
 continue to apply. Release automation produces an SPDX software bill of
 materials so recipients can inspect the complete dependency inventory for a
 specific build.

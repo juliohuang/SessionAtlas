@@ -1,232 +1,132 @@
-# AI CLI 项目聚合工具设计方案
+# SessionAtlas 设计说明（当前 Rust 架构）
 
-## 一、开源项目调研结论
+> 本文描述当前全部基于 Rust 的实现：共享核心库 `sessionatlas-core`、Rust CLI
+> `sessionatlas`、Tauri 桌面控制台。早期实现的迁移历史记录在
+> [`docs/rust-migration-plan.md`](./docs/rust-migration-plan.md)。
 
-经过全面搜索，**目前没有完全匹配需求的开源聚合实现**。现有相关项目分为以下几类，各有明显局限：
+## 一、定位与核心模型
 
-| 项目 | 定位 | 与需求的匹配度 | 说明 |
-|------|------|-------------|------|
-| **claude-code-history-viewer (CCHV)** | 统一历史查看器 | ❌ 不匹配 | 支持 25+ 个 AI 助手的历史记录查看/搜索，但**只读历史，不做项目管理，也不能打开 CLI** |
-| **Superconductor** | Agent 聚合器 | ❌ 不匹配 | 闭源 macOS 应用，聚合 Claude Code / Codex / Gemini 等，支持多 Tab 并行，但**无项目发现/索引功能** |
-| **CC Switch** | 配置统一管理平台 | ❌ 不匹配 | Tauri 桌面应用，管理 API Key / 模型 / 端点配置，**不涉及项目目录发现** |
-| **Coder-AI-Ops** | 开发流程管理 | ⚠️ 部分相关 | 解决 Codex CLI 和 Claude Code 的流程管理不足，参考云效，但**侧重流程而非项目发现** |
-| **acpx (OpenClaw)** | Agent 网关 | ❌ 不匹配 | 给其他 Agent 调用 Claude Code / Codex 的协议网关，**不是人用的项目管理工具** |
-| **claude-code-switcher** | Claude 配置切换 | ❌ 不匹配 | 仅支持 Claude Code 的 Profile / MCP 配置切换 |
-| **moa-x** | 多 Agent 协作 | ❌ 不匹配 | 利用多个 CLI 并行生成实现计划，**不是项目浏览器** |
+**一句话定位**：扫描本机多个 AI CLI（Claude Code、Codex、Kimi、OpenCode、Aider）
+留下的工作目录，按规范化路径去重，建立统一 SQLite 索引，并在桌面控制台里一键续接
+AI 会话。
 
-**结论**：需求是一个全新的工具类别——需要从零设计实现。
+**核心实体**（`crates/sessionatlas-core/src/model.rs`）：
 
----
+- `Project`：一个工作目录，唯一身份是归一化后的绝对路径。
+- `ToolUsage`：某个工具在该项目上的使用记录，含 `session_count`、`last_used_at`、
+  `last_session_id`。
+- `Session`：一次工具原生 session ID 的记录。
+- `ToolSource`：工具来源（内置 key 或自定义工具）。
 
-## 二、工具定位
+**身份契约**：唯一支持的身份是 `sessionatlas` CLI、`SessionAtlas` 产品标识、
+Tauri crate `sessionatlas-tauri`、标识 `com.sessionatlas.console`、
+`sessionatlas.*` localStorage 键、`SESSIONATLAS_HOME` 与 `~/.sessionatlas/`。
+不提供旧别名回退，也不自动迁移旧数据根。
 
-**名称**：`SessionAtlas`（命令行为 `sessionatlas`，数据目录为 `~/.sessionatlas/`）
+## 二、工作区结构
 
-**一句话定位**：扫描所有 AI CLI 工具的工作目录，建立统一项目索引，一键打开任意 CLI 进入指定项目。
-
-**核心解决的问题**：
-- 开发者同时使用 Claude Code、Codex、Kimi、OpenCode 等多个 CLI 工具
-- 各工具散落在不同目录（`~/.claude/projects/`、`~/.codex/sessions/`、`~/.kimi-code/` 等）
-- 想找回"上周用 Claude Code 改过的那个项目"非常困难
-- 需要手动 `cd` 到项目目录再手动启动对应 CLI
-
----
-
-## 三、功能设计
-
-### 3.1 核心功能
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  sessionatlas <command>                                           │
-├─────────────────────────────────────────────────────────────┤
-│  scan    → 扫描所有已安装 AI CLI 工具的数据目录             │
-│  list    → 列出已索引的项目（支持过滤/排序）                │
-│  search  → 模糊搜索项目名称或路径                           │
-│  open    → 交互式选择项目 + CLI 工具，一键打开终端           │
-│  recent  → 列出最近访问的项目（跨工具）                     │
-│  config  → 管理工具配置、添加自定义扫描规则               │
-└─────────────────────────────────────────────────────────────┘
+```text
+Cargo workspace
+├─ crates/sessionatlas-core   # 共享库：model / path / scanner / indexer /
+│                             # store / config / process / security / launcher
+├─ crates/sessionatlas-cli    # `sessionatlas` 可执行文件（clap 命令）
+└─ src-tauri                  # Tauri 2 桌面应用，依赖 sessionatlas-core
 ```
 
-### 3.2 详细功能
+- 核心 crate 不依赖 Tauri、前端或 CLI 显示库。
+- CLI 与 Tauri 都是同一核心的输入输出适配层；两者链接同一个 `sessionatlas-core`。
+- 数据目录统一为 `~/.sessionatlas/`：`index.db`（CLI 所有、Tauri 只读）、
+  `config.json`、`prefs.db`（Tauri 所有：分组、打开器、远程项目）。
 
-| 功能 | 说明 |
-|------|------|
-| **自动发现** | 首次运行自动检测系统已安装的 AI CLI 工具（通过 PATH 和已知安装路径） |
-| **增量扫描** | 只扫描新增/修改的项目，已有项目缓存加速 |
-| **多维度索引** | 项目路径、工具来源、最后访问时间、Git 分支、仓库信息 |
-| **模糊搜索** | 支持拼音、路径片段、仓库名多维度搜索 |
-| **跨工具项目去重** | 同一项目被多个工具编辑过，合并为一个项目，显示多标签 |
-| **一键打开** | 选择项目后，选择工具（Claude Code / Codex / Kimi 等），自动 `cd` 并启动 CLI |
-| **终端适配** | 支持 Windows Terminal、iTerm2、GNOME Terminal、VS Code 终端等 |
-| **会话恢复** | 支持 `--resume` 直接进入上次工作的工具和项目 |
+## 三、扫描与索引数据流
 
----
-
-## 四、架构设计
-
-### 4.1 模块结构
-
-```
-SessionAtlas/
-├── CLI Layer          (Spectre.Console - TUI 交互)
-│   ├── Commands/      (scan, list, search, open, recent, config)
-│   ├── Prompts/       (交互式选择器、搜索框、确认框)
-│   └── Renderers/     (表格、树形、面板渲染)
-├── Core Layer
-│   ├── Scanner/       (各工具数据目录扫描器)
-│   ├── Indexer/       (项目索引构建与去重)
-│   ├── Store/         (SQLite 本地存储 + 轻量缓存)
-│   ├── Launcher/      (终端进程启动与命令行构建)
-│   └── Config/        (用户配置与自定义扫描规则)
-└── Models/
-    ├── Project.cs      (项目实体)
-    ├── ToolSource.cs   (AI CLI 工具来源定义)
-    └── Session.cs      (会话记录)
+```text
+各 AI 工具数据目录 → scanner/（每工具一个 Scanner + custom）→ ScanOutcome
+→ indexer（规范化路径去重/合并，读 .git/HEAD 取分支）
+→ store（单 SQLite 事务快照替换 + FTS5 重建）
 ```
 
-### 4.2 数据流
+- `ScanOutcome` 区分可信的空快照（`Succeeded`）、不可用（`Unavailable`）与失败
+  （`Failed`）；只有 `Succeeded` 可以替换对应工具快照，其余保留旧数据。
+- 路径语义在 `path.rs`：Windows 大小写不敏感、Unix 字节敏感；根路径不归一化为空。
+- 快照替换、孤儿项目清理、活动时间重算与 FTS 重建在同一事务内原子完成。
+- `prefs.db` 由 Tauri 管理，本地扫描不改其中的分组/排序/打开器/远程项目数据。
 
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  AI CLI 工具  │───→│   Scanner    │───→│   Indexer    │───→│   SQLite     │
-│ 数据目录     │    │ (按工具解析) │    │ (去重/合并)  │    │  项目索引库   │
-└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
-                                                                    │
-                              ┌──────────────┐                     │
-                              │   Launcher   │←────────────────────┘
-                              │ (启动终端)   │    用户选择项目+工具
-                              └──────────────┘
-```
+## 四、SQLite 存储
 
----
+`index.db` 表：`projects`、`tool_usages`、`sessions`，以及 FTS5 `projects_fts`。
+schema 幂等创建/迁移；`store.rs` 同时负责旧数据去重迁移与只读异常行检查。
+Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任何连接都不创建或
+修改 WAL/SHM/journal 文件。
 
-## 五、支持工具矩阵
+## 五、配置与原子写
 
-| 工具 | 状态 | 数据目录 | 项目路径提取方式 |
-|------|------|---------|-----------------|
-| **Claude Code** | ✅ 优先支持 | `~/.claude/projects/` | 目录名 = 项目路径 |
-| **Codex CLI** | ✅ 优先支持 | `~/.codex/sessions/` | session 元数据中的 `cwd` |
-| **Gemini CLI** | ✅ 优先支持 | `~/.gemini/history/` | 历史文件中的 `cwd` |
-| **Kimi CLI** | ✅ 优先支持 | `~/.kimi-code/sessions/` | `state.json` 中的 `workDir` |
-| **OpenCode** | ✅ 优先支持 | `~/.local/share/opencode/opencode.db` | `project` / `session` 表 |
-| **Aider** | ✅ 支持 | 项目目录内 `.aider.chat.history` | 扫描最近修改的项目目录 |
-| **Cline** | ✅ 支持 | VS Code `globalStorage/<ext>/tasks/` | task 元数据中的 workspace |
-| **Cursor** | ✅ 支持 | `~/.cursor/projects/` 或 Composer 数据 | 项目索引文件 |
-| **Goose** | ✅ 支持 | `~/.config/goose/sessions/` | `sessions.db` 中的 `working_dir` |
-| **Continue.dev** | ✅ 支持 | `~/.continue/sessions/` | 按 `workspace` 字段分组 |
-| **Pi Agent** | ✅ 支持 | `~/.pi/` 或配置目录 | 已知项目路径索引 |
-| **Amazon Q CLI** | 计划 | `~/.aws/amazonq/` | SQLite 数据 |
-| **Trae** | 计划 | 应用数据目录 | 项目索引 |
-| **自定义** | ✅ 支持 | 用户配置 | 正则/JSONPath 提取 |
+`config.json` 由 `config.rs` 管理：大小写不敏感读取、跨进程有界锁、fingerprint
+冲突检测、临时文件精确清理与原子替换。CLI 的 `config` 命令与 Tauri 共用该实现。
 
----
+## 六、进程安全与执行边界
 
-## 六、界面设计（TUI）
+- 本地进程一律使用「可执行文件 + 参数数组 + 工作目录」模型（`process.rs` /
+  `ProcessSpec`）；shell 文本只用于互动终端或 SSH 远端命令的固有场景。
+- `security.rs`（core 与 src-tauri 各自一份）校验/引用工具 key、session ID、
+  SSH 用户/主机/身份文件/远端路径、URL 与打开器模板；所有输入先过对应的
+  validator/quoting 再插入命令。
+- `launcher.rs` 构造 `<tool>{sessionId}` 命令行（`--resume <id>` 由可信后端追加）
+  并打开平台终端。
+- 远程 SSH：`BatchMode=yes` 全量强制，纯免密；`classify_ssh_failure` 将 ssh 错误
+  转为可操作的中英双语提示。完整契约见
+  [`docs/execution-security-contract.md`](./docs/execution-security-contract.md)。
 
-### 6.1 主界面：`sessionatlas` 或 `sessionatlas list`
+## 七、Tauri 桌面控制台
 
-```
-╭───────────────────────── AI Project Hub ──────────────────────────╮
-│                                                                    │
-│  #  工具          项目名称              路径                      最后访问    │
-│  ────────────────────────────────────────────────────────────────  │
-│  1  claude       my-api-service       ~/work/api-service         2h ago     │
-│  2  codex   ┐    legacy-migration     ~/work/migration           1d ago     │
-│  3  kimi    ┘    legacy-migration     ~/work/migration           3h ago     │
-│  4  opencode     cli-tool             ~/projects/cli-tool         5d ago     │
-│  5  aider        dotfiles             ~/.dotfiles                 1w ago     │
-│  6  cursor       landing-page         ~/work/landing              3d ago     │
-│                                                                    │
-│  [↑/↓] 选择  [Enter] 打开  [/] 搜索  [?] 帮助  [q] 退出           │
-╰────────────────────────────────────────────────────────────────────╯
-```
+- **数据源**：只读打开 CLI 维护的 `index.db`；缺失时所有命令返回
+  "run `sessionatlas scan` first"。
+- **进程内扫描**：`scan_projects` 通过 `spawn_blocking` 调用 `sessionatlas-core`
+  的扫描管线，返回 `COUNT(*)`；不启动 sidecar 或子进程，不阻塞 Tauri async 线程。
+- **命令层**：`list_projects`、`search_projects`（FTS5 `MATCH`）、`list_tools`、
+  `scan_projects`、PTY 一组（`pty_spawn/attach/write/resize/kill`）、远程 SSH 一组、
+  打开器偏好、分组、Git 信息与托盘同步命令。结构体用 `#[serde(rename="camelCase")]`
+  使 Rust snake_case 以 `lastAccessedAt` 形式到达 JS。
+- **PTY 终端**：右栏多标签，每标签一个伪终端；`pty_spawn` 先建未挂接 PTY，
+  前端注册标签后 `pty_attach` 携带结构化 `toolKey`/`sessionId`，后端校验并恰一次
+  转换为可选工具命令，再启动输出读取。自然退出/读失败/显式关闭/应用退出都会移除
+  注册项并回收子进程。xterm.js + addon-fit 本地 vendored 在 `frontend/vendor/`。
+- **前端**：`.stage` 双栏网格；单一 `state` 对象，改动经 `applyFilters()` → 渲染。
+  `app.js` 按 `window.__TAURI__` 双模式运行（Tauri 调 Rust 命令，浏览器用内置
+  `SAMPLE` 数据）。`frontend/i18n.js` 提供中英文案，`lang-init.js` 在绘制前设置
+  `<html lang>`；OS 托盘菜单语言随 `set_tray_language` 变化。
+- **能力**：`src-tauri/capabilities/default.json` 对 `main` 授予 `core:default` +
+  `shell:allow-open`；新增插件权限必须在此登记。
 
-### 6.2 打开项目交互
+## 八、数据流与并发
 
-```
-选中项目: legacy-migration (~/work/migration)
+- CLI `scan` 是唯一写者，原子替换快照；Tauri 只读读者始终看到完整旧快照或完整
+  新快照，绝无半写状态。
+- Tauri 扫描在 `spawn_blocking` 上运行，不与前端命令争抢 async 线程。
+- `prefs.db` 的分组/排序写入使用事务与 revision 冲突检查；frontend 按 mutation
+  队列串行化写操作，成功后发布服务端权威快照。
+- 60 秒自动刷新在没有搜索词时静默重拉；full/auto/search 使用独立 gate，避免
+  低信息请求覆盖完整加载（last-known-good 语义）。
 
-┌─────────────────────────────────────┐
-│  选择要使用的 CLI 工具:             │
-│                                     │
-│  > Claude Code  (上次使用)          │
-│    Codex CLI                        │
-│    Kimi CLI                         │
-│    OpenCode                         │
-│    Aider                            │
-│                                     │
-│  [Enter] 启动  [Esc] 取消           │
-└─────────────────────────────────────┘
-```
+## 九、安全模型要点
 
-### 6.3 搜索界面：`sessionatlas search api`
+- 本地优先：索引/偏好/配置只保存在 `~/.sessionatlas/`，无遥测或云同步。
+- 扫描器只取路径、时间、session ID 与必要 Git 元数据；不持久化提示词、消息、
+  密钥或认证内容。
+- 所有外部进程为参数数组；shell 元字符、控制字符、选项形 tool key 一律拒绝。
+- 搜索词与用户字符串按文本节点渲染，绝不进入 `innerHTML` 执行标记。
+- xterm/高亮/字体全部本地加载，不依赖 CDN。
 
-```
-搜索: api
+## 十、测试与验收
 
-  结果 1: my-api-service    (claude, codex)    ~/work/api-service
-  结果 2: api-gateway       (kimi)             ~/work/gateway
-  结果 3: internal-api      (opencode)         ~/projects/internal-api
-```
-
----
-
-## 七、技术选型
-
-| 层面 | 选型 | 理由 |
-|------|------|------|
-| 语言 | C# / .NET 8 | 用户技术栈熟悉，跨平台单文件发布，性能优秀 |
-| CLI 框架 | Spectre.Console | .NET 生态最佳 TUI 库，支持表格、树、进度条、输入、选择器 |
-| 数据存储 | SQLite | 零配置、轻量、支持全文搜索 (FTS5) |
-| 配置 | JSON / YAML | 用户自定义扫描规则，易于手写 |
-| 打包 | `dotnet publish -r` | 单文件自包含可执行文件，跨平台 |
-
----
-
-## 八、实现阶段规划
-
-| 阶段 | 目标 | 周期 |
-|------|------|------|
-| **MVP** | 支持 Claude Code / Kimi CLI 扫描 + list/search/open + SQLite 存储 | 1 周 |
-| **V0.2** | 增加 Codex / Gemini / OpenCode / Aider 支持 + 去重合并 | 3 天 |
-| **V0.3** | 增加 Cursor / Cline / Goose / Continue.dev + 终端适配器 | 3 天 |
-| **V0.4** | 自定义扫描规则 + 会话恢复 + 配置管理 | 2 天 |
-| **V1.0** | 稳定版 + 安装脚本 + 完整文档 | 2 天 |
-
----
-
-## 九、使用示例
-
-```bash
-# 首次运行，扫描所有已安装工具
-sessionatlas scan
-
-# 列出所有项目（交互式 TUI）
-sessionatlas list
-
-# 搜索项目
-sessionatlas search "api"
-
-# 直接打开最近项目（上次使用的工具）
-sessionatlas open --recent
-
-# 指定项目和工具打开
-sessionatlas open ~/work/my-api --tool claude
-
-# 查看配置
-sessionatlas config
-
-# 添加自定义工具扫描规则
-sessionatlas config add-tool --name my-custom-agent --path ~/.my-agent/history --pattern "cwd: (.*)"
-```
-
----
-
-## 十、与现有工具的关系
-
-- **不替代**任何 AI CLI 工具，只做"项目浏览器 + 启动器"
-- **可配合** CCHV 使用：CCHV 看历史，`sessionatlas` 打开项目
-- **可配合** CC Switch 使用：CC Switch 管配置，`sessionatlas` 管项目
-- **灵感来源** Superconductor 的聚合理念，但做成开源、跨平台、项目为中心的 CLI 工具
+- 根命令：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets
+  -- -D warnings`、`cargo test --workspace`、`npm --prefix frontend run check` /
+  `npm --prefix frontend test`。
+- 测试一律使用临时 `SESSIONATLAS_HOME` 与合成数据；不读取真实 `~/.sessionatlas/`，
+  不启动真实 AI CLI / SSH。
+- 自动化证据与剩余手工/发布门禁见
+  [`docs/test-baseline.md`](./docs/test-baseline.md) 与
+  [`docs/remaining-issues.md`](./docs/remaining-issues.md)。
+- 发布序列（格式/lint/测试/前端/安装包/隔离扫描）在
+  [`docs/rust-migration-plan.md`](./docs/rust-migration-plan.md) 的 R14 中定义，
+  本地可执行门禁已通过；托管依赖审计与原生交互矩阵仍属待验收门禁。

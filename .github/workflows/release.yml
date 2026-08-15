@@ -22,10 +22,6 @@ jobs:
         run: throw "Release publishing must run from an existing v* tag."
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up .NET
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
-        with:
-          dotnet-version: 8.0.x
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -39,32 +35,37 @@ jobs:
         working-directory: frontend
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version 2.11.4 --locked
+      - name: Install Playwright Chromium
+        shell: pwsh
+        working-directory: frontend
+        run: npx playwright install chromium
       - name: Run release tests
         shell: pwsh
         run: |
-          dotnet test SessionAtlas.Tests/SessionAtlas.Tests.csproj --configuration Release --nologo
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm --prefix frontend run check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm --prefix frontend test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo test --workspace
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build installers with bundled CLI
+      - name: Build installers
         run: cargo tauri build --ci
-      - name: Smoke-test the bundled scanner in an isolated home
+      - name: Build release CLI
+        run: cargo build --locked -p sessionatlas-cli --release
+      - name: Smoke-test the scanner in an isolated home
         shell: pwsh
         run: |
+          $scanner = (Resolve-Path target/release/sessionatlas.exe).Path
           ./scripts/New-AcceptanceFixture.ps1 `
-            -OutputRoot (Join-Path $env:RUNNER_TEMP "sessionatlas-acceptance") `
-            -ScannerPath ./src-tauri/binaries/sessionatlas-x86_64-pc-windows-msvc.exe
+            -ScannerPath $scanner `
+            -OutputRoot (Join-Path $env:RUNNER_TEMP "sessionatlas-acceptance")
       - name: Collect release artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path artifacts | Out-Null
-          Get-ChildItem -LiteralPath src-tauri/target/release/bundle/msi -Filter *.msi -File |
+          Get-ChildItem -LiteralPath target/release/bundle/msi -Filter *.msi -File |
             Copy-Item -Destination artifacts
-          Get-ChildItem -LiteralPath src-tauri/target/release/bundle/nsis -Filter *-setup.exe -File |
+          Get-ChildItem -LiteralPath target/release/bundle/nsis -Filter *-setup.exe -File |
             Copy-Item -Destination artifacts
           if ((Get-ChildItem -LiteralPath artifacts -File).Count -lt 2) {
             throw "Expected both MSI and NSIS installers."

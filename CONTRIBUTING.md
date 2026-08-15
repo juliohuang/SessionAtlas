@@ -11,25 +11,20 @@ Thanks for helping improve SessionAtlas. Small, focused changes with reproducibl
 
 ## Development setup
 
-Install .NET 8, stable Rust, Node.js 20+, and the Tauri 2 prerequisites for your operating system. From the repository root:
+Install stable Rust, Node.js 22+, and the Tauri 2 prerequisites for your operating system. From the repository root:
 
 ```bash
-dotnet restore
-dotnet build
-dotnet test SessionAtlas.Tests
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 
 cd frontend
 npm ci
 npm run check
 npm test
-
-cd ../src-tauri
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
 ```
 
-Run `cargo tauri dev` from the repository root for the desktop console. Its prepare hook publishes and stages the matching self-contained CLI sidecar.
+Run `cargo tauri dev` from the repository root for the desktop console. `scan_projects` runs the `sessionatlas-core` scan pipeline in-process on `spawn_blocking`; the installer does not bundle a separate scanner binary, and nothing requires a .NET runtime.
 
 ## Test isolation
 

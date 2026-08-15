@@ -5,7 +5,7 @@
   "identifier": "com.sessionatlas.console",
   "build": {
     "beforeBuildCommand": "npm run prepare:release",
-    "beforeDevCommand": "npm run prepare:sidecar",
+    "beforeDevCommand": "npm run prepare:release",
     "frontendDist": "../frontend/dist"
   },
   "app": {
@@ -28,9 +28,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": [
-      "binaries/sessionatlas"
-    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
