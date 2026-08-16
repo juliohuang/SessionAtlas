@@ -92,7 +92,21 @@ The execution boundary is documented in [`docs/execution-security-contract.md`](
 
 ## Development
 
-Development requires stable Rust, Node.js 22+, and the Tauri 2 system prerequisites.
+Development requires stable Rust, Node.js 22+, and the Tauri 2 system prerequisites. On Ubuntu/Debian, install the desktop development libraries first:
+
+```bash
+sudo apt-get update
+sudo apt-get install --no-install-recommends \
+  build-essential \
+  curl \
+  file \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  libssl-dev \
+  libwebkit2gtk-4.1-dev \
+  libxdo-dev \
+  wget
+```
 
 ```bash
 # Rust CLI and tests
