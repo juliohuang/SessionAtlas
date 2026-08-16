@@ -28,11 +28,13 @@ mod security;
 
 use process::{git_read_spec, ProcessOutput, ProcessRunner, SystemProcessRunner};
 use pty::{normalize_pty_size, take_once, validate_pty_input, SessionStore, Utf8StreamDecoder};
+#[cfg(target_os = "windows")]
+use security::render_shell_command;
 use security::{
     build_argv_launch_input, is_shell_program, parse_command_template, quote_remote_path,
-    render_shell_command, ssh_destination, tool_launch_argv, validate_cli_argv,
-    validate_display_label, validate_external_url, validate_session_id, validate_ssh_host,
-    validate_ssh_user, validate_tool_key,
+    ssh_destination, tool_launch_argv, validate_cli_argv, validate_display_label,
+    validate_external_url, validate_session_id, validate_ssh_host, validate_ssh_user,
+    validate_tool_key,
 };
 
 const HOME_OVERRIDE_ENV: &str = "SESSIONATLAS_HOME";
@@ -997,9 +999,9 @@ fn launch_project(
     {
         let term = std::env::var("TERMINAL").ok().filter(|t| !t.is_empty());
         let chosen = term
-            .or_else(which("gnome-terminal"))
-            .or_else(which("konsole"))
-            .or_else(which("xterm"));
+            .or_else(|| which("gnome-terminal"))
+            .or_else(|| which("konsole"))
+            .or_else(|| which("xterm"));
         match chosen {
             Some(t) => {
                 // gnome-terminal needs `-- `, konsole/xterm use `-e`.
@@ -1200,13 +1202,9 @@ fn open_with_opener(opener_id: i64, path: String) -> Result<(), String> {
 }
 
 fn open_vscode(path: &std::path::Path) -> Result<(), String> {
-    let mut candidates = vec![std::path::PathBuf::from(if cfg!(windows) {
-        "code.exe"
-    } else {
-        "code"
-    })];
     #[cfg(windows)]
-    {
+    let candidates = {
+        let mut candidates = vec![std::path::PathBuf::from("code.exe")];
         if let Some(local) = dirs::data_local_dir() {
             candidates.push(local.join(r"Programs\Microsoft VS Code\Code.exe"));
         }
@@ -1215,7 +1213,10 @@ fn open_vscode(path: &std::path::Path) -> Result<(), String> {
                 candidates.push(std::path::PathBuf::from(root).join(r"Microsoft VS Code\Code.exe"));
             }
         }
-    }
+        candidates
+    };
+    #[cfg(not(windows))]
+    let candidates = vec![std::path::PathBuf::from("code")];
 
     for bin in candidates {
         match Command::new(&bin).arg(path).spawn() {
@@ -1302,9 +1303,9 @@ fn open_terminal_native(path: &std::path::Path) -> Result<(), String> {
         let term = std::env::var("TERMINAL")
             .ok()
             .filter(|t| !t.is_empty())
-            .or_else(which("gnome-terminal"))
-            .or_else(which("konsole"))
-            .or_else(which("xterm"));
+            .or_else(|| which("gnome-terminal"))
+            .or_else(|| which("konsole"))
+            .or_else(|| which("xterm"));
         match term {
             Some(t) => {
                 Command::new(t)
