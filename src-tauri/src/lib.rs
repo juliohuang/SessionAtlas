@@ -28,13 +28,11 @@ mod security;
 
 use process::{git_read_spec, ProcessOutput, ProcessRunner, SystemProcessRunner};
 use pty::{normalize_pty_size, take_once, validate_pty_input, SessionStore, Utf8StreamDecoder};
-#[cfg(target_os = "windows")]
-use security::render_shell_command;
 use security::{
     build_argv_launch_input, is_shell_program, parse_command_template, quote_remote_path,
-    ssh_destination, tool_launch_argv, validate_cli_argv, validate_display_label,
-    validate_external_url, validate_session_id, validate_ssh_host, validate_ssh_user,
-    validate_tool_key,
+    render_shell_command, ssh_destination, tool_launch_argv, validate_cli_argv,
+    validate_display_label, validate_external_url, validate_session_id, validate_ssh_host,
+    validate_ssh_user, validate_tool_key,
 };
 
 const HOME_OVERRIDE_ENV: &str = "SESSIONATLAS_HOME";
