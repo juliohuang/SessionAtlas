@@ -28,13 +28,11 @@ mod security;
 
 use process::{git_read_spec, ProcessOutput, ProcessRunner, SystemProcessRunner};
 use pty::{normalize_pty_size, take_once, validate_pty_input, SessionStore, Utf8StreamDecoder};
-#[cfg(target_os = "windows")]
-use security::render_shell_command;
 use security::{
     build_argv_launch_input, is_shell_program, parse_command_template, quote_remote_path,
-    ssh_destination, tool_launch_argv, validate_cli_argv, validate_display_label,
-    validate_external_url, validate_session_id, validate_ssh_host, validate_ssh_user,
-    validate_tool_key,
+    render_shell_command, ssh_destination, tool_launch_argv, validate_cli_argv,
+    validate_display_label, validate_external_url, validate_session_id, validate_ssh_host,
+    validate_ssh_user, validate_tool_key,
 };
 
 const HOME_OVERRIDE_ENV: &str = "SESSIONATLAS_HOME";
@@ -199,6 +197,15 @@ pub struct RemoteServer {
     scan_roots: String,
     #[serde(rename = "createdAt")]
     created_at: String,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct RemoteConnectionProbe {
+    home: String,
+    #[serde(rename = "tmuxAvailable")]
+    tmux_available: bool,
+    #[serde(rename = "tmuxVersion")]
+    tmux_version: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -1383,6 +1390,7 @@ struct PtySession {
     writer: Mutex<Box<dyn std::io::Write + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     reader: Mutex<Option<Box<dyn std::io::Read + Send>>>,
+    remote_server_id: Option<i64>,
 }
 
 #[derive(Default)]
@@ -1450,15 +1458,214 @@ fn shutdown_pty_sessions(registry: &PtyRegistry) {
     }
 }
 
+const REMOTE_TMUX_MISSING_MESSAGE: &str = "SessionAtlas requires tmux for persistent remote terminals.\nInstall tmux and reconnect (Ubuntu/Debian: sudo apt install tmux; Fedora/RHEL: sudo dnf install tmux; macOS: brew install tmux).\nSessionAtlas 的持久化远程终端需要 tmux。\n请安装 tmux 后重新连接（Ubuntu/Debian：sudo apt install tmux；Fedora/RHEL：sudo dnf install tmux；macOS：brew install tmux）。";
+const DEFAULT_REMOTE_SCAN_ROOTS: &str = "~ ~/projects ~/code";
+const REMOTE_TERMINAL_TYPE: &str = "xterm-256color";
+const REMOTE_TMUX_SOCKET: &str = "sessionatlas-v1";
+
+fn configure_remote_pty_environment(command: &mut CommandBuilder) {
+    // Windows commonly has no TERM (or inherits "dumb"). OpenSSH forwards
+    // this value in its PTY request; tmux otherwise rejects attach with
+    // "terminal does not support clear" before the remote TUI can start.
+    command.env("TERM", REMOTE_TERMINAL_TYPE);
+}
+
+fn remote_tmux_session_name(path: &str, tool_key: Option<&str>) -> Result<String, String> {
+    let tool_key = tool_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("shell");
+    let tool_key = validate_tool_key(tool_key)?.to_ascii_lowercase();
+    let display_key: String = tool_key
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(24)
+        .collect();
+
+    // FNV-1a keeps names deterministic across app restarts without adding a
+    // cryptographic dependency. The hash is an identifier, not a trust token.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in path
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(tool_key.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("sessionatlas-{display_key}-{hash:016x}"))
+}
+
+fn resolve_remote_tool_launch(
+    tool_key: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(Option<String>, Option<Vec<String>>), String> {
+    let requested_tool = tool_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let launch_argv = match requested_tool.as_deref() {
+        Some(value) if !value.eq_ignore_ascii_case("shell") => {
+            Some(resolve_configured_tool_launch_argv(value, session_id)?)
+        }
+        _ => {
+            if session_id.is_some_and(|value| !value.trim().is_empty()) {
+                return Err("session id requires a tool key".to_string());
+            }
+            None
+        }
+    };
+    Ok((requested_tool, launch_argv))
+}
+
+fn remote_tmux_startup_command(launch_argv: Option<&[String]>) -> Result<String, String> {
+    match launch_argv {
+        Some(arguments) => {
+            let launch_command = render_shell_command(arguments)?;
+            let login_script = format!("{launch_command}; exec \"$SHELL\" -l");
+            Ok(format!(
+                "exec \"$SHELL\" -lc {}",
+                shell_quote(&login_script)
+            ))
+        }
+        None => Ok("exec \"$SHELL\" -l".to_string()),
+    }
+}
+
+fn escape_tmux_formats(value: &str) -> String {
+    value.replace('#', "##")
+}
+
+/// Quote one argument for tmux's command parser. These strings are typed into
+/// the tmux command prompt, so POSIX shell quoting is not the correct grammar.
+fn tmux_quote_argument(value: &str) -> Result<String, String> {
+    if value.chars().any(char::is_control) {
+        return Err("tmux argument contains control characters".to_string());
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' | '"' | '$' => {
+                quoted.push('\\');
+                quoted.push(character);
+            }
+            // tmux formats treat #{...}, #(...), and short #X forms as
+            // expansion directives. Doubling keeps a caller-controlled #
+            // literal through the later format-expansion phase.
+            '#' => quoted.push_str("##"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
+
+fn build_remote_tmux_prompt_commands(
+    path: &str,
+    tool_key: Option<&str>,
+    launch_argv: Option<&[String]>,
+) -> Result<(String, String), String> {
+    // Validate paths with the same boundary as initial SSH launch before
+    // quoting for tmux's own command language.
+    let normalized_path = path.trim();
+    quote_remote_path(normalized_path)?;
+    let session_name = remote_tmux_session_name(normalized_path, tool_key)?;
+    let safe_path = tmux_quote_argument(normalized_path)?;
+    let startup_command = remote_tmux_startup_command(launch_argv)?;
+    let safe_startup_command = tmux_quote_argument(&startup_command)?;
+    Ok((
+        format!("new-session -d -s {session_name} -c {safe_path} {safe_startup_command}"),
+        format!("switch-client -t {session_name}"),
+    ))
+}
+
+fn write_tmux_prompt_command(
+    writer: &mut (dyn std::io::Write + Send),
+    command: &str,
+) -> Result<(), String> {
+    validate_pty_input(command)?;
+    if command.chars().any(char::is_control) {
+        return Err("tmux command contains control characters".to_string());
+    }
+    // Use the isolated socket's fixed C-b prefix, open the command prompt, and
+    // type slowly enough that remote PTYs do not classify the control sequence
+    // as pasted text. Tests skip delays but still assert the exact byte stream.
+    writer.write_all(b"\x02:").map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    #[cfg(not(test))]
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    for byte in command.bytes() {
+        writer.write_all(&[byte]).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+        #[cfg(not(test))]
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    writer.write_all(b"\r").map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    #[cfg(not(test))]
+    std::thread::sleep(std::time::Duration::from_millis(75));
+    Ok(())
+}
+
+fn ensure_remote_server_matches(
+    actual_server_id: Option<i64>,
+    requested_server_id: i64,
+) -> Result<(), String> {
+    if requested_server_id <= 0 {
+        return Err("remote server id must be positive".to_string());
+    }
+    match actual_server_id {
+        Some(actual) if actual == requested_server_id => Ok(()),
+        Some(_) => Err("PTY belongs to a different remote server".to_string()),
+        None => Err("PTY is not a remote server connection".to_string()),
+    }
+}
+
+fn build_remote_tmux_command(
+    path: &str,
+    tool_key: Option<&str>,
+    launch_argv: Option<&[String]>,
+) -> Result<String, String> {
+    let normalized_path = path.trim();
+    quote_remote_path(normalized_path)?;
+    let safe_path = quote_remote_path(&escape_tmux_formats(normalized_path))?;
+    let session_name = remote_tmux_session_name(normalized_path, tool_key)?;
+    let safe_session_name = shell_quote(&session_name);
+    let startup_command = remote_tmux_startup_command(launch_argv)?;
+    let safe_startup_command = shell_quote(&escape_tmux_formats(&startup_command));
+    let safe_missing_message = shell_quote(REMOTE_TMUX_MISSING_MESSAGE);
+    let safe_socket = shell_quote(REMOTE_TMUX_SOCKET);
+
+    Ok(format!(
+        "if ! command -v tmux >/dev/null 2>&1; then \
+         printf '%s\\n' {safe_missing_message} >&2; exit 127; fi; \
+         if ! tmux -L {safe_socket} has-session -t {safe_session_name} 2>/dev/null; then \
+         tmux -L {safe_socket} -f /dev/null new-session -d -s {safe_session_name} -c {safe_path} {safe_startup_command} 2>/dev/null || true; \
+         fi; \
+         tmux -L {safe_socket} set-option -g prefix C-b; \
+         tmux -L {safe_socket} set-option -g prefix2 None; \
+         tmux -L {safe_socket} set-option -g assume-paste-time 0; \
+         exec tmux -L {safe_socket} -f /dev/null attach-session -t {safe_session_name}"
+    ))
+}
+
 /// Spawn an interactive shell in `path` and stream its output.
 /// Returns the session id the frontend uses to address the tab.
 ///
 /// `source` is "local" (default) or "remote". When "remote", `path` is
 /// a directory path on the remote machine and `remote` carries the
-/// connection details — we shell out to `ssh` and let the remote
-/// shell land in that directory. `BatchMode=yes` ensures the SSH
-/// call fails fast (no interactive password prompt) when keys/auth
-/// are wrong.
+/// connection and tool details. We shell out to `ssh` and create or attach a
+/// persistent tmux session in that directory. `BatchMode=yes` ensures the SSH
+/// call fails fast (no interactive password prompt) when keys/auth are wrong.
 #[tauri::command]
 fn pty_spawn(
     path: String,
@@ -1470,6 +1677,9 @@ fn pty_spawn(
     claude_print: Option<String>,
 ) -> Result<u32, String> {
     let is_remote = source.as_deref() == Some("remote");
+    if is_remote && claude_print.is_some() {
+        return Err("remote queued prompts are not supported".to_string());
+    }
     if !is_remote && !std::path::Path::new(&path).is_dir() {
         return Err(format!("directory not found: {path}"));
     }
@@ -1484,6 +1694,7 @@ fn pty_spawn(
         })
         .map_err(|e| e.to_string())?;
 
+    let mut remote_server_id = None;
     let cmd = if let Some(prompt) = claude_print {
         // Queue/headless mode: run a single Claude Code prompt to
         // completion, then exit. `-p`/`--print` is non-interactive so
@@ -1534,19 +1745,26 @@ fn pty_spawn(
             cmd
         }
     } else if is_remote {
-        // Remote: ssh into the box, cd to the project dir, then exec
-        // the user's login shell. -tt forces a PTY on the remote side
-        // so apps like `claude` see a terminal and behave correctly.
+        // Remote: attach to a stable per-project/per-tool tmux session. A new
+        // session starts the selected tool once; reconnects attach without
+        // injecting a second launch command into the running TUI.
         let r = remote.ok_or_else(|| "remote pty opts missing".to_string())?;
+        if r.server_id <= 0 {
+            return Err("remote server id must be positive".to_string());
+        }
+        remote_server_id = Some(r.server_id);
         let port = r.port.unwrap_or(22);
         if port == 0 {
             return Err("SSH port must be between 1 and 65535".to_string());
         }
         let destination = ssh_destination(&r.user, &r.host)?;
         let identity_file = normalize_identity_file(r.identity_file.as_deref())?;
-        let safe_path = quote_remote_path(&path)?;
-        let shell_cmd = format!("cd {safe_path} && exec \"$SHELL\" -l");
+        let (requested_tool, launch_argv) =
+            resolve_remote_tool_launch(r.tool_key.as_deref(), r.session_id.as_deref())?;
+        let shell_cmd =
+            build_remote_tmux_command(&path, requested_tool.as_deref(), launch_argv.as_deref())?;
         let mut ssh = CommandBuilder::new("ssh");
+        configure_remote_pty_environment(&mut ssh);
         ssh.arg("-tt");
         ssh.arg("-o");
         ssh.arg("BatchMode=yes");
@@ -1583,6 +1801,7 @@ fn pty_spawn(
         writer: Mutex::new(writer),
         child: Mutex::new(child),
         reader: Mutex::new(Some(reader)),
+        remote_server_id,
     };
     match state.sessions.insert(session) {
         Ok(id) => Ok(id),
@@ -1731,6 +1950,42 @@ fn pty_write(id: u32, data: String, state: tauri::State<PtyRegistry>) -> Result<
         .write_all(data.as_bytes())
         .map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Reuse an existing SSH PTY and switch its attached tmux client to another
+/// deterministic project/tool session. This never starts another SSH process.
+#[tauri::command]
+fn pty_remote_switch(
+    id: u32,
+    path: String,
+    server_id: i64,
+    tool_key: String,
+    session_id: Option<String>,
+    state: tauri::State<PtyRegistry>,
+) -> Result<(), String> {
+    let session = state
+        .sessions
+        .get(id)?
+        .ok_or_else(|| "session not found".to_string())?;
+    ensure_remote_server_matches(session.remote_server_id, server_id)?;
+
+    let (requested_tool, launch_argv) =
+        resolve_remote_tool_launch(Some(&tool_key), session_id.as_deref())?;
+    let (create_command, switch_command) = build_remote_tmux_prompt_commands(
+        &path,
+        requested_tool.as_deref(),
+        launch_argv.as_deref(),
+    )?;
+
+    let mut writer = session
+        .writer
+        .lock()
+        .map_err(|_| "PTY writer lock poisoned".to_string())?;
+    // `new-session` is expected to report "duplicate session" when the target
+    // already exists. The independent second prompt must still switch to it.
+    write_tmux_prompt_command(writer.as_mut(), &create_command)?;
+    write_tmux_prompt_command(writer.as_mut(), &switch_command)?;
     Ok(())
 }
 
@@ -2409,11 +2664,17 @@ pub struct DocEntry {
 /// keeps in `state.remoteServerById[project.remoteServerId]`.
 #[derive(Deserialize, Debug)]
 struct RemotePtyOpts {
+    #[serde(rename = "serverId")]
+    server_id: i64,
     user: String,
     host: String,
     port: Option<u16>,
     #[serde(rename = "identityFile")]
     identity_file: Option<String>,
+    #[serde(rename = "toolKey")]
+    tool_key: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2526,7 +2787,7 @@ fn add_remote_server(
         .map(|path| path.to_string_lossy().into_owned());
     let scan_roots = match scan_roots {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => "~ ~/projects ~/code".to_string(),
+        _ => DEFAULT_REMOTE_SCAN_ROOTS.to_string(),
     };
     shell_quote_roots(&scan_roots)?;
     with_prefs(|c| {
@@ -2568,22 +2829,45 @@ fn delete_remote_server(server_id: i64) -> Result<(), String> {
     })
 }
 
-/// Connection pre-check for a remote SSH server: runs a single lightweight
-/// `echo` over ssh (reusing `build_ssh_command`, so BatchMode=yes +
-/// ConnectTimeout=5 apply) and classifies any failure into an actionable
-/// bilingual message via `classify_ssh_failure`.
+fn parse_remote_connection_probe(stdout: &str) -> RemoteConnectionProbe {
+    let mut home = String::new();
+    let mut tmux_available = false;
+    let mut tmux_version = None;
+    for line in stdout.lines() {
+        if let Some(index) = line.find("SESSIONATLAS_SSH_OK:") {
+            let value = &line[index + "SESSIONATLAS_SSH_OK:".len()..];
+            home = value.trim().to_string();
+        } else if let Some(index) = line.find("SESSIONATLAS_TMUX_OK:") {
+            let value = &line[index + "SESSIONATLAS_TMUX_OK:".len()..];
+            tmux_available = true;
+            let value = value.trim();
+            if !value.is_empty() {
+                tmux_version = Some(value.to_string());
+            }
+        }
+    }
+    RemoteConnectionProbe {
+        home,
+        tmux_available,
+        tmux_version,
+    }
+}
+
+/// Connection pre-check for a remote SSH server: confirms passwordless SSH,
+/// resolves `$HOME`, and reports whether tmux is available for persistent
+/// remote terminals. SSH failures remain actionable bilingual messages.
 ///
 /// Called by the frontend BEFORE `add_remote_server` so a server that can't
 /// be reached / lacks passwordless auth never lands in the prefs DB as a
-/// zombie record. On success returns Ok with the resolved $HOME (handy for
-/// diagnostics); on failure returns the classified message.
+/// zombie record. A missing tmux does not block project indexing; the returned
+/// capability lets the frontend warn before the first terminal is opened.
 #[tauri::command]
 fn test_remote_connection(
     user: String,
     host: String,
     port: Option<u16>,
     identity_file: Option<String>,
-) -> Result<String, String> {
+) -> Result<RemoteConnectionProbe, String> {
     let user = validate_ssh_user(&user)?.to_string();
     let host = validate_ssh_host(&host)?.to_string();
     let p = port.unwrap_or(22);
@@ -2592,9 +2876,12 @@ fn test_remote_connection(
     }
     let idfile = normalize_identity_file(identity_file.as_deref())?;
 
-    // A no-op remote command that also echoes $HOME — if it succeeds, both
-    // connectivity and passwordless auth are confirmed.
-    let probe = "printf 'SESSIONATLAS_SSH_OK:%s' \"$HOME\"";
+    // Keep the command successful when tmux is absent: SSH and indexing still
+    // work, while the structured result tells the UI to show an install hint.
+    let probe = "printf 'SESSIONATLAS_SSH_OK:%s\\n' \"$HOME\"; \
+                 if command -v tmux >/dev/null 2>&1; then \
+                 printf 'SESSIONATLAS_TMUX_OK:'; tmux -V 2>/dev/null; \
+                 else printf 'SESSIONATLAS_TMUX_MISSING\\n'; fi";
     let cmd = build_ssh_command(
         &user,
         &host,
@@ -2617,17 +2904,8 @@ fn test_remote_connection(
         return Err(classify_ssh_failure(&user, &host, p, &stderr));
     }
 
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    // Extract the home dir printed after our marker, if present.
-    let home = stdout
-        .find("SESSIONATLAS_SSH_OK:")
-        .map(|i| {
-            stdout[i + "SESSIONATLAS_SSH_OK:".len()..]
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
-    Ok(home)
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_remote_connection_probe(&stdout))
 }
 
 /// Mirror of the local `is_excluded_project_path` (which lives below).
@@ -2812,9 +3090,19 @@ struct RemoteScanRow {
 /// not corrupt the protocol.
 fn build_remote_scan_command(scan_roots: &str) -> Result<String, String> {
     let roots = shell_quote_roots(scan_roots)?;
+    // The two nested built-in roots are optional accelerators: they extend
+    // the depth available below common project directories, but many valid
+    // hosts do not have one or both of them. Preserve fail-closed behavior
+    // for every custom root list while skipping only absent built-in roots.
+    let skip_absent_builtin_roots = if scan_roots.trim() == DEFAULT_REMOTE_SCAN_ROOTS {
+        "if [ ! -e \"$r\" ]; then continue; fi; "
+    } else {
+        ""
+    };
     Ok(format!(
         "scan_failed=0; \
          for r in {roots}; do \
+             {skip_absent_builtin_roots}\
              if ! \
             find \"$r\" -maxdepth 6 -name .git -prune -exec sh -c ' \
                 for marker do \
@@ -4334,6 +4622,7 @@ pub fn run() {
             pty_spawn,
             pty_attach,
             pty_write,
+            pty_remote_switch,
             pty_resize,
             pty_kill,
             notify,
@@ -4546,12 +4835,20 @@ mod baseline_tests {
     }
 
     #[test]
-    fn remote_scan_command_accumulates_find_failures() {
+    fn custom_remote_scan_command_accumulates_find_failures() {
         let command = build_remote_scan_command("/missing /projects").unwrap();
         assert!(command.contains("scan_failed=0"));
         assert!(command.contains("scan_failed=1"));
         assert!(command.contains("exit \"$scan_failed\""));
+        assert!(!command.contains("if [ ! -e \"$r\" ]; then continue; fi"));
         assert!(!command.contains("+ 2>/dev/null"));
+    }
+
+    #[test]
+    fn built_in_remote_scan_roots_skip_only_absent_optional_directories() {
+        let command = build_remote_scan_command(DEFAULT_REMOTE_SCAN_ROOTS).unwrap();
+        assert!(command.contains("if [ ! -e \"$r\" ]; then continue; fi"));
+        assert!(command.contains("scan_failed=1"));
     }
 
     #[test]
@@ -4614,7 +4911,7 @@ mod baseline_tests {
 
     #[cfg(unix)]
     #[test]
-    fn remote_scan_shell_fails_closed_for_missing_root() {
+    fn custom_remote_scan_shell_fails_closed_for_missing_root() {
         let root =
             std::env::temp_dir().join(format!("sessionatlas-remote-shell-{}", std::process::id()));
         std::fs::create_dir_all(root.join("good")).unwrap();
@@ -5000,6 +5297,142 @@ mod baseline_tests {
             build_ssh_command("-oProxyCommand=calc", "example.test", 22, None, "printf ok")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn remote_connection_probe_reports_tmux_capability() {
+        assert_eq!(
+            parse_remote_connection_probe(
+                "banner:SESSIONATLAS_SSH_OK:/home/demo\nSESSIONATLAS_TMUX_OK:tmux 3.4\n"
+            ),
+            RemoteConnectionProbe {
+                home: "/home/demo".to_string(),
+                tmux_available: true,
+                tmux_version: Some("tmux 3.4".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_remote_connection_probe(
+                "SESSIONATLAS_SSH_OK:/home/demo\nSESSIONATLAS_TMUX_MISSING\n"
+            ),
+            RemoteConnectionProbe {
+                home: "/home/demo".to_string(),
+                tmux_available: false,
+                tmux_version: None,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_tmux_names_are_stable_safe_and_tool_scoped() {
+        let first = remote_tmux_session_name("/srv/Project One", Some("custom.tool")).unwrap();
+        let second = remote_tmux_session_name("/srv/Project One", Some("custom.tool")).unwrap();
+        let other_tool = remote_tmux_session_name("/srv/Project One", Some("claude")).unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_tool);
+        assert!(first.starts_with("sessionatlas-custom-tool-"));
+        assert!(first
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')));
+        assert!(remote_tmux_session_name("/srv/project", Some("-unsafe")).is_err());
+    }
+
+    #[test]
+    fn remote_pty_forwards_a_tmux_compatible_terminal_type() {
+        let mut command = CommandBuilder::new("ssh");
+        configure_remote_pty_environment(&mut command);
+
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+    }
+
+    #[test]
+    fn remote_tmux_command_detects_creates_and_reconnects_without_relaunch() {
+        let launch_argv = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "session-123".to_string(),
+        ];
+        let command =
+            build_remote_tmux_command("/srv/team's project", Some("claude"), Some(&launch_argv))
+                .unwrap();
+
+        assert!(command.contains("command -v tmux"));
+        assert!(command.contains("tmux -L 'sessionatlas-v1' has-session"));
+        assert!(command.contains("tmux -L 'sessionatlas-v1' -f /dev/null new-session -d"));
+        assert!(command.contains("2>/dev/null || true"));
+        assert!(command.contains("set-option -g prefix C-b"));
+        assert!(command.contains("set-option -g prefix2 None"));
+        assert!(command.contains("set-option -g assume-paste-time 0"));
+        assert!(command.contains("exec tmux -L 'sessionatlas-v1' -f /dev/null attach-session"));
+        assert!(command.contains("SessionAtlas requires tmux"));
+        assert!(command.contains("/srv/team'\"'\"'s project"));
+        assert_eq!(command.matches("claude --resume session-123").count(), 1);
+
+        let shell_command =
+            build_remote_tmux_command("~/projects/demo", Some("shell"), None).unwrap();
+        assert!(shell_command.contains("exec \"$SHELL\" -l"));
+        assert!(!shell_command.contains("--resume"));
+
+        let format_input = vec!["custom-tool".to_string(), "#(touch marker)".to_string()];
+        let escaped_formats = build_remote_tmux_command(
+            "/srv/#(path probe)",
+            Some("custom-tool"),
+            Some(&format_input),
+        )
+        .unwrap();
+        assert!(escaped_formats.contains("/srv/##(path probe)"));
+        assert!(escaped_formats.contains("##(touch marker)"));
+    }
+
+    #[test]
+    fn tmux_prompt_arguments_escape_tmux_expansion_and_reject_controls() {
+        assert_eq!(
+            tmux_quote_argument("/srv/#(touch marker)/team's $project/\"quoted\"\\path").unwrap(),
+            "\"/srv/##(touch marker)/team's \\$project/\\\"quoted\\\"\\\\path\""
+        );
+        assert!(tmux_quote_argument("/srv/project\nnext").is_err());
+    }
+
+    #[test]
+    fn remote_tmux_switch_builds_independent_create_and_switch_commands() {
+        let launch_argv = vec![
+            "codex".to_string(),
+            "resume".to_string(),
+            "session-456".to_string(),
+        ];
+        let (create, switch) = build_remote_tmux_prompt_commands(
+            "/srv/team's $project",
+            Some("codex"),
+            Some(&launch_argv),
+        )
+        .unwrap();
+        let expected_name =
+            remote_tmux_session_name("/srv/team's $project", Some("codex")).unwrap();
+
+        assert!(create.starts_with(&format!("new-session -d -s {expected_name}")));
+        assert!(create.contains("-c \"/srv/team's \\$project\""));
+        assert!(create.contains("codex resume session-456"));
+        assert_eq!(switch, format!("switch-client -t {expected_name}"));
+    }
+
+    #[test]
+    fn tmux_prompt_writer_emits_prefix_prompt_command_and_enter() {
+        let mut bytes = Vec::<u8>::new();
+        write_tmux_prompt_command(&mut bytes, "switch-client -t target").unwrap();
+        assert_eq!(bytes, b"\x02:switch-client -t target\r");
+        assert!(write_tmux_prompt_command(&mut bytes, "bad\ncommand").is_err());
+    }
+
+    #[test]
+    fn remote_switch_rejects_local_and_different_server_ptys() {
+        assert!(ensure_remote_server_matches(Some(7), 7).is_ok());
+        assert!(ensure_remote_server_matches(Some(7), 8).is_err());
+        assert!(ensure_remote_server_matches(None, 7).is_err());
+        assert!(ensure_remote_server_matches(Some(7), 0).is_err());
     }
 
     #[test]

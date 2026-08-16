@@ -10,6 +10,8 @@ import { iconSvg, TOOL_ICONS, FILETYPE_ICONS } from "./icons.js";
 import {
   activateTerminalHttpLink,
   buildPtyAttachRequest,
+  buildPtyRemoteSwitchRequest,
+  buildPtySpawnRequest,
   buildProjectPublication,
   canSubmitCompleteGroupOrder,
   captureResult,
@@ -18,6 +20,7 @@ import {
   createMutationQueue,
   createReloadCoordinator,
   findOpenTerminalTab,
+  findReusableRemoteTerminalTab,
   mergeProjectSources,
   projectGroupKey,
   projectCatalogFingerprint,
@@ -83,7 +86,7 @@ const state = {
   selectedId: null, cursor: -1,
   autoTimer: null, searchTimer: null,
   tabs: [],            // {ptyId, title, term, fit, pane, project, usage, dead}
-  openingPtys: new Map(), // project+tool → in-flight open promise
+  openingPtys: new Map(), // project+tool → in-flight open/switch promise
   ptyEventsReady: !HAS_TAURI,
   activeTabId: null,   // ptyId of active tab
   openerPrefs: [],          // full list (built-in + custom) from list_opener_prefs
@@ -106,6 +109,7 @@ const state = {
 const reloadCoordinator = createReloadCoordinator();
 const groupMutationQueue = createMutationQueue();
 const settingsMutationQueue = createMutationQueue();
+const remoteTerminalQueue = createMutationQueue();
 const entryDocsGate = createLatestRequestGate();
 const entryTreeGate = createLatestRequestGate();
 const docModalGate = createLatestRequestGate();
@@ -1909,8 +1913,68 @@ function openTerminalTab(project, usage) {
   return coalescePending(
     state.openingPtys,
     key,
-    () => openTerminalTabOnce(project, usage),
+    () => {
+      const openOrSwitch = () => {
+        const current = findOpenTerminalTab(state.tabs, project?.id, toolKey);
+        if (current) {
+          switchTab(current.tabId);
+          return current;
+        }
+        if (project?.source === "remote") {
+          const reusable = findReusableRemoteTerminalTab(
+            state.tabs,
+            project.remoteServerId,
+          );
+          if (reusable) return switchRemoteTerminalTab(reusable, project, usage);
+        }
+        return openTerminalTabOnce(project, usage);
+      };
+      if (project?.source !== "remote") return openOrSwitch();
+      return remoteTerminalQueue.run(
+        `server:${String(project.remoteServerId ?? "")}`,
+        openOrSwitch,
+      );
+    },
   );
+}
+
+async function switchRemoteTerminalTab(tab, project, usage) {
+  const toolKey = usage?.toolKey || "shell";
+  const isShell = toolKey === "shell";
+  const title = isShell ? project.name : `${project.name} · ${toolKey}`;
+  const serverLabel = state.remoteServerById[project.remoteServerId]?.label
+    || project.remoteServerId;
+  setStatus(tr("status.switchingRemoteSession", {
+    server: serverLabel,
+    title,
+  }));
+  tab.switching = true;
+  switchTab(tab.tabId);
+  try {
+    await invoke(
+      "pty_remote_switch",
+      buildPtyRemoteSwitchRequest(tab.ptyId, project, usage),
+    );
+  } catch (e) {
+    setStatus(tr("status.remoteSwitchFailed", { err: e }));
+    showActionError(tr("status.remoteSwitchFailed", { err: e }));
+    return tab;
+  } finally {
+    tab.switching = false;
+  }
+  if (tab.dead || !state.tabs.includes(tab)) return tab;
+
+  tab.project = project;
+  tab.usage = usage;
+  tab.title = title;
+  refreshTabButton(tab);
+  switchTab(tab.tabId);
+  recordTerminalActivity(project, usage);
+  setStatus(tr("status.remoteSessionSwitched", {
+    server: serverLabel,
+    title,
+  }));
+  return tab;
 }
 
 async function openTerminalTabOnce(project, usage) {
@@ -1970,25 +2034,19 @@ async function openTerminalTabOnce(project, usage) {
   term.open(pane);
   fit.fit();
 
+  const isRemote = project.source === "remote";
   let ptyId;
   try {
-    const isRemote = project.source === "remote";
     const server = isRemote
       ? state.remoteServerById[project.remoteServerId]
       : null;
-    const remoteOpts = isRemote && server
-      ? {
-          user: server.user,
-          host: server.host,
-          port: server.port,
-          identityFile: server.identityFile || null,
-        }
-      : null;
-    ptyId = await invoke("pty_spawn", {
-      path: project.path, cols: term.cols, rows: term.rows,
-      source: isRemote ? "remote" : "local",
-      remote: remoteOpts,
-    });
+    // Remote tools are launched only when a new deterministic tmux session is
+    // created. Reconnects attach without typing a duplicate command into it.
+    // Local launches still happen in pty_attach.
+    ptyId = await invoke(
+      "pty_spawn",
+      buildPtySpawnRequest(project, usage, server, term.cols, term.rows),
+    );
   } catch (e) {
     try { term.dispose(); } catch {}
     pane.remove();
@@ -2007,13 +2065,13 @@ async function openTerminalTabOnce(project, usage) {
   // tab is rendered and closed.
   const tab = {
     tabId: ptyId, kind: "pty", ptyId, title, term, fit, pane,
-    project, usage, dead: false,
+    project, usage, dead: false, switching: false,
   };
   state.tabs.push(tab);
 
   // Forward keystrokes to the PTY.
   term.onData((data) => {
-    if (tab.dead) return;
+    if (tab.dead || tab.switching) return;
     invoke("pty_write", { id: ptyId, data }).catch(() => {});
   });
 
@@ -2027,7 +2085,7 @@ async function openTerminalTabOnce(project, usage) {
   try {
     await invoke(
       "pty_attach",
-      buildPtyAttachRequest(ptyId, toolKey, usage?.lastSessionId),
+      buildPtyAttachRequest(ptyId, toolKey, usage?.lastSessionId, isRemote),
     );
   } catch (e) {
     // Closing the tab while attach was in flight is an intentional cancel,
@@ -2047,24 +2105,24 @@ async function openTerminalTabOnce(project, usage) {
   }
   if (tab.dead || !state.tabs.includes(tab)) return tab;
 
-  // Optimistically mark the project as just-touched so its entry__time
-  // ticks to "now" immediately — the backend's `lastAccessedAt` only
-  // updates on the next `sessionatlas scan`, which can be hours or days
-  // after the user opens a session. The auto-refresh will overwrite
-  // this with the server's value once it fires (or sooner if the
-  // user clicks RESCAN).
-  project.lastAccessedAt = new Date().toISOString();
-  // Re-render the ledger so this project's entry picks up the
-  // `has-session` class, its name turns green, AND its entry__time
-  // shows "now".
-  renderLedger();
+  recordTerminalActivity(project, usage);
   setStatus(tr("status.sessionOpen", { title }));
+  return tab;
+}
+
+function recordTerminalActivity(project, usage) {
+  const toolKey = usage?.toolKey || "shell";
+  // Optimistically mark the project as just-touched so its entry__time ticks
+  // to "now" immediately. Switching a reused remote connection must also move
+  // the green active-session marker from the previous project to this one.
+  project.lastAccessedAt = new Date().toISOString();
+  renderLedger();
   // For remote sessions, eagerly record the tool-usage row so the
   // session count / last-session-id surfaces in the next
   // list_remote_projects pull. The local equivalent is implicit (the
   // sessionatlas CLI notices the touched dir and writes to index.db), but
   // for remote we own the writer.
-  if (project.source === "remote" && !isShell) {
+  if (project.source === "remote" && toolKey !== "shell") {
     invoke("record_remote_tool_usage", {
       serverId: project.remoteServerId,
       projectId: project.id,
@@ -2073,7 +2131,6 @@ async function openTerminalTabOnce(project, usage) {
       sessionId: usage?.lastSessionId || null,
     }).catch(() => {});
   }
-  return tab;
 }
 
 // Open a file as a new tab in the right pane (instead of a modal). If
@@ -2218,10 +2275,7 @@ function openWebTab(url) {
   return tab;
 }
 
-function addTabButton(tab) {
-  const btn = document.createElement("div");
-  btn.className = "term-tab";
-  btn.dataset.tabId = String(tab.tabId);
+function tabButtonContent(tab) {
   // Icon: tool monogram for pty tabs, VS Code-style file-type tile for
   // file tabs, an "WB" tile for browser tabs.
   let icon;
@@ -2232,10 +2286,24 @@ function addTabButton(tab) {
   } else {
     icon = toolIcon(tab.usage?.toolKey || "shell");
   }
-  btn.innerHTML = `
+  return `
     ${icon}
     <span class="term-tab__name">${escapeHtml(tab.title)}</span>
     <button class="term-tab__close" title="${escapeHtml(tr("terms.closeTab"))}">✕</button>`;
+}
+
+function refreshTabButton(tab) {
+  const btn = termsBar.querySelector(
+    `.term-tab[data-tab-id="${CSS.escape(String(tab.tabId))}"]`,
+  );
+  if (btn) btn.innerHTML = tabButtonContent(tab);
+}
+
+function addTabButton(tab) {
+  const btn = document.createElement("div");
+  btn.className = "term-tab";
+  btn.dataset.tabId = String(tab.tabId);
+  btn.innerHTML = tabButtonContent(tab);
   btn.addEventListener("click", (e) => {
     if (e.target.closest(".term-tab__close")) { closeTab(tab.tabId); return; }
     switchTab(tab.tabId);
@@ -2984,6 +3052,7 @@ function closeSettings() {
   if (HAS_TAURI) loadOpenerPrefs();
 }
 function escCloseDrawer(e) {
+  if (e.key !== "Escape") return;
   // Esc pops one level on a sub-page first, then closes the drawer.
   if (!drawer.hidden) {
     e.stopPropagation();
@@ -3427,7 +3496,7 @@ async function submitDrawerForm(form, e) {
         // lands in the DB as a zombie record. The command returns a friendly,
         // bilingual, actionable message on failure.
         setStatus(tr("status.probing", { name: label }));
-        await invoke("test_remote_connection", {
+        const probe = await invoke("test_remote_connection", {
           user, host, port: port || null, identityFile: identityFile || null,
         });
 
@@ -3452,10 +3521,16 @@ async function submitDrawerForm(form, e) {
           showActionError(tr("status.serverAddedScanFailed", { name: label, err: scanError }));
           return;
         }
-        setStatus(tr("status.scanResult", { name: label, count }));
         form.reset();
         await reload();
         renderDrawerBody();
+        if (probe?.tmuxAvailable === false) {
+          showActionError(tr("status.serverAddedTmuxMissing", { name: label }));
+        } else {
+          const scanResult = tr("status.scanResult", { name: label, count });
+          const tmuxVersion = probe?.tmuxVersion || "tmux";
+          setStatus(`${scanResult} · ${tr("status.tmuxReady", { version: tmuxVersion })}`);
+        }
       } catch (e) {
         // Pre-check (or add/scan) failed: show the classified message but
         // keep the form values so the user can fix and retry.

@@ -16,8 +16,9 @@ data can cause an external process to start.
 
 ## Tool and session launch
 
-- The frontend sends optional `toolKey` and `sessionId` fields to `pty_attach`;
-  it never sends a ready-made command.
+- The frontend sends optional `toolKey` and `sessionId` fields to `pty_attach`
+  for local sessions and to `pty_spawn` / `pty_remote_switch` for remote tmux
+  sessions; it never sends a ready-made command or tmux target.
 - Tool keys are bounded identifiers and cannot begin with `-` or contain
   whitespace, control characters, or shell punctuation.
 - Session IDs are bounded identifiers. `--resume` and the value are appended
@@ -40,9 +41,26 @@ data can cause an external process to start.
   regular file. SessionAtlas checks metadata and canonicalizes the path; it never
   reads or logs key contents.
 - All connections enforce `BatchMode=yes`.
+- Remote terminal commands first verify `command -v tmux`. Session names are
+  backend-generated from a validated tool key plus a deterministic path hash;
+  callers cannot supply a tmux target or shell fragment. Existing sessions are
+  attached without replaying the tool launch command.
+- SessionAtlas uses its own `sessionatlas-v1` tmux socket with a fixed `C-b`
+  prefix. One SSH PTY is reused for all projects on a server. A switch request
+  is accepted only when its server ID matches the immutable server ID stored on
+  that PTY; the backend separately types a validated create command and a
+  backend-generated `switch-client` command into the tmux prompt. Tmux argument
+  quoting also doubles caller-controlled `#` characters so paths and custom
+  tool arguments cannot become `#{...}` or `#(...)` format expansions.
+- Remote PTY children receive the fixed `TERM=xterm-256color` capability value;
+  it is not caller-controlled and is forwarded by OpenSSH to tmux.
 - Remote paths reject control characters and use POSIX single-quote escaping
   that preserves apostrophes. A bare `~` or `~/...` keeps home expansion;
   `~other-user` is rejected.
+- The built-in scan roots treat absent `~/projects` or `~/code` directories as
+  optional, while any `find` failure for an existing built-in root and every
+  failure in a custom root list remains fail-closed and preserves the previous
+  remote snapshot.
 
 ## URLs and openers
 

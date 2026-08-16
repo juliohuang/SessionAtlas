@@ -13,6 +13,11 @@ async function installMutationFixture(page) {
     window.__rejectCommands = [];
     window.__invokeCalls = [];
     window.__remoteServers = [];
+    window.__tmuxProbe = {
+      home: "/home/tester",
+      tmuxAvailable: true,
+      tmuxVersion: "tmux 3.4",
+    };
     window.__TAURI__ = {
       core: {
         invoke: async (command, payload) => {
@@ -22,6 +27,7 @@ async function installMutationFixture(page) {
           if (command === "list_tools" || command === "list_remote_projects"
               || command === "search_remote_projects") return [];
           if (command === "list_remote_servers") return window.__remoteServers;
+          if (command === "test_remote_connection") return window.__tmuxProbe;
           if (command === "add_remote_server") {
             const server = {
               id: 11,
@@ -66,6 +72,25 @@ async function openSettingsView(page, view) {
   await page.locator("#settingsBtn").click();
   await page.locator(`[data-settings-view="${view}"]`).click();
 }
+
+test("typing in a settings form does not trigger the Escape-only drawer handler", async ({ page }) => {
+  await installMutationFixture(page);
+  await page.goto("/index.html");
+  await openSettingsView(page, "remote");
+
+  const label = page.locator('#serverForm [name="label"]');
+  await label.pressSequentially("E2E remote server");
+
+  await expect(label).toHaveValue("E2E remote server");
+  await expect(page.locator("#drawerTitle")).toHaveText("Remote servers");
+  await expect(page.locator("#drawer")).toBeVisible();
+
+  await label.press("Escape");
+  await expect(page.locator('[data-settings-view="remote"]')).toBeVisible();
+  await expect(page.locator("#drawer")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#drawer")).toBeHidden();
+});
 
 test("failed opener toggle restores the checkbox without replacing the ledger", async ({ page }) => {
   await installMutationFixture(page);
@@ -135,6 +160,28 @@ test("server add followed by scan failure is explicit partial success", async ({
   await expect(page.locator('.server-row[data-id="11"]')).toBeVisible();
   await expect(page.locator('#serverForm [name="label"]')).toHaveValue("");
   await expect(page.locator('article.entry[data-id="p1"]')).toBeVisible();
+});
+
+test("server add warns when the remote machine has no tmux", async ({ page }) => {
+  await installMutationFixture(page);
+  await page.goto("/index.html");
+  await openSettingsView(page, "remote");
+  await page.evaluate(() => {
+    window.__tmuxProbe = {
+      home: "/home/tester",
+      tmuxAvailable: false,
+      tmuxVersion: null,
+    };
+  });
+
+  await page.locator('#serverForm [name="label"]').fill("Remote without tmux");
+  await page.locator('#serverForm [name="user"]').fill("tester");
+  await page.locator('#serverForm [name="host"]').fill("example.test");
+  await page.locator('#serverForm [type="submit"]').click();
+
+  await expect(page.locator("#footStatus")).toContainText("tmux is not installed");
+  await expect(page.locator("#footStatus")).toContainText("sudo apt install tmux");
+  await expect(page.locator('.server-row[data-id="11"]')).toBeVisible();
 });
 
 test("successful write followed by reconciliation failure keeps last-known-good rows", async ({ page }) => {
