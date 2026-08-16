@@ -997,7 +997,9 @@ fn launch_project(
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let term = std::env::var("TERMINAL").ok().filter(|t| !t.is_empty());
+        let term = std::env::var_os("TERMINAL")
+            .filter(|t| !t.is_empty())
+            .map(std::path::PathBuf::from);
         let chosen = term
             .or_else(|| which("gnome-terminal"))
             .or_else(|| which("konsole"))
@@ -1300,9 +1302,9 @@ fn open_terminal_native(path: &std::path::Path) -> Result<(), String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let term = std::env::var("TERMINAL")
-            .ok()
+        let term = std::env::var_os("TERMINAL")
             .filter(|t| !t.is_empty())
+            .map(std::path::PathBuf::from)
             .or_else(|| which("gnome-terminal"))
             .or_else(|| which("konsole"))
             .or_else(|| which("xterm"));
