@@ -73,8 +73,13 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
   validator/quoting 再插入命令。
 - `launcher.rs` 构造 `<tool>{sessionId}` 命令行（`--resume <id>` 由可信后端追加）
   并打开平台终端。
-- 远程 SSH：`BatchMode=yes` 全量强制，纯免密；`classify_ssh_failure` 将 ssh 错误
-  转为可操作的中英双语提示。完整契约见
+- 远程 SSH：`BatchMode=yes` 全量强制，纯免密；连接探测同时报告 tmux 能力。
+  每个「远程项目 + 工具」映射到确定性的 tmux 会话，首次打开创建并启动工具，
+  后续打开只重连已有 TUI。同一服务器只保留一个前端 SSH PTY；选择该服务器上的
+  其他项目或工具时，通过后端 `pty_remote_switch` 在现有连接内创建（如需要）并
+  `switch-client`，不再启动额外 SSH 子进程。缺少 tmux 时给出安装提示，不回退到
+  易丢失的直连 Shell。
+  `classify_ssh_failure` 将 ssh 错误转为可操作的中英双语提示。完整契约见
   [`docs/execution-security-contract.md`](./docs/execution-security-contract.md)。
 
 ## 七、Tauri 桌面控制台
@@ -84,13 +89,16 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 - **进程内扫描**：`scan_projects` 通过 `spawn_blocking` 调用 `sessionatlas-core`
   的扫描管线，返回 `COUNT(*)`；不启动 sidecar 或子进程，不阻塞 Tauri async 线程。
 - **命令层**：`list_projects`、`search_projects`（FTS5 `MATCH`）、`list_tools`、
-  `scan_projects`、PTY 一组（`pty_spawn/attach/write/resize/kill`）、远程 SSH 一组、
+  `scan_projects`、PTY 一组（`pty_spawn/attach/write/remote_switch/resize/kill`）、远程 SSH 一组、
   打开器偏好、分组、Git 信息与托盘同步命令。结构体用 `#[serde(rename="camelCase")]`
   使 Rust snake_case 以 `lastAccessedAt` 形式到达 JS。
-- **PTY 终端**：右栏多标签，每标签一个伪终端；`pty_spawn` 先建未挂接 PTY，
-  前端注册标签后 `pty_attach` 携带结构化 `toolKey`/`sessionId`，后端校验并恰一次
-  转换为可选工具命令，再启动输出读取。自然退出/读失败/显式关闭/应用退出都会移除
-  注册项并回收子进程。xterm.js + addon-fit 本地 vendored 在 `frontend/vendor/`。
+- **PTY 终端**：右栏多标签，每标签一个伪终端；本地会话由 `pty_attach` 在监听器
+  就绪后恰一次启动工具。远程会话由 `pty_spawn` 把结构化工具元数据转换为安全的
+  tmux 首次启动命令，`pty_attach` 只开始输出桥接，避免重连时向已有 TUI 重复注入
+  启动命令；同服务器的后续项目由 `pty_remote_switch` 复用现有 SSH PTY，并将已
+  绑定服务器 ID 与请求 ID 匹配后切换确定性 tmux 会话。自然退出/读失败/显式关闭/应用退出都会移除本地注册项并回收 SSH
+  子进程，但远程 tmux 会话继续存在。xterm.js + addon-fit 本地 vendored 在
+  `frontend/vendor/`。
 - **前端**：`.stage` 双栏网格；单一 `state` 对象，改动经 `applyFilters()` → 渲染。
   `app.js` 按 `window.__TAURI__` 双模式运行（Tauri 调 Rust 命令，浏览器用内置
   `SAMPLE` 数据）。`frontend/i18n.js` 提供中英文案，`lang-init.js` 在绘制前设置

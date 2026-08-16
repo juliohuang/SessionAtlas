@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   activateTerminalHttpLink,
   buildPtyAttachRequest,
+  buildPtyRemoteSwitchRequest,
+  buildPtySpawnRequest,
   buildProjectPublication,
   canSubmitCompleteGroupOrder,
   captureResult,
@@ -12,6 +14,7 @@ import {
   createMutationQueue,
   createReloadCoordinator,
   findOpenTerminalTab,
+  findReusableRemoteTerminalTab,
   mergeProjectSources,
   projectGroupKey,
   projectCatalogFingerprint,
@@ -28,6 +31,80 @@ test("PTY attach sends structured tool metadata instead of a shell command", () 
   assert.deepEqual(
     buildPtyAttachRequest(8, "shell", "ignored"),
     { id: 8, toolKey: null, sessionId: null },
+  );
+  assert.deepEqual(
+    buildPtyAttachRequest(9, "codex", "remote-session", true),
+    { id: 9, toolKey: null, sessionId: null },
+  );
+});
+
+test("remote PTY spawn carries tool metadata for one-time tmux startup", () => {
+  const project = {
+    source: "remote",
+    path: "/srv/project",
+  };
+  const usage = {
+    toolKey: "codex",
+    lastSessionId: "session-123",
+  };
+  const server = {
+    id: 17,
+    user: "developer",
+    host: "example.test",
+    port: 2222,
+    identityFile: "/keys/id_ed25519",
+  };
+
+  assert.deepEqual(buildPtySpawnRequest(project, usage, server, 120, 40), {
+    path: "/srv/project",
+    cols: 120,
+    rows: 40,
+    source: "remote",
+    remote: {
+      serverId: 17,
+      user: "developer",
+      host: "example.test",
+      port: 2222,
+      identityFile: "/keys/id_ed25519",
+      toolKey: "codex",
+      sessionId: "session-123",
+    },
+  });
+});
+
+test("remote PTY switch identifies the existing server connection and target", () => {
+  assert.deepEqual(
+    buildPtyRemoteSwitchRequest(
+      44,
+      { source: "remote", remoteServerId: 17, path: "/srv/other-project" },
+      { toolKey: "claude", lastSessionId: "session-456" },
+    ),
+    {
+      id: 44,
+      path: "/srv/other-project",
+      serverId: 17,
+      toolKey: "claude",
+      sessionId: "session-456",
+    },
+  );
+});
+
+test("local PTY spawn leaves tool startup to attach", () => {
+  assert.deepEqual(
+    buildPtySpawnRequest(
+      { source: "local", path: "C:\\workspace\\project" },
+      { toolKey: "claude", lastSessionId: "session-123" },
+      null,
+      80,
+      24,
+    ),
+    {
+      path: "C:\\workspace\\project",
+      cols: 80,
+      rows: 24,
+      source: "local",
+      remote: null,
+    },
   );
 });
 
@@ -55,6 +132,19 @@ test("terminal dedup finds only a live matching project and tool tab", () => {
 
   assert.equal(findOpenTerminalTab(tabs, "p1", "codex")?.tabId, 7);
   assert.equal(findOpenTerminalTab(tabs, "p2", "codex"), undefined);
+});
+
+test("remote terminal reuse selects the newest live tab on the same server", () => {
+  const tabs = [
+    { tabId: 1, kind: "pty", dead: false, project: { source: "remote", remoteServerId: 7 } },
+    { tabId: 2, kind: "pty", dead: false, project: { source: "remote", remoteServerId: 8 } },
+    { tabId: 3, kind: "pty", dead: true, project: { source: "remote", remoteServerId: 7 } },
+    { tabId: 4, kind: "pty", dead: false, project: { source: "remote", remoteServerId: 7 } },
+    { tabId: 5, kind: "file", project: { source: "remote", remoteServerId: 7 } },
+  ];
+
+  assert.equal(findReusableRemoteTerminalTab(tabs, 7)?.tabId, 4);
+  assert.equal(findReusableRemoteTerminalTab(tabs, 9), undefined);
 });
 
 test("concurrent terminal opens share one in-flight operation and clear it", async () => {

@@ -18,9 +18,46 @@ export function activateTerminalHttpLink(event, uri, open) {
   return true;
 }
 
-export function buildPtyAttachRequest(id, toolKey, sessionId) {
+function buildRemotePtyOptions(usage, server) {
+  if (!server) return null;
+  const toolKey = String(usage?.toolKey || "shell");
+  return {
+    serverId: server.id,
+    user: server.user,
+    host: server.host,
+    port: server.port,
+    identityFile: server.identityFile || null,
+    toolKey,
+    sessionId: toolKey !== "shell" ? (usage?.lastSessionId || null) : null,
+  };
+}
+
+export function buildPtySpawnRequest(project, usage, server, cols, rows) {
+  const isRemote = project?.source === "remote";
+  return {
+    path: project?.path,
+    cols,
+    rows,
+    source: isRemote ? "remote" : "local",
+    remote: isRemote ? buildRemotePtyOptions(usage, server) : null,
+  };
+}
+
+export function buildPtyRemoteSwitchRequest(id, project, usage) {
+  return {
+    id,
+    path: project?.path,
+    serverId: project?.remoteServerId,
+    toolKey: String(usage?.toolKey || "shell"),
+    sessionId: usage?.toolKey && usage.toolKey !== "shell"
+      ? (usage.lastSessionId || null)
+      : null,
+  };
+}
+
+export function buildPtyAttachRequest(id, toolKey, sessionId, remote = false) {
   const key = String(toolKey ?? "shell");
-  const isShell = key === "shell";
+  const isShell = remote || key === "shell";
   return {
     id,
     toolKey: isShell ? null : key,
@@ -36,6 +73,17 @@ export function findOpenTerminalTab(tabs, projectId, toolKey) {
     && !tab.dead
     && String(tab.project?.id ?? "") === projectKey
     && String(tab.usage?.toolKey ?? "shell") === requestedTool
+  );
+}
+
+export function findReusableRemoteTerminalTab(tabs, remoteServerId) {
+  const serverKey = String(remoteServerId ?? "");
+  return [...(tabs || [])].reverse().find(tab =>
+    tab.kind === "pty"
+    && !tab.dead
+    && !tab.isQueue
+    && tab.project?.source === "remote"
+    && String(tab.project?.remoteServerId ?? "") === serverKey
   );
 }
 

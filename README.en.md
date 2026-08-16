@@ -76,7 +76,7 @@ Additional tools that meet the command-safety contract can be registered with `s
 - tool and recency filters, persistent groups, and drag ordering;
 - real multi-tab PTY terminals and recent-session resume actions;
 - configurable VS Code, file manager, terminal, and custom openers;
-- remote SSH indexing through passwordless key/agent authentication;
+- remote SSH indexing through passwordless key/agent authentication, with persistent tmux TUI sessions and one reused SSH terminal per server;
 - Chinese and English UI with keyboard-first navigation;
 - browser demo mode backed by bundled sample data when Tauri is unavailable.
 
