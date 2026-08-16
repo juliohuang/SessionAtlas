@@ -97,7 +97,15 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 ```bash
 sudo apt-get update
 sudo apt-get install --no-install-recommends \
-  libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
+  build-essential \
+  curl \
+  file \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  libssl-dev \
+  libwebkit2gtk-4.1-dev \
+  libxdo-dev \
+  wget
 ```
 
 ```bash

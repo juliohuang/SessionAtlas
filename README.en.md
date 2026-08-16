@@ -97,7 +97,15 @@ Development requires stable Rust, Node.js 22+, and the Tauri 2 system prerequisi
 ```bash
 sudo apt-get update
 sudo apt-get install --no-install-recommends \
-  libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
+  build-essential \
+  curl \
+  file \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  libssl-dev \
+  libwebkit2gtk-4.1-dev \
+  libxdo-dev \
+  wget
 ```
 
 ```bash
