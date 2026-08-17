@@ -1,7 +1,7 @@
 //! SQLite index writer: schema creation, migration, path identity, snapshot
 //! replacement, FTS5, list/search/exact lookup, session recording.
 //!
-//! Mirrors `Core/Store/SqliteStore.cs` (task R07). The store owns `index.db`
+//! The store owns `index.db`
 //! and writes exactly the schema the Tauri console queries read-only:
 //! `projects`, `tool_usages`, `sessions` plus the FTS5 `projects_fts` table.
 
@@ -716,8 +716,8 @@ fn migrate_tool_usage_identity(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Path-equality predicate for SQL: case-insensitive on Windows (matching the
-/// C# `COLLATE NOCASE` behavior), byte-exact on Unix.
+/// Path-equality predicate for SQL: case-insensitive on Windows and byte-exact
+/// on Unix.
 fn path_equality_clause(qualifier: &str) -> String {
     if cfg!(windows) {
         format!("{qualifier}path = ?1 COLLATE NOCASE")
@@ -903,12 +903,12 @@ fn path_identity_key(value: &str) -> String {
     }
 }
 
-/// Unicode case folding closest to C# `OrdinalIgnoreCase`.
+/// Unicode case folding used for case-insensitive identity matching.
 fn fold_case(value: &str) -> String {
     value.chars().flat_map(char::to_uppercase).collect()
 }
 
-/// Formats a UTC timestamp like C# `DateTime.ToString("O")` — parseable by
+/// Formats a UTC timestamp as RFC 3339 with microsecond precision, parseable by
 /// `DateTime::parse_from_rfc3339`.
 fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::AutoSi, true)

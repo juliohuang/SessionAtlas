@@ -1,7 +1,7 @@
 //! Codex scanner: recursive JSONL traversal, minimal field extraction,
 //! bad-line tolerance, time fallback, missing-session-id handling.
 //!
-//! Mirrors `Core/Scanner/CodexScanner.cs`. Only the project path, native
+//! Only the project path, native
 //! session ID and activity timestamp are extracted from each record; prompt,
 //! message and other session content is never read into the output.
 
@@ -34,8 +34,7 @@ impl CodexScanner {
         Self::with_availability(|| command_available("codex"))
     }
 
-    /// Availability override, mirroring the C# `CodexScanner(Func<bool>?)`
-    /// constructor so tests can pin the outcome deterministically.
+    /// Availability override so tests can pin the outcome deterministically.
     pub fn with_availability(availability: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_available: Box::new(availability),
@@ -99,8 +98,8 @@ impl CodexScanner {
 }
 
 /// Recursively enumerates `*.jsonl` session files in ordinal path order.
-/// Any inaccessible entry surfaces as `Err(())`, matching the C# recursive
-/// enumeration which throws on the first unreadable path.
+/// Any inaccessible entry surfaces as `Err(())`; enumeration stops on the
+/// first unreadable path.
 fn enumerate_jsonl_files(sessions_dir: &Path) -> Result<Vec<PathBuf>, ()> {
     let mut files = Vec::new();
     for entry in recursive_file_enumeration(sessions_dir) {
@@ -264,8 +263,7 @@ fn parse_session_file(
     });
 }
 
-/// Reads the file modification time as a UTC timestamp, mirroring the C#
-/// `File.GetLastWriteTimeUtc` fallback. Returns `None` only when the metadata
+/// Reads the file modification time as a UTC timestamp. Returns `None` only when the metadata
 /// is unavailable despite a successful read moments earlier.
 fn file_last_write_utc(path: &Path) -> Option<DateTime<Utc>> {
     let metadata = std::fs::metadata(path).ok()?;
@@ -273,8 +271,7 @@ fn file_last_write_utc(path: &Path) -> Option<DateTime<Utc>> {
     Some(modified.into())
 }
 
-/// Whether a command executable is reachable on `PATH`. Mirrors the C#
-/// `ScannerRegistry.CommandExists` without launching anything.
+/// Whether a command executable is reachable on `PATH` without launching it.
 fn command_available(command: &str) -> bool {
     let Some(path_value) = std::env::var_os("PATH") else {
         return false;

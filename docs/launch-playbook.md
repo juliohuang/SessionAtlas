@@ -15,7 +15,7 @@ Before launch, make an explicit keep-or-rename decision for `SessionAtlas`. An u
 ## GitHub settings checklist
 
 - Make the repository public only after the final secret/history scan.
-- Set the description to: `Local-first workspace for finding and resuming projects across Claude Code, Codex, Kimi, OpenCode, and Aider.`
+- Set the description to: `Local-first workspace for finding and resuming projects across Claude Code, Codex, Kimi, OpenCode, Aider, and Pi Coding Agent.`
 - Add topics: `ai-cli`, `developer-tools`, `tauri`, `rust`, `terminal`, `claude-code`, `codex`, `local-first`.
 - Use `docs/images/sessionatlas-browser-demo.png` or a purpose-built 1280×640 derivative as the social preview.
 - Enable Issues and Discussions; seed a welcome/roadmap discussion.
@@ -52,7 +52,7 @@ Before launch, make an explicit keep-or-rename decision for `SessionAtlas`. An u
 
 ### Short post
 
-> I built SessionAtlas, a local-first workspace for people who use several AI coding CLIs. It scans local Claude Code, Codex, Kimi, OpenCode, and Aider histories, deduplicates projects, and lets you resume work from a Tauri desktop console with real PTY terminals. The first Windows beta, source, threat boundaries, SBOM, and checksums are on GitHub. Feedback on first-run setup and scanner compatibility is especially useful.
+> I built SessionAtlas, a local-first workspace for people who use several AI coding CLIs. It scans local Claude Code, Codex, Kimi, OpenCode, Aider, and Pi Coding Agent histories, deduplicates projects, and lets you resume work from a Tauri desktop console with real PTY terminals. The first Windows beta, source, threat boundaries, SBOM, and checksums are on GitHub. Feedback on first-run setup and scanner compatibility is especially useful.
 
 ### Show HN title
 

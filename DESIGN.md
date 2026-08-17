@@ -6,7 +6,7 @@
 
 ## 一、定位与核心模型
 
-**一句话定位**：扫描本机多个 AI CLI（Claude Code、Codex、Kimi、OpenCode、Aider）
+**一句话定位**：扫描本机多个 AI CLI（Claude Code、Codex、Kimi、OpenCode、Aider、Pi Coding Agent）
 留下的工作目录，按规范化路径去重，建立统一 SQLite 索引，并在桌面控制台里一键续接
 AI 会话。
 
@@ -36,7 +36,7 @@ Cargo workspace
 - 核心 crate 不依赖 Tauri、前端或 CLI 显示库。
 - CLI 与 Tauri 都是同一核心的输入输出适配层；两者链接同一个 `sessionatlas-core`。
 - 数据目录统一为 `~/.sessionatlas/`：`index.db`（CLI 所有、Tauri 只读）、
-  `config.json`、`prefs.db`（Tauri 所有：分组、打开器、远程项目）。
+  `config.json`、`prefs.db`（Tauri 所有：分组、打开器、远程项目和项目忽略规则）。
 
 ## 三、扫描与索引数据流
 
@@ -50,7 +50,7 @@ Cargo workspace
   （`Failed`）；只有 `Succeeded` 可以替换对应工具快照，其余保留旧数据。
 - 路径语义在 `path.rs`：Windows 大小写不敏感、Unix 字节敏感；根路径不归一化为空。
 - 快照替换、孤儿项目清理、活动时间重算与 FTS 重建在同一事务内原子完成。
-- `prefs.db` 由 Tauri 管理，本地扫描不改其中的分组/排序/打开器/远程项目数据。
+- `prefs.db` 由 Tauri 管理，本地扫描不改其中的分组/排序/打开器/远程项目/忽略规则数据。
 
 ## 四、SQLite 存储
 
@@ -71,7 +71,8 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 - `security.rs`（core 与 src-tauri 各自一份）校验/引用工具 key、session ID、
   SSH 用户/主机/身份文件/远端路径、URL 与打开器模板；所有输入先过对应的
   validator/quoting 再插入命令。
-- `launcher.rs` 构造 `<tool>{sessionId}` 命令行（`--resume <id>` 由可信后端追加）
+- `launcher.rs` 构造工具对应的恢复命令（Codex 使用 `resume <id>`，Pi 使用 `--session <id>`，其余工具保留各自参数），
+  恢复参数与 session ID 由可信后端追加
   并打开平台终端。
 - 远程 SSH：`BatchMode=yes` 全量强制，纯免密；连接探测同时报告 tmux 能力。
   每个「远程项目 + 工具」映射到确定性的 tmux 会话，首次打开创建并启动工具，
@@ -84,13 +85,23 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 
 ## 七、Tauri 桌面控制台
 
-- **数据源**：只读打开 CLI 维护的 `index.db`；缺失时所有命令返回
-  "run `sessionatlas scan` first"。
+- **数据源**：查询时只读打开共享扫描核心维护的 `index.db`；首次启动检测到文件缺失时，
+  前端先触发一次进程内扫描再加载项目。已有索引（包括可信的空索引）不自动重复扫描；
+  首次扫描失败时不创建伪成功索引，并展示可重试引导。
 - **进程内扫描**：`scan_projects` 通过 `spawn_blocking` 调用 `sessionatlas-core`
   的扫描管线，返回 `COUNT(*)`；不启动 sidecar 或子进程，不阻塞 Tauri async 线程。
+- **远程扫描**：连接预检和 `scan_remote_server` / `scan_all_remote_servers` 的 SSH、
+  `find` 与 SQLite 工作也运行在 `spawn_blocking` worker。新增服务器保存后，前端立即恢复
+  表单并自动在后台完成首次扫描；按服务器去重扫描请求，完成后再刷新项目列表。每次成功
+  写入远程项目快照时，会在同一事务内记录 `last_scanned_at`，服务器列表显示该时间；失败
+  不覆盖上一次成功扫描时间。
+- **项目可见性**：本机与远程的列表、搜索均隐藏路径中任一以 `.` 开头的目录及其后代；
+  用户还可把任意项目目录树加入 `prefs.db.project_ignores`。本机规则按路径生效，远程规则
+  额外按服务器 ID 隔离。手动忽略只在查询层过滤，不删除扫描数据，因此移除规则后无需
+  重扫即可恢复；远程扫描返回的项目数也只统计最终可见行。
 - **命令层**：`list_projects`、`search_projects`（FTS5 `MATCH`）、`list_tools`、
   `scan_projects`、PTY 一组（`pty_spawn/attach/write/remote_switch/resize/kill`）、远程 SSH 一组、
-  打开器偏好、分组、Git 信息与托盘同步命令。结构体用 `#[serde(rename="camelCase")]`
+  项目忽略、打开器偏好、分组、Git 信息与托盘同步命令。结构体用 `#[serde(rename="camelCase")]`
   使 Rust snake_case 以 `lastAccessedAt` 形式到达 JS。
 - **PTY 终端**：右栏多标签，每标签一个伪终端；本地会话由 `pty_attach` 在监听器
   就绪后恰一次启动工具。远程会话由 `pty_spawn` 把结构化工具元数据转换为安全的
@@ -99,7 +110,8 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
   绑定服务器 ID 与请求 ID 匹配后切换确定性 tmux 会话。自然退出/读失败/显式关闭/应用退出都会移除本地注册项并回收 SSH
   子进程，但远程 tmux 会话继续存在。xterm.js + addon-fit 本地 vendored 在
   `frontend/vendor/`。
-- **前端**：`.stage` 双栏网格；单一 `state` 对象，改动经 `applyFilters()` → 渲染。
+- **前端**：`.stage` 双栏网格；单一 `state` 对象，改动经 `applyFilters()` → 渲染。项目账本
+  和选中项目概览始终显示来源徽标：本机为“本地”，SSH 项目为“远程 · 机器名”。
   `app.js` 按 `window.__TAURI__` 双模式运行（Tauri 调 Rust 命令，浏览器用内置
   `SAMPLE` 数据）。`frontend/i18n.js` 提供中英文案，`lang-init.js` 在绘制前设置
   `<html lang>`；OS 托盘菜单语言随 `set_tray_language` 变化。

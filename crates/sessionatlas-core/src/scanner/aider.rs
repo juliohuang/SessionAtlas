@@ -1,7 +1,7 @@
 //! Aider scanner: checks `.aider.chat.history` metadata only, never reads
 //! conversation content.
 //!
-//! Mirrors `Core/Scanner/AiderScanner.cs`. Availability (the `aider` executable
+//! Availability (the `aider` executable
 //! on PATH) is separate from historical-data discoverability (`.aider.chat.history`
 //! markers under `~/work`, `~/projects`, `~/dev`, `~/src`). Aider has no central
 //! session database, so a project is identified by the presence and modification
@@ -23,7 +23,7 @@ use crate::scanner::{
 /// Aider history-marker file name; a project is its parent directory.
 const HISTORY_MARKER: &str = ".aider.chat.history";
 
-/// Default search-root names under the sessionatlas home, in C# order.
+/// Default search-root names under the SessionAtlas home, in probe order.
 const SEARCH_ROOTS: [&str; 4] = ["work", "projects", "dev", "src"];
 
 /// Aider scanner.
@@ -145,8 +145,8 @@ impl Scanner for AiderScanner {
     }
 }
 
-/// Case rule for the in-scan path deduplication: Windows paths fold
-/// case-insensitively, everything else byte-exactly, matching the C#.
+/// Case rule for in-scan path deduplication: Windows paths fold
+/// case-insensitively and all other paths remain byte-exact.
 fn case_fold(path: &str) -> String {
     if cfg!(windows) {
         path.to_lowercase()

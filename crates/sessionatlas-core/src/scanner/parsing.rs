@@ -2,7 +2,7 @@
 //! native absolute-path normalization, trailing-separator trimming, and the
 //! recursive source-enumeration policy.
 //!
-//! Mirrors `Core/Scanner/ScannerParsing.cs`. Everything here is pure and
+//! Everything here is pure and
 //! filesystem-safe: it never touches `~/.sessionatlas` and never requires a
 //! tool-specific on-disk format.
 
@@ -21,7 +21,7 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Resolves the sessionatlas home directory. `SESSIONATLAS_HOME`, when set to
 /// a non-blank value, takes precedence (used by isolated tests and portable
 /// installs); otherwise the platform user home is returned. Blank overrides
-/// are ignored to match the C# `string.IsNullOrWhiteSpace` contract.
+/// are ignored.
 pub fn home_directory() -> Option<PathBuf> {
     if let Some(override_home) = std::env::var_os("SESSIONATLAS_HOME") {
         if !override_home.to_string_lossy().trim().is_empty() {

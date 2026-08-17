@@ -88,7 +88,7 @@ pub fn run_with_open_environment(
     env: &OpenEnvironment<'_>,
 ) -> i32 {
     match cli.command {
-        // No arguments: default interactive list, mirroring `Program.cs`.
+        // No arguments: default to the interactive project list.
         None => commands::list::run_list(
             io,
             db_path,

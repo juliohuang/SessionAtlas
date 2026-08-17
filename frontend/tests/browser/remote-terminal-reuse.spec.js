@@ -55,6 +55,17 @@ async function installRemoteTerminalFixture(page) {
               { toolKey: "claude", toolName: "Claude Code" },
             ];
           }
+          if (command === "probe_tui_capabilities") {
+            return {
+              source: payload?.serverId == null ? "local" : "remote",
+              serverId: payload?.serverId ?? null,
+              label: payload?.serverId == null ? "Local" : "development-box",
+              tools: [
+                { toolKey: "codex", toolName: "Codex CLI", installed: true, version: "test", enabled: true, installAvailable: true, installManager: "npm" },
+                { toolKey: "claude", toolName: "Claude Code", installed: true, version: "test", enabled: true, installAvailable: true, installManager: "npm" },
+              ],
+            };
+          }
           if (command === "pty_spawn") return 101;
           if (command === "pty_remote_switch" && window.__rejectRemoteSwitch) {
             throw new Error("switch rejected");
@@ -120,4 +131,59 @@ test("failed remote tmux switch keeps the original tab target", async ({ page })
   await expect(page.locator(".term-tab")).toHaveCount(1);
   await expect(page.locator(".term-tab__name")).toHaveText("project-one · codex");
   await expect(page.locator("#footStatus")).toContainText("switch rejected");
+});
+
+test("IME composition cannot horizontally shift the terminal workspace", async ({ page }) => {
+  await installRemoteTerminalFixture(page);
+  await page.goto("/index.html");
+
+  await page.locator('article.entry[data-id="remote-one"]').click();
+  await page.locator('#termsSelectedLaunch [data-tool="codex"]').click();
+  await expect(page.locator(".term-pane.is-active .xterm-helper-textarea")).toHaveCount(1);
+
+  const workspaceBefore = await page.locator(".stage__right").boundingBox();
+  const result = await page.evaluate(async () => {
+    const pane = document.querySelector(".term-pane.is-active");
+    const textarea = pane.querySelector(".xterm-helper-textarea");
+    const viewport = document.getElementById("termsViewport");
+    const overflowProbe = document.createElement("div");
+    overflowProbe.style.cssText = "position:absolute;left:0;top:0;width:4000px;height:1px";
+    pane.appendChild(overflowProbe);
+
+    textarea.dispatchEvent(new Event("compositionstart"));
+    const composingDuringInput = pane.classList.contains("is-composing");
+    pane.scrollLeft = 320;
+    viewport.scrollLeft = 240;
+    textarea.dispatchEvent(new Event("compositionupdate"));
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const offsetsDuringInput = {
+      pane: pane.scrollLeft,
+      viewport: viewport.scrollLeft,
+      document: document.scrollingElement.scrollLeft,
+    };
+
+    const resizeCountBeforeEnd = window.__invokeCalls
+      .filter(call => call.command === "pty_resize").length;
+    textarea.dispatchEvent(new Event("compositionend"));
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const resizeCountAfterEnd = window.__invokeCalls
+      .filter(call => call.command === "pty_resize").length;
+    overflowProbe.remove();
+
+    return {
+      composingDuringInput,
+      composingAfterInput: pane.classList.contains("is-composing"),
+      offsetsDuringInput,
+      resizeCountBeforeEnd,
+      resizeCountAfterEnd,
+    };
+  });
+  const workspaceAfter = await page.locator(".stage__right").boundingBox();
+
+  expect(result.composingDuringInput).toBe(true);
+  expect(result.composingAfterInput).toBe(false);
+  expect(result.offsetsDuringInput).toEqual({ pane: 0, viewport: 0, document: 0 });
+  expect(result.resizeCountAfterEnd).toBeGreaterThan(result.resizeCountBeforeEnd);
+  expect(workspaceAfter.x).toBe(workspaceBefore.x);
+  expect(workspaceAfter.width).toBe(workspaceBefore.width);
 });

@@ -49,6 +49,35 @@ test("workspace redesign exposes project overview and terminal regions", async (
   await expect(page.locator("#termsEmpty")).toContainText("terminal-lab");
 });
 
+test("project overview collapses into a persistent restore rail", async ({ page }) => {
+  await page.goto("/index.html");
+
+  const stage = page.locator("#stage");
+  const overview = page.locator(".stage__overview");
+  const terminal = page.locator(".stage__right");
+  const toggle = page.locator("#overviewToggleBtn");
+  const expandedTerminalWidth = (await terminal.boundingBox()).width;
+
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator("#termsSelectedLaunch")).toBeVisible();
+  await toggle.click();
+
+  await expect(stage).toHaveClass(/stage--overview-collapsed/);
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator("#termsSelectedLaunch")).toBeHidden();
+  expect((await overview.boundingBox()).width).toBeLessThanOrEqual(40);
+  expect((await terminal.boundingBox()).width).toBeGreaterThan(expandedTerminalWidth);
+
+  await page.reload();
+  await expect(stage).toHaveClass(/stage--overview-collapsed/);
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+  await toggle.click();
+  await expect(stage).not.toHaveClass(/stage--overview-collapsed/);
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator("#termsSelectedLaunch")).toBeVisible();
+});
+
 test("mocked Tauri mode publishes backend projects", async ({ page }) => {
   const errors = [];
   page.on("console", message => {

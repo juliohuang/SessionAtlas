@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`SessionAtlas` aggregates projects that have been worked on by multiple AI CLI coding tools (Claude Code, Codex, Kimi, OpenCode, Aider). The repo is a **pure Rust workspace** with two cooperating components sharing one data directory (`~/.sessionatlas/`):
+`SessionAtlas` aggregates projects that have been worked on by multiple AI CLI coding tools (Claude Code, Codex, Kimi, OpenCode, Aider, Pi Coding Agent). The repo is a **pure Rust workspace** with two cooperating components sharing one data directory (`~/.sessionatlas/`):
 
 1. **`sessionatlas` CLI** (`crates/sessionatlas-cli`, Rust) — the canonical scanner. Walks each AI tool's data directory, deduplicates by normalized path, and writes a unified index to `~/.sessionatlas/index.db` (SQLite + FTS5). Also launches AI CLIs in project dirs via `sessionatlas open`.
 2. **Tauri desktop console** (`src-tauri/` + `frontend/`, Rust + plain HTML/JS) — the **current primary GUI**. Opens the CLI's SQLite index read-only, browses/searches projects, and runs interactive AI-CLI terminals in-app via PTY. This is the actively-developed frontend.
@@ -55,7 +55,7 @@ libraries. CLI and Tauri are I/O adapters over the same core.
 - **`src/path.rs`** — path normalization, root-path display, and same-or-child
   parent/child semantics (Windows case-insensitive, Unix byte-sensitive).
 - **`src/scanner/`** — one `Scanner` per AI tool (`claude`, `codex`, `kimi`,
-  `opencode`, `aider`) plus a runtime-configured `custom` scanner; `base.rs`
+  `opencode`, `aider`, `pi`) plus a runtime-configured `custom` scanner; `base.rs`
   holds the shared driver, `parsing.rs` the shared time/record parsers. A
   structured `ScanOutcome` keeps a trustworthy empty snapshot distinct from
   unavailable or failed input.
@@ -136,7 +136,7 @@ is in `docs/execution-security-contract.md`.
 ## Conventions
 
 - Data dir for all components: `~/.sessionatlas/` (`index.db`, `config.json`, `prefs.db`). `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
-- Tool keys are lowercase short strings (`claude`, `codex`, `kimi`, `opencode`, `aider`) — keep consistent across CLI scanners, launcher templates, config, and the Tauri `TOOL_COLOR`/`TOOL_DOT` maps.
+- Tool keys are lowercase short strings (`claude`, `codex`, `kimi`, `opencode`, `aider`, `pi`) — keep consistent across CLI scanners, launcher templates, config, and the Tauri `TOOL_COLOR`/`TOOL_DOT` maps.
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` must stay green; use `#![deny(...)]`/strict clippy where the code already does.
 - Tauri frontend: keyboard is first-class (`/` search, `Esc` clear, `↑↓` nav, `Enter` launch) — don't break these. Match existing CSS tokens in `styles.css` rather than introducing new design primitives.
 - `DESIGN.md` holds the current Rust architecture/data-flow/security design; this file is the shorter engineering reference.

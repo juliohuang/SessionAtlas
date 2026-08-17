@@ -18,6 +18,164 @@ export function activateTerminalHttpLink(event, uri, open) {
   return true;
 }
 
+function tokenizeSshInput(input) {
+  const tokens = [];
+  let current = "";
+  let quote = null;
+  let started = false;
+
+  for (const character of String(input ?? "")) {
+    if (quote !== null) {
+      if (character === quote) {
+        quote = null;
+      } else {
+        current += character;
+      }
+      started = true;
+      continue;
+    }
+
+    if (character === '"' || character === "'") {
+      quote = character;
+      started = true;
+    } else if (/\s/.test(character)) {
+      if (started) {
+        tokens.push(current);
+        current = "";
+        started = false;
+      }
+    } else {
+      current += character;
+      started = true;
+    }
+  }
+
+  if (quote !== null) return { ok: false, error: "unterminatedQuote" };
+  if (started) tokens.push(current);
+  return { ok: true, tokens };
+}
+
+/**
+ * Parse the small, intentionally-bounded SSH syntax accepted by the remote
+ * server form. The returned fields are still validated by the Rust command;
+ * this parser never executes the supplied text as a shell command.
+ */
+export function parseSshConnectionInput(input) {
+  const tokenized = tokenizeSshInput(input);
+  if (!tokenized.ok) return tokenized;
+
+  const tokens = [...tokenized.tokens];
+  if (/^ssh(?:\.exe)?$/i.test(tokens[0] || "")) tokens.shift();
+  if (!tokens.length) return { ok: false, error: "empty" };
+
+  let destination = null;
+  let port = null;
+  let identityFile = null;
+  let optionsEnded = false;
+
+  const setOption = (kind, value) => {
+    if (!value) return { ok: false, error: "missingOptionValue", detail: kind };
+    if (kind === "-p") {
+      if (port !== null) return { ok: false, error: "duplicateOption", detail: kind };
+      if (!/^\d+$/.test(value)) return { ok: false, error: "port" };
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        return { ok: false, error: "port" };
+      }
+      port = parsed;
+    } else {
+      if (identityFile !== null) return { ok: false, error: "duplicateOption", detail: kind };
+      identityFile = value;
+    }
+    return null;
+  };
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!optionsEnded && token === "--") {
+      optionsEnded = true;
+      continue;
+    }
+
+    if (!optionsEnded && (token === "-p" || token === "-i")) {
+      const error = setOption(token, tokens[index + 1]);
+      if (error) return error;
+      index += 1;
+      continue;
+    }
+
+    if (!optionsEnded && (/^-p.+/.test(token) || /^-i.+/.test(token))) {
+      const kind = token.slice(0, 2);
+      const error = setOption(kind, token.slice(2));
+      if (error) return error;
+      continue;
+    }
+
+    if (!optionsEnded && token.startsWith("-")) {
+      return { ok: false, error: "unsupportedOption", detail: token };
+    }
+
+    if (destination !== null) {
+      return { ok: false, error: "extraArgument", detail: token };
+    }
+    destination = token;
+  }
+
+  if (!destination) return { ok: false, error: "destination" };
+  const separator = destination.lastIndexOf("@");
+  if (separator <= 0 || separator === destination.length - 1) {
+    return { ok: false, error: "destination" };
+  }
+
+  const user = destination.slice(0, separator);
+  let host = destination.slice(separator + 1);
+  let inlinePort = null;
+  let inlinePortText = null;
+
+  // Accept the familiar `user@host:port` shorthand as well as OpenSSH's
+  // `-p PORT`. Bracketed IPv6 keeps its brackets so the Rust validator and
+  // SSH destination builder continue to distinguish address colons from the
+  // optional port separator.
+  if (host.startsWith("[")) {
+    const bracketEnd = host.indexOf("]");
+    if (bracketEnd < 0) return { ok: false, error: "destination" };
+    const suffix = host.slice(bracketEnd + 1);
+    if (suffix) {
+      if (!suffix.startsWith(":")) return { ok: false, error: "destination" };
+      inlinePortText = suffix.slice(1);
+      host = host.slice(0, bracketEnd + 1);
+    }
+  } else {
+    const firstColon = host.indexOf(":");
+    const lastColon = host.lastIndexOf(":");
+    if (firstColon === lastColon && firstColon >= 0) {
+      if (firstColon === 0) return { ok: false, error: "destination" };
+      inlinePortText = host.slice(firstColon + 1);
+      host = host.slice(0, firstColon);
+    }
+  }
+
+  if (inlinePortText !== null) {
+    if (!/^\d+$/.test(inlinePortText)) return { ok: false, error: "port" };
+    inlinePort = Number(inlinePortText);
+    if (!Number.isInteger(inlinePort) || inlinePort < 1 || inlinePort > 65535) {
+      return { ok: false, error: "port" };
+    }
+    if (port !== null) return { ok: false, error: "duplicateOption", detail: "-p" };
+    port = inlinePort;
+  }
+
+  return {
+    ok: true,
+    value: {
+      user,
+      host,
+      port,
+      identityFile,
+    },
+  };
+}
+
 function buildRemotePtyOptions(usage, server) {
   if (!server) return null;
   const toolKey = String(usage?.toolKey || "shell");

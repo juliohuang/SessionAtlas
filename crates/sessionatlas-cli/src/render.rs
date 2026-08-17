@@ -63,7 +63,7 @@ fn skip_escape_sequence(chars: &mut std::str::Chars<'_>) {
     }
 }
 
-/// Relative time label mirroring the C# `ListCommand.FormatRelativeTime`.
+/// Formats a compact relative-time label.
 ///
 /// Accepts anything convertible to `SystemTime` (the core model timestamps
 /// convert via `From<DateTime<Utc>>`), so this module never names chrono types.
@@ -98,7 +98,7 @@ where
 }
 
 /// Formats an RFC 3339 timestamp (e.g. from `DateTime::to_rfc3339`) as
-/// `YYYY-MM-DD HH:MM` UTC wall time, mirroring the C# search table.
+/// `YYYY-MM-DD HH:MM` UTC wall time.
 pub fn format_absolute_time(rfc3339: &str) -> String {
     if rfc3339.len() >= 16 {
         format!(
@@ -114,8 +114,7 @@ pub fn format_absolute_time(rfc3339: &str) -> String {
     }
 }
 
-/// Formats an RFC 3339 timestamp as `MM-dd HH:MM`, mirroring the C# recent
-/// table.
+/// Formats an RFC 3339 timestamp as `MM-dd HH:MM` for the recent table.
 pub fn format_mm_dd_hm(rfc3339: &str) -> String {
     if rfc3339.len() >= 16 {
         format!(
@@ -130,7 +129,7 @@ pub fn format_mm_dd_hm(rfc3339: &str) -> String {
     }
 }
 
-/// Mirrors the C# `Truncate`: keeps the tail of the value and prefixes `...`.
+/// Keeps the tail of a long value and prefixes `...`.
 /// Operates on characters so multibyte text is never split mid-sequence.
 pub fn truncate(value: &str, max_length: usize) -> String {
     if max_length == 0 {
@@ -165,7 +164,7 @@ pub fn render_table(header: &[String], rows: &[Vec<String>]) -> String {
     lines.join("\n")
 }
 
-/// Renders the `list` table, mirroring the C# column set and truncation.
+/// Renders the `list` table with its canonical columns and truncation.
 pub fn render_list(projects: &[Project]) -> String {
     let header = vec![
         "#".to_string(),
@@ -192,7 +191,7 @@ pub fn render_list(projects: &[Project]) -> String {
     render_table(&header, &rows)
 }
 
-/// Renders the `search` table, mirroring the C# column set and the absolute
+/// Renders the `search` table with its canonical columns and the absolute
 /// `YYYY-MM-DD HH:MM` timestamp.
 pub fn render_search(projects: &[Project]) -> String {
     let header = vec![
@@ -218,7 +217,7 @@ pub fn render_search(projects: &[Project]) -> String {
     render_table(&header, &rows)
 }
 
-/// Renders the `recent` table, mirroring the C# `时间/工具/项目路径` columns.
+/// Renders the `recent` table with the `时间/工具/项目路径` columns.
 pub fn render_recent(sessions: &[Session]) -> String {
     let header = vec![
         "时间".to_string(),

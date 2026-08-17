@@ -49,10 +49,11 @@ Updated: 2026-08-15
   `kimi_scanner_home_resolution_follows_sessionatlas_then_kimi_code_home` 偶发失败；
   改为共享 parsing 模块级 `crate::scanner::parsing::ENV_LOCK` 后 6 轮全量 lib 测试稳定通过。
 
-## Remaining release gates（R14 未执行项与手工/真机验收）
+## Remaining release gates（2026-08-16 后续复核与手工/真机验收）
 
-1. R14 本地未重跑 `cargo audit`（本机未安装，按约定不新增工具）；托管 Security
-   workflow 固定安装 `cargo-audit 0.22.2` 并执行 `cargo audit`，仍是发布门禁。
+1. 2026-08-16 本地 `cargo audit 0.22.2` 已扫描 542 个锁定 crate：0 个漏洞、
+   17 个已分析的上游 informational warning；托管 Security workflow 仍须在交付
+   commit 上通过。
 2. 托管 CI 与托管 Security workflow 未在托管执行器上运行；Windows/Ubuntu 托管 job
    证据需在同一 commit 的托管执行器上产生。
 3. 原生 Tauri 交互矩阵 T1～T9（见

@@ -39,6 +39,7 @@ content was not copied.
 | Kimi Code | `~/.kimi-code/sessions/<worktree-key>/<session-id>/state.json` |
 | OpenCode | SQLite `project` and `session` tables in `opencode.db` |
 | Aider | project-local `.aider.chat.history` marker |
+| Pi Coding Agent | `~/.pi/agent/sessions/**/*.jsonl` with a `type: "session"` header containing `id`, `cwd`, and `timestamp` |
 
 Fixtures deliberately describe the current formats even when a production
 scanner does not support that format yet. Parser behavior for those fixtures
@@ -131,6 +132,32 @@ before `npm test`, and both `ci.yml` (windows-desktop) and `release.yml` build
 `target/release/sessionatlas.exe` to the acceptance script instead of relying on
 `cargo tauri build` to produce the CLI implicitly.
 
+## Interface regression and native walkthrough (R15, 2026-08-17, Windows x64)
+
+R15 exercised the current accumulated desktop changes, including first-run
+scan, local/remote source labels, SSH setup and background scan states, ignore
+rules, settings sub-pages, project details, file browsing, Markdown preview,
+and dialog keyboard behavior.
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | passed (exit 0) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | passed (exit 0) |
+| `cargo test --workspace` | 407 passed, 0 failed/ignored (exit 0) |
+| `npm --prefix frontend run check` | passed (exit 0) |
+| `npm --prefix frontend run test:unit` | 22 passed, 0 failed (exit 0) |
+| Playwright browser suite | all 42 cases reported `ok`; on this Windows tool session the runner did not finish teardown and was manually interrupted after the final result |
+| `npm --prefix frontend run build:static` | passed; all eight staged frontend source hashes matched `frontend/dist` |
+| `git diff --check` | passed (only Windows LF→CRLF notices) |
+
+The rebuilt native app was then launched with `cargo tauri dev`. A real local
+rescan completed and published 87 projects. The main ledger/overview/terminal
+layout, every settings sub-page, project detail, file workspace, and document
+preview were inspected. Settings focus entered the first row and returned to
+the opener on Escape. README badge/image Markdown rendered as labelled chips
+without the earlier raw `![...]` fragments. No real terminal command or remote
+SSH rescan was launched during UI automation; those remain separate live gates.
+
 ### Contracts protected now
 
 - `ProjectIndexer` merges tool observations, counts distinct native session
@@ -149,7 +176,7 @@ before `npm test`, and both `ci.yml` (windows-desktop) and `release.yml` build
 - SQLite snapshot tests cover stable project identity, exact usage
   replacement, partial and successful-empty scans, orphan/FTS cleanup,
   migration of duplicate legacy usages, and transaction rollback.
-- Current Claude, Codex, Kimi Code, OpenCode, and Aider formats are parsed from
+- Current Claude, Codex, Kimi Code, OpenCode, Aider, and Pi Coding Agent formats are parsed from
   sanitized temporary sources. Missing, malformed, unreadable-shape, and
   successful-empty sources exercise distinct scanner outcomes.
 - Configuration tests verify that malformed custom-tool configuration emits a
@@ -173,7 +200,7 @@ These are **not** claimed to have passed by local automation. They remain
 release gates and must be executed before release:
 
 - Real-user read-only scan of actually installed Claude/Codex/Kimi/OpenCode/
-  Aider data directories with project/session counts checked against the tool.
+  Aider/Pi data directories with project/session counts checked against the tool.
 - Cross-platform real terminal launch of `sessionatlas open` (Windows
   Terminal/cmd, macOS Terminal, and at least one Linux terminal).
 - Native Tauri interaction matrix T1–T9 (rapid A/B switching, docs/files close
@@ -183,10 +210,11 @@ release gates and must be executed before release:
 - Windows/Ubuntu hosted CI on the current commit (including the hosted Security
   workflow). Local R14 does not substitute for a hosted runner; RI-04 stays
   BLOCKED until such evidence exists on a shared commit.
-- `cargo audit` rerun: R14 local did **not** rerun it (the tool is not installed
-  locally and was not installed per the R14 boundary). The hosted Security
-  workflow still pins `cargo-audit 0.22.2` and runs `cargo audit`; it remains a
-  release gate. RI-05's earlier scan evidence is historical, not R14 evidence.
+- `cargo audit` rerun: on 2026-08-16, local `cargo audit 0.22.2` scanned 542
+  locked crates and exited 0 with no vulnerabilities. The 17 upstream
+  informational warnings are tracked in `execution-security-contract.md`.
+  The hosted Security workflow remains a separate release gate for the delivery
+  commit; local evidence does not replace its result.
 - Install in a sandbox without any extra language runtime and first scan.
 
 Earlier implementation baselines are archived only in

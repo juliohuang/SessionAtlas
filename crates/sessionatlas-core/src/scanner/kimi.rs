@@ -1,7 +1,7 @@
 //! Kimi scanner: recursive `state.json` discovery, `workDir` extraction,
 //! timestamp candidates and file-modification-time fallback.
 //!
-//! Mirrors `Core/Scanner/KimiScanner.cs`. Sessions live at
+//! Sessions live at
 //! `~/.kimi-code/sessions/<worktree-key>/<session-id>/state.json`. Only the
 //! project path, the session ID (the state file's parent directory name) and
 //! an activity timestamp are extracted; no conversation content is read.
@@ -35,8 +35,7 @@ impl KimiScanner {
         Self::with_availability(|| command_available("kimi"))
     }
 
-    /// Availability override, mirroring the C# `KimiScanner(Func<bool>?)`
-    /// constructor so tests can pin the outcome deterministically.
+    /// Availability override so tests can pin the outcome deterministically.
     pub fn with_availability(availability: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_available: Box::new(availability),
@@ -117,15 +116,14 @@ fn resolve_kimi_home() -> Option<PathBuf> {
     Some(application_home.join(".kimi-code"))
 }
 
-/// Whether an environment variable holds a non-blank value, mirroring the C#
-/// `string.IsNullOrWhiteSpace` guard.
+/// Whether an environment variable holds a non-blank value.
 fn env_var_non_blank(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
 }
 
 /// Recursively enumerates `state.json` files in ordinal path order. Any
-/// inaccessible entry surfaces as `Err(())`, matching the C# recursive
-/// enumeration which throws on the first unreadable path.
+/// inaccessible entry surfaces as `Err(())`; enumeration stops on the first
+/// unreadable path.
 fn enumerate_state_files(sessions_dir: &Path) -> Result<Vec<PathBuf>, ()> {
     let mut files = Vec::new();
     for entry in recursive_file_enumeration(sessions_dir) {
@@ -141,8 +139,8 @@ fn enumerate_state_files(sessions_dir: &Path) -> Result<Vec<PathBuf>, ()> {
     Ok(files)
 }
 
-/// The C# `Directory.GetFiles(..., "state.json", ...)` search pattern matches
-/// case-insensitively on Windows and byte-exactly elsewhere.
+/// Matches `state.json` case-insensitively on Windows and byte-exactly
+/// elsewhere.
 fn is_state_file(path: &Path) -> bool {
     let Some(file_name) = path.file_name() else {
         return false;
@@ -234,15 +232,14 @@ fn parse_state_file(
     });
 }
 
-/// First usable timestamp among the C# candidate property names, in order.
+/// First usable timestamp among the candidate property names, in order.
 fn read_timestamp(root: &Value) -> Option<DateTime<Utc>> {
     ["updatedAt", "lastUpdatedAt", "timestamp"]
         .into_iter()
         .find_map(|property| root.get(property).and_then(try_read_utc_timestamp))
 }
 
-/// Reads the file modification time as a UTC timestamp, mirroring the C#
-/// `File.GetLastWriteTimeUtc` fallback. Returns `None` only when the metadata
+/// Reads the file modification time as a UTC timestamp. Returns `None` only when the metadata
 /// is unavailable despite a successful read moments earlier.
 fn file_last_write_utc(path: &Path) -> Option<DateTime<Utc>> {
     let metadata = std::fs::metadata(path).ok()?;
@@ -250,8 +247,7 @@ fn file_last_write_utc(path: &Path) -> Option<DateTime<Utc>> {
     Some(modified.into())
 }
 
-/// Whether a command executable is reachable on `PATH`. Mirrors the C#
-/// `ScannerRegistry.CommandExists` without launching anything.
+/// Whether a command executable is reachable on `PATH` without launching it.
 fn command_available(command: &str) -> bool {
     let Some(path_value) = std::env::var_os("PATH") else {
         return false;

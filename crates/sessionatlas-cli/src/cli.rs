@@ -6,11 +6,11 @@
 
 use clap::{Args, Parser, Subcommand};
 
-/// Largest `--limit` accepted by `list` (mirrors the C# 1..=10000 range).
+/// Largest `--limit` accepted by `list`.
 pub const LIST_LIMIT_MAX: usize = 10_000;
-/// Largest `--count` accepted by `recent` (mirrors the C# 1..=1000 range).
+/// Largest `--count` accepted by `recent`.
 pub const RECENT_COUNT_MAX: usize = 1_000;
-/// Search result cap, mirroring the C# `SearchCommand` hard-coded 50.
+/// Search result cap.
 pub const SEARCH_LIMIT: usize = 50;
 
 /// The complete parse result of `sessionatlas [COMMAND] ...`.
@@ -48,7 +48,7 @@ pub enum Command {
 /// Arguments for `scan`.
 #[derive(Debug, Args)]
 pub struct ScanArgs {
-    /// 仅扫描指定工具，如 claude, codex, kimi
+    /// 仅扫描指定工具，如 claude, codex, kimi, pi
     #[arg(long)]
     pub tool: Option<String>,
 }
@@ -82,7 +82,7 @@ pub struct SearchArgs {
 pub struct OpenArgs {
     /// 项目路径（支持模糊匹配，留空进入交互选择）
     pub project_path: Option<String>,
-    /// 指定工具: claude, codex, kimi, opencode, aider
+    /// 指定工具: claude, codex, kimi, opencode, aider, pi
     #[arg(short = 't', long)]
     pub tool: Option<String>,
     /// 交互式选择工具
@@ -123,7 +123,7 @@ pub struct ConfigArgs {
     pub action: Option<ConfigAction>,
 }
 
-/// Clap value parser for `--limit`, matching the C# `1..=10000` range.
+/// Clap value parser for `--limit`, accepting `1..=10000`.
 pub fn parse_list_limit(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
         Ok(limit) if (1..=LIST_LIMIT_MAX).contains(&limit) => Ok(limit),
@@ -131,7 +131,7 @@ pub fn parse_list_limit(value: &str) -> Result<usize, String> {
     }
 }
 
-/// Clap value parser for `--count`, matching the C# `1..=1000` range.
+/// Clap value parser for `--count`, accepting `1..=1000`.
 pub fn parse_recent_count(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
         Ok(count) if (1..=RECENT_COUNT_MAX).contains(&count) => Ok(count),

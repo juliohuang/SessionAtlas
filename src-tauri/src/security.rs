@@ -55,9 +55,19 @@ pub(crate) fn tool_launch_argv(
     tool_key: &str,
     session_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let mut args = vec![validate_tool_key(tool_key)?.to_string()];
+    let tool_key = validate_tool_key(tool_key)?;
+    let mut args = vec![tool_key.to_string()];
     if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
-        args.push("--resume".to_string());
+        args.push(
+            if tool_key.eq_ignore_ascii_case("codex") {
+                "resume"
+            } else if tool_key.eq_ignore_ascii_case("pi") {
+                "--session"
+            } else {
+                "--resume"
+            }
+            .to_string(),
+        );
         args.push(validate_session_id(session_id)?.to_string());
     }
     Ok(args)
@@ -310,7 +320,15 @@ mod tests {
     fn tool_launch_input_rejects_shell_syntax() {
         assert_eq!(
             build_tool_launch_input(Some("codex"), Some("session-123")).unwrap(),
-            Some("codex --resume session-123\r".to_string())
+            Some("codex resume session-123\r".to_string())
+        );
+        assert_eq!(
+            build_tool_launch_input(Some("claude"), Some("session-123")).unwrap(),
+            Some("claude --resume session-123\r".to_string())
+        );
+        assert_eq!(
+            build_tool_launch_input(Some("pi"), Some("session-123")).unwrap(),
+            Some("pi --session session-123\r".to_string())
         );
         assert!(build_tool_launch_input(Some("codex & calc"), None).is_err());
         assert!(build_tool_launch_input(Some("codex"), Some("ok\rwhoami")).is_err());

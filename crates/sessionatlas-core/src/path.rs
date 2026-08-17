@@ -1,8 +1,7 @@
 //! Path normalization and semantics (Windows/POSIX flavors, root safety,
 //! display names, parent/child relations).
 //!
-//! Mirrors `SessionAtlas.Models.ProjectPathSemantics`. Explicit flavors are
-//! lexical so both platform contracts can be exercised on every host; the
+//! Explicit flavors are lexical so both platform contracts can be exercised on every host; the
 //! native flavor applies the current platform's rules without touching the
 //! filesystem or the current working directory.
 
@@ -40,8 +39,7 @@ impl PathFlavor {
     }
 }
 
-/// Rejects empty/all-whitespace input and any string containing a null byte,
-/// matching the C# `TryNormalize` preconditions.
+/// Rejects empty/all-whitespace input and any string containing a null byte.
 fn valid_input(candidate: &str) -> bool {
     !candidate.trim().is_empty() && !candidate.contains('\0')
 }
@@ -60,7 +58,7 @@ pub fn normalize(flavor: PathFlavor, candidate: &str) -> Option<String> {
 
 /// Native-flavor normalization: rejects relative/blank input, resolves the
 /// platform-rooted path with the standard library, then applies lexical rules.
-/// This mirrors C# `Path.GetFullPath`; it does not require the target to exist.
+/// The target does not need to exist.
 pub fn normalize_native(candidate: &str) -> Option<String> {
     if !valid_input(candidate) {
         return None;
@@ -143,7 +141,7 @@ fn normalize_windows(candidate: &str) -> Option<String> {
 }
 
 /// Drops empty and `.` segments; pops one segment per `..` (ignored above the
-/// root), matching the C# `ReduceSegments`.
+/// root).
 fn reduce_segments<'a, I>(source: I) -> Vec<&'a str>
 where
     I: IntoIterator<Item = &'a str>,
@@ -167,7 +165,7 @@ fn windows_case_key(value: &str) -> String {
 }
 
 /// Case rule for path comparison on a flavor. Windows uses invariant Unicode
-/// case folding as the closest Rust equivalent to C# `OrdinalIgnoreCase`;
+/// case folding;
 /// Unix compares byte-exactly.
 pub fn paths_equal(flavor: PathFlavor, a: &str, b: &str) -> bool {
     match flavor {
@@ -226,7 +224,7 @@ pub fn display_name_native(path: &str) -> Option<String> {
 
 /// Whether `candidate` equals `parent` (case rule) or lies strictly under it,
 /// bounded by a separator so sibling prefixes like `C:\repo2` are not treated
-/// as children of `C:\repo`. Mirrors the C# `IsSameOrChild`.
+/// as children of `C:\repo`.
 pub fn is_same_or_child(flavor: PathFlavor, candidate: &str, parent: &str) -> bool {
     if paths_equal(flavor, candidate, parent) {
         return true;

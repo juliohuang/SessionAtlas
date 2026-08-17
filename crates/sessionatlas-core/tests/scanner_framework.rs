@@ -139,7 +139,7 @@ fn scanner_framework_diagnostic_carries_tool_severity_code_and_actionable_messag
 }
 
 #[test]
-fn scanner_framework_probe_matches_csharp_semantics() {
+fn scanner_framework_probe_reports_expected_availability() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     std::fs::create_dir(&source).unwrap();

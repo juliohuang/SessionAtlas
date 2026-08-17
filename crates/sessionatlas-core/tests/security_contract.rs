@@ -1,6 +1,6 @@
 //! Contract tests for `sessionatlas_core::security`.
 //!
-//! Mirrors the R10 pass conditions and `CommandSecurityTests.cs`: tool keys,
+//! Covers the R10 pass conditions: tool keys,
 //! session IDs, display labels, safe command parsing, Windows/Posix command
 //! construction, Posix single-quoting, and shell/script-wrapper rejection.
 //! Every test is pure — no process is ever started and no environment or

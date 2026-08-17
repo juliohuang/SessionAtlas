@@ -4,7 +4,7 @@
 //! Task R09 implements the scanning pipeline that R08 left as a stub. The
 //! scanner set is injected so tests drive the contract with fake scanners and
 //! never touch real tool data directories; production builds the canonical set
-//! (five built-ins plus enabled, non-colliding custom tools) from the config
+//! (six built-ins plus enabled, non-colliding custom tools) from the config
 //! file. Only `ScanStatus::Succeeded` tools feed `replace_tool_snapshots` —
 //! `Failed`/`Unavailable` outcomes and panics preserve the previous snapshot.
 
@@ -19,6 +19,7 @@ use sessionatlas_core::scanner::codex::CodexScanner;
 use sessionatlas_core::scanner::custom::CustomToolScanner;
 use sessionatlas_core::scanner::kimi::KimiScanner;
 use sessionatlas_core::scanner::opencode::OpenCodeScanner;
+use sessionatlas_core::scanner::pi::PiScanner;
 use sessionatlas_core::scanner::{
     ScanDiagnostic, ScanDiagnosticSeverity, ScanStatus, ScannedProject, Scanner,
     CONFIG_READ_FAILED, UNEXPECTED_SCANNER_FAILURE,
@@ -30,10 +31,10 @@ use crate::render::sanitize;
 use crate::Io;
 
 /// Builds the canonical scanner set for the config file at `config_path`: the
-/// five built-in scanners in C# registration order, then each enabled custom
+/// six built-in scanners in canonical registration order, then each enabled custom
 /// tool whose key does not collide with a built-in (case-insensitive). When
 /// the config cannot be read or parsed, built-ins remain available and a
-/// `config_read_failed` diagnostic is returned, mirroring `ScannerRegistry`.
+/// a `config_read_failed` diagnostic is returned.
 pub fn build_default_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec<ScanDiagnostic>) {
     let mut scanners: Vec<Box<dyn Scanner>> = vec![
         Box::new(ClaudeScanner::new()),
@@ -41,6 +42,7 @@ pub fn build_default_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec
         Box::new(CodexScanner::new()),
         Box::new(OpenCodeScanner::new()),
         Box::new(AiderScanner::new()),
+        Box::new(PiScanner::new()),
     ];
     let mut diagnostics = Vec::new();
     match load_config(config_path) {

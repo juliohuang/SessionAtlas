@@ -3521,6 +3521,7 @@ dependencies = [
 name = "sessionatlas-tauri"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs",
  "portable-pty",
  "rusqlite",
@@ -3531,6 +3532,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-notification",
  "tauri-plugin-shell",
+ "tempfile",
  "url",
 ]
 

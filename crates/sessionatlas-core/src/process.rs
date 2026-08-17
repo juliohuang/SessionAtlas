@@ -52,7 +52,7 @@ impl fmt::Display for ProcessError {
 impl std::error::Error for ProcessError {}
 
 /// Boundary around operating-system process execution. Mirrors
-/// `Core/Process/IProcessRunner.cs`. Production uses
+/// The production implementation uses
 /// [`SystemProcessRunner`]; tests supply a recording fake so they never start
 /// terminals, tools, `where`, or `which`.
 pub trait ProcessRunner {
@@ -170,9 +170,8 @@ impl ProcessRunner for RecordingProcessRunner {
 }
 
 /// Executable resolution used for availability probing and terminal detection.
-/// Implementations never launch anything — they inspect PATH lexically and via
-/// filesystem metadata, mirroring the C# `ScannerRegistry.CommandExists`
-/// contract without invoking `where`/`which`.
+/// Implementations never launch anything: they inspect PATH lexically and via
+/// filesystem metadata without invoking `where`/`which`.
 pub trait ProgramResolver {
     /// Whether `program` resolves to an executable through PATH (or exists as
     /// a direct path).
