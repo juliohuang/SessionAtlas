@@ -12,14 +12,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::adapter::{AdapterManifest, AdapterRegistry};
 use crate::config::AppConfig;
 use crate::process::{ProcessError, ProcessRunner, ProcessSpec, ProgramResolver};
 use crate::security;
-
-/// The six built-in tool keys, in their canonical registration order. A custom tool
-/// whose key collides with one of these (case-insensitive) is never allowed to
-/// override a built-in identity.
-pub const BUILT_IN_TOOL_KEYS: [&str; 6] = ["claude", "kimi", "codex", "opencode", "aider", "pi"];
 
 /// Linux terminals in probe order.
 const LINUX_TERMINALS: [&str; 6] = [
@@ -89,25 +85,30 @@ impl std::error::Error for LauncherError {
 /// Whether `key` collides with a built-in identity, compared
 /// ASCII-case-insensitively. Custom tools may never override built-ins.
 pub fn is_reserved_tool_key(key: &str) -> bool {
-    BUILT_IN_TOOL_KEYS
-        .iter()
-        .any(|built_in| built_in.eq_ignore_ascii_case(key))
+    AdapterRegistry::bundled()
+        .expect("compiled official adapter manifests must always be valid")
+        .find(key)
+        .is_some()
 }
 
 /// Launchable tool identities and their CLI command text. Keys are matched
 /// ASCII-case-insensitively; lookups go through a lowercased map.
 pub struct ToolCommands {
-    commands: HashMap<String, String>,
+    commands: HashMap<String, ToolCommand>,
+}
+
+#[derive(Clone)]
+enum ToolCommand {
+    Adapter(Box<AdapterManifest>),
+    Legacy(String),
 }
 
 impl ToolCommands {
     /// The six built-in tools, each invoking its own binary.
     pub fn built_in() -> Self {
-        let mut commands = HashMap::new();
-        for key in BUILT_IN_TOOL_KEYS {
-            commands.insert(key.to_string(), key.to_string());
-        }
-        Self { commands }
+        let registry = AdapterRegistry::bundled()
+            .expect("compiled official adapter manifests must always be valid");
+        Self::from_registry(&AppConfig::default(), &registry)
     }
 
     /// Built-ins plus every custom tool that is enabled, has a valid key, has
@@ -115,7 +116,27 @@ impl ToolCommands {
     /// Invalid or hand-edited entries are ignored, mirroring
     /// `CliLauncher`'s constructor.
     pub fn from_config(config: &AppConfig) -> Self {
-        let mut commands = ToolCommands::built_in();
+        let registry = AdapterRegistry::bundled()
+            .expect("compiled official adapter manifests must always be valid");
+        Self::from_registry(config, &registry)
+    }
+
+    /// Active adapters plus enabled legacy custom tools. Adapter launch and
+    /// resume argv come from the validated manifest rather than tool-key
+    /// conditionals.
+    pub fn from_registry(config: &AppConfig, registry: &AdapterRegistry) -> Self {
+        let mut commands = ToolCommands {
+            commands: registry
+                .enabled(config)
+                .filter(|adapter| adapter.supports_platform(std::env::consts::OS))
+                .map(|adapter| {
+                    (
+                        adapter.id.to_lowercase(),
+                        ToolCommand::Adapter(Box::new(adapter.manifest.clone())),
+                    )
+                })
+                .collect(),
+        };
         for tool in &config.custom_tools {
             if !tool.is_enabled || tool.key.trim().is_empty() || tool.cli_command.trim().is_empty()
             {
@@ -127,12 +148,15 @@ impl ToolCommands {
             if security::parse_safe_command(&tool.cli_command).is_err() {
                 continue;
             }
-            if is_reserved_tool_key(&key) {
+            // An installed adapter owns its identity even while disabled. A
+            // legacy CustomTools entry must never replace its launch contract.
+            if registry.find(&key).is_some() {
                 continue;
             }
-            commands
-                .commands
-                .insert(key.to_lowercase(), tool.cli_command.clone());
+            commands.commands.insert(
+                key.to_lowercase(),
+                ToolCommand::Legacy(tool.cli_command.clone()),
+            );
         }
         commands
     }
@@ -145,8 +169,12 @@ impl ToolCommands {
     /// Whether the tool's executable can currently be found through the
     /// injectable resolver. Unknown or invalid tools are never available.
     pub fn is_tool_available(&self, key: &str, resolver: &dyn ProgramResolver) -> bool {
-        let Some(command_text) = self.lookup(key) else {
+        let Some(command) = self.lookup(key) else {
             return false;
+        };
+        let command_text = match command {
+            ToolCommand::Adapter(adapter) => &adapter.command,
+            ToolCommand::Legacy(command) => command,
         };
         match security::parse_safe_command(command_text) {
             Ok(tokens) if !tokens.is_empty() => resolver.is_on_path(&tokens[0]),
@@ -163,31 +191,34 @@ impl ToolCommands {
     ) -> Result<Vec<String>, LauncherError> {
         let validated_key = security::validate_tool_key(key)
             .map_err(|_| LauncherError::InvalidToolKey(key.to_string()))?;
-        let Some(command_text) = self.lookup(&validated_key) else {
+        let Some(command) = self.lookup(&validated_key) else {
             return Err(LauncherError::UnknownToolKey(validated_key));
         };
-        let mut arguments = security::parse_safe_command(command_text)
-            .map_err(|error| LauncherError::InvalidCommand(error.to_string()))?;
         if let Some(id) = session_id.filter(|id| !id.trim().is_empty()) {
-            let validated_id = security::validate_session_id(id)
+            security::validate_session_id(id)
                 .map_err(|_| LauncherError::InvalidSessionId(id.to_string()))?;
-            arguments.push(
-                if validated_key.eq_ignore_ascii_case("codex") {
-                    "resume"
-                } else if validated_key.eq_ignore_ascii_case("pi") {
-                    "--session"
-                } else {
-                    "--resume"
-                }
-                .to_string(),
-            );
-            arguments.push(validated_id);
         }
-        Ok(arguments)
+        match command {
+            ToolCommand::Adapter(adapter) => adapter
+                .launch_argv(session_id)
+                .map_err(|error| LauncherError::InvalidCommand(error.to_string())),
+            ToolCommand::Legacy(command_text) => {
+                let mut arguments = security::parse_safe_command(command_text)
+                    .map_err(|error| LauncherError::InvalidCommand(error.to_string()))?;
+                if let Some(id) = session_id.filter(|id| !id.trim().is_empty()) {
+                    arguments.push("--resume".to_string());
+                    arguments.push(
+                        security::validate_session_id(id)
+                            .map_err(|_| LauncherError::InvalidSessionId(id.to_string()))?,
+                    );
+                }
+                Ok(arguments)
+            }
+        }
     }
 
-    fn lookup(&self, key: &str) -> Option<&str> {
-        self.commands.get(&key.to_lowercase()).map(String::as_str)
+    fn lookup(&self, key: &str) -> Option<&ToolCommand> {
+        self.commands.get(&key.to_lowercase())
     }
 }
 

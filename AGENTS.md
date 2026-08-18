@@ -42,8 +42,8 @@ No JS bundler — `frontend/` is plain static HTML/CSS/JS served directly.
 ### Workspace layout
 ```
 Cargo workspace
-├─ crates/sessionatlas-core   # shared library: model, path, scanner, indexer,
-│                             # store, config, process/security, launcher
+├─ crates/sessionatlas-core   # shared library: adapter, model, path, scanner,
+│                             # indexer, store, config, process/security, launcher
 ├─ crates/sessionatlas-cli    # `sessionatlas` executable (clap commands)
 └─ src-tauri                  # Tauri 2 app, depends on sessionatlas-core
 ```
@@ -51,12 +51,16 @@ The core crate has no dependency on Tauri, the frontend, or CLI display
 libraries. CLI and Tauri are I/O adapters over the same core.
 
 ### `sessionatlas-core` (`crates/sessionatlas-core`)
+- **`src/adapter.rs`** — strict declarative adapter API v1, six compiled official
+  manifests, immutable local-version registry, active-version selection, and
+  safe new/resume argv construction. See `docs/tui-adapter-contract.md`.
 - **`src/model.rs`** — `Project`, `ToolUsage`, `Session`, `ToolSource`; identity and defaults.
 - **`src/path.rs`** — path normalization, root-path display, and same-or-child
   parent/child semantics (Windows case-insensitive, Unix byte-sensitive).
-- **`src/scanner/`** — one `Scanner` per AI tool (`claude`, `codex`, `kimi`,
-  `opencode`, `aider`, `pi`) plus a runtime-configured `custom` scanner; `base.rs`
-  holds the shared driver, `parsing.rs` the shared time/record parsers. A
+- **`src/scanner/`** — adapter-selected scanners: official `builtin.<id>`
+  handlers bridge the mature per-tool parsers and extension adapters use the
+  bounded `metadata-v1` parser; legacy `custom` entries remain compatible.
+  `base.rs` holds the shared driver, `parsing.rs` the shared time/record parsers. A
   structured `ScanOutcome` keeps a trustworthy empty snapshot distinct from
   unavailable or failed input.
 - **`src/indexer.rs`** — dedup/merge keyed by normalized path; same project
@@ -66,8 +70,8 @@ libraries. CLI and Tauri are I/O adapters over the same core.
   `tool_usages`, `sessions`, plus FTS5 `projects_fts`. Snapshot replacement,
   orphan cleanup, activity-time recomputation, and FTS rebuild happen in one
   SQLite transaction. Schema created/migrated idempotently.
-- **`src/config.rs`** — `~/.sessionatlas/config.json` (custom tools, per-path
-  preferred tool, default terminal) with case-insensitive reads, a bounded
+- **`src/config.rs`** — `~/.sessionatlas/config.json` (adapter selections and
+  active versions, legacy custom tools, per-path preferred tool, default terminal) with case-insensitive reads, a bounded
   cross-process lock, fingerprint conflict detection, and atomic replacement.
 - **`src/process.rs`** — injectable process runner for git, SSH, and browser
   launch; keeps every external invocation as an argument array.
@@ -97,6 +101,14 @@ successful scans replace snapshots atomically.
 `scan_projects`, `pty_spawn`/`pty_attach`/`pty_write`/`pty_resize`/`pty_kill`,
 the remote-SSH set (`test_remote_connection`/`add_remote_server`/`scan_remote_server`),
 project ignores, opener prefs, groups, git info, and the tray-sync commands.
+
+**TUI adapters**: every official and extension TUI resolves through the active
+`AdapterRegistry`. The settings page can import a validated absolute-path
+`adapter.json`, activate an already installed newer version, or point back to a
+retained older version. Adapter files are immutable and contain no executable
+code; v1 permits only fixed npm/uv package metadata and bounded scanner
+handlers. Per-machine enablement still requires the executable to be detected,
+and `platforms` / `supportsRemote` are enforced in the backend.
 
 **In-app terminals (PTY)**: the right pane hosts multiple interactive terminal
 tabs, one PTY each. `pty_spawn` creates and registers an unattached
@@ -135,8 +147,8 @@ is in `docs/execution-security-contract.md`.
 
 ## Conventions
 
-- Data dir for all components: `~/.sessionatlas/` (`index.db`, `config.json`, `prefs.db`). `prefs.db` also owns source-scoped project ignore rules; any path component starting with `.` is always hidden in the desktop project view. `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
-- Tool keys are lowercase short strings (`claude`, `codex`, `kimi`, `opencode`, `aider`, `pi`) — keep consistent across CLI scanners, launcher templates, config, and the Tauri `TOOL_COLOR`/`TOOL_DOT` maps.
+- Data dir for all components: `~/.sessionatlas/` (`index.db`, `config.json`, `adapters/<id>/<version>/adapter.json`, `prefs.db`). `prefs.db` also owns source-scoped project ignore rules; any path component starting with `.` is always hidden in the desktop project view. `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
+- Tool keys are lowercase short strings. Official identities (`claude`, `codex`, `kimi`, `opencode`, `aider`, `pi`) come from `adapters/official/*.json`; do not reintroduce separate launch/install key maps. Unknown adapter keys use the frontend's generic icon/color fallback.
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` must stay green; use `#![deny(...)]`/strict clippy where the code already does.
 - Tauri frontend: keyboard is first-class (`/` search, `Esc` clear, `↑↓` nav, `Enter` launch) — don't break these. Match existing CSS tokens in `styles.css` rather than introducing new design primitives.
 - `DESIGN.md` holds the current Rust architecture/data-flow/security design; this file is the shorter engineering reference.

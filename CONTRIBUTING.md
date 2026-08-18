@@ -24,7 +24,7 @@ npm run check
 npm test
 ```
 
-Run `cargo tauri dev` from the repository root for the desktop console. `scan_projects` runs the `sessionatlas-core` scan pipeline in-process on `spawn_blocking`; the installer does not bundle a separate scanner binary, and nothing requires a .NET runtime.
+Run `cargo tauri dev` from the repository root for the desktop console. `scan_projects` runs the `sessionatlas-core` scan pipeline in-process on `spawn_blocking`; the installer does not bundle a separate scanner binary or require an additional language runtime.
 
 ## Test isolation
 

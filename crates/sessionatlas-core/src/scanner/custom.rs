@@ -33,9 +33,12 @@ pub(crate) fn executable_on_path(executable: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// First whitespace-separated token of a CLI command, i.e. the executable.
-fn first_command_token(command: &str) -> &str {
-    command.split_whitespace().next().unwrap_or("")
+/// Safely parsed executable token of a configured CLI command. This preserves
+/// quoted absolute paths instead of truncating them at the first space.
+fn first_command_token(command: &str) -> Option<String> {
+    crate::security::parse_safe_command(command)
+        .ok()
+        .and_then(|tokens| tokens.into_iter().next())
 }
 
 /// Generic scanner for a user-configured directory whose direct children are
@@ -48,7 +51,7 @@ pub struct CustomToolScanner {
 impl CustomToolScanner {
     /// Scanner probing the configured `CliCommand` executable for availability.
     pub fn new(tool: ToolSource) -> Self {
-        let executable = first_command_token(&tool.cli_command).to_string();
+        let executable = first_command_token(&tool.cli_command).unwrap_or_default();
         Self::with_availability(tool, move || executable_on_path(&executable))
     }
 

@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "id": "codex",
+  "name": "Codex CLI",
+  "adapterVersion": "1.0.0",
+  "command": "codex",
+  "versionArgs": ["--version"],
+  "launch": {
+    "newArgs": [],
+    "resumeArgs": ["resume", "{sessionId}"]
+  },
+  "manager": "npm",
+  "package": "@openai/codex",
+  "scanner": { "handler": "builtin.codex" },
+  "platforms": ["windows", "macos", "linux"],
+  "supportsRemote": true
+}

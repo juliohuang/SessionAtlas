@@ -44,6 +44,17 @@ async function installMutationFixture(page) {
           if (command === "list_tools" || command === "list_remote_projects"
               || command === "search_remote_projects") return [];
           if (command === "list_remote_servers") return window.__remoteServers;
+          if (command === "probe_tui_capabilities") {
+            const serverId = payload?.serverId ?? null;
+            const server = window.__remoteServers.find(item => item.id === serverId);
+            return {
+              source: serverId == null ? "local" : "remote",
+              serverId,
+              label: server?.label || (serverId == null ? "Local" : "Remote"),
+              tools: [],
+              adapterDiagnostics: [],
+            };
+          }
           if (command === "list_project_ignores") return window.__projectIgnores;
           if (command === "list_project_docs") {
             return [{ name: "README.md", relPath: "README.md", size: window.__docText.length }];
@@ -377,6 +388,9 @@ test("server add returns while scanning and the display name remains editable", 
   await expect(page.locator('.server-row[data-id="11"] [data-server-last-scan]'))
     .toHaveText("Not scanned yet");
   await expect(page.locator("#footStatus")).toContainText("initial scan is running in the background");
+  await expect.poll(() => page.evaluate(() => window.__invokeCalls.some(call => (
+    call.command === "probe_tui_capabilities" && call.payload?.serverId === 11
+  )))).toBe(true);
 
   const name = page.locator('.server-row[data-id="11"] [data-server-rename]');
   await name.fill("Build machine");

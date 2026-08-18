@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "id": "claude",
+  "name": "Claude Code",
+  "adapterVersion": "1.0.0",
+  "command": "claude",
+  "versionArgs": ["--version"],
+  "launch": {
+    "newArgs": [],
+    "resumeArgs": ["--resume", "{sessionId}"]
+  },
+  "manager": "npm",
+  "package": "@anthropic-ai/claude-code",
+  "scanner": { "handler": "builtin.claude" },
+  "platforms": ["windows", "macos", "linux"],
+  "supportsRemote": true
+}

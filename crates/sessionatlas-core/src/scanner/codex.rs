@@ -17,6 +17,7 @@ use super::base::{
     MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, MISSING_SESSION_ID, SESSION_READ_FAILED,
     TIMESTAMP_FALLBACK,
 };
+use super::cache::FileCache;
 use super::parsing::{
     home_directory, recursive_file_enumeration, try_normalize_project_path, try_read_utc_timestamp,
 };
@@ -26,6 +27,8 @@ use super::parsing::{
 pub struct CodexScanner {
     is_available: Box<dyn Fn() -> bool>,
 }
+
+const PARSER_VERSION: u32 = 1;
 
 impl CodexScanner {
     /// Availability defaults to whether `codex` is on `PATH`; historical data
@@ -89,9 +92,21 @@ impl CodexScanner {
         let mut projects = Vec::new();
         let mut diagnostics = Vec::new();
         let codex_home = codex_home.to_string_lossy().into_owned();
+        let mut cache = FileCache::load(&home, PARSER_VERSION);
+        cache.retain_paths("codex", &session_files);
         for session_file in &session_files {
+            if let Some(cached) = cache.get("codex", session_file) {
+                projects.extend(cached);
+                continue;
+            }
+            let project_start = projects.len();
+            let diagnostic_start = diagnostics.len();
             parse_session_file(session_file, &codex_home, &mut projects, &mut diagnostics);
+            if diagnostics.len() == diagnostic_start && projects.len() > project_start {
+                cache.record("codex", session_file, &projects[project_start..]);
+            }
         }
+        cache.save();
 
         complete_session_files("codex", session_files.len(), projects, diagnostics)
     }

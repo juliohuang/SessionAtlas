@@ -16,8 +16,8 @@ use sessionatlas_core::scanner::kimi::KimiScanner;
 use sessionatlas_core::scanner::opencode::OpenCodeScanner;
 use sessionatlas_core::scanner::{
     ScanDiagnosticSeverity, ScanOutcome, ScanStatus, ScannedProject, Scanner,
-    MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, NO_VALID_SESSIONS, SESSION_READ_FAILED,
-    SOURCE_READ_FAILED, SOURCE_UNAVAILABLE, TIMESTAMP_FALLBACK,
+    AUXILIARY_SESSION_FILTERED, MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, NO_VALID_SESSIONS,
+    SESSION_READ_FAILED, SOURCE_READ_FAILED, SOURCE_UNAVAILABLE, TIMESTAMP_FALLBACK,
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -548,6 +548,38 @@ const OPENCODE_SCHEMA: &str = "
     );
 ";
 
+const OPENCODE_MODERN_SCHEMA: &str = "
+    CREATE TABLE project (
+        id TEXT PRIMARY KEY,
+        worktree TEXT NOT NULL,
+        name TEXT,
+        time_created INTEGER NOT NULL,
+        time_updated INTEGER NOT NULL
+    );
+    CREATE TABLE session (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        parent_id TEXT,
+        permission TEXT,
+        directory TEXT NOT NULL,
+        title TEXT NOT NULL,
+        version TEXT NOT NULL,
+        time_created INTEGER NOT NULL,
+        time_updated INTEGER NOT NULL,
+        time_archived INTEGER,
+        FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
+    );
+    CREATE TABLE message (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        time_created INTEGER NOT NULL,
+        time_updated INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+    );
+    CREATE INDEX message_session_idx ON message(session_id);
+";
+
 fn opencode_home_db(home: &Path) -> PathBuf {
     home.join(".local")
         .join("share")
@@ -562,6 +594,107 @@ fn create_opencode_db(database_path: &Path) -> Connection {
     let connection = Connection::open(database_path).unwrap();
     connection.execute_batch(OPENCODE_SCHEMA).unwrap();
     connection
+}
+
+fn create_modern_opencode_db(database_path: &Path) -> Connection {
+    if let Some(parent) = database_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let connection = Connection::open(database_path).unwrap();
+    connection.execute_batch(OPENCODE_MODERN_SCHEMA).unwrap();
+    connection
+}
+
+fn create_message_opencode_db(database_path: &Path) -> Connection {
+    let connection = create_opencode_db(database_path);
+    connection
+        .execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+            );
+            CREATE INDEX message_session_idx ON message(session_id);",
+        )
+        .unwrap();
+    connection
+}
+
+fn insert_modern_opencode_project(
+    connection: &Connection,
+    project_id: &str,
+    project_path: &str,
+    updated: i64,
+) {
+    connection
+        .execute(
+            "INSERT INTO project (id, worktree, name, time_created, time_updated)
+             VALUES (?1, ?2, 'Demo', ?3, ?3)",
+            rusqlite::params![project_id, project_path, updated],
+        )
+        .unwrap();
+}
+
+fn insert_modern_opencode_session(
+    connection: &Connection,
+    session_id: &str,
+    project_id: &str,
+    parent_id: Option<&str>,
+    project_path: &str,
+    updated: i64,
+    shape: (usize, bool),
+) {
+    let (user_turns, non_interactive_run) = shape;
+    let permission = non_interactive_run.then_some(
+        r#"[{"permission":"question","action":"deny","pattern":"*"},{"permission":"plan_enter","action":"deny","pattern":"*"},{"permission":"plan_exit","action":"deny","pattern":"*"}]"#,
+    );
+    connection
+        .execute(
+            "INSERT INTO session
+                (id, project_id, parent_id, permission, directory, title, version, time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'Fixture', '0.0.0', ?6, ?6)",
+            rusqlite::params![
+                session_id,
+                project_id,
+                parent_id,
+                permission,
+                project_path,
+                updated
+            ],
+        )
+        .unwrap();
+    insert_opencode_messages(connection, session_id, updated, user_turns);
+}
+
+fn insert_opencode_messages(
+    connection: &Connection,
+    session_id: &str,
+    updated: i64,
+    user_turns: usize,
+) {
+    for turn in 0..user_turns {
+        connection
+            .execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES (?1, ?2, ?3, ?3, '{\"role\":\"user\"}')",
+                rusqlite::params![format!("message-{session_id}-{turn}"), session_id, updated],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?3, '{\"role\":\"assistant\"}')",
+            rusqlite::params![
+                format!("message-{session_id}-assistant"),
+                session_id,
+                updated
+            ],
+        )
+        .unwrap();
 }
 
 fn insert_opencode_row(
@@ -623,6 +756,137 @@ fn opencode_scanner_reads_project_and_session_tables_read_only() {
         let project = project_by_path(projects, &path::normalize_native(&project_path).unwrap());
         assert_eq!(project.session_id.as_deref(), Some("session-opencode-demo"));
         assert_eq!(project.last_accessed_at, rfc3339("2026-07-30T12:00:00Z"));
+    });
+}
+
+#[test]
+fn opencode_scanner_excludes_exact_children_and_likely_delegated_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    with_home(dir.path(), || {
+        let database_path = opencode_home_db(dir.path());
+        let main_path = home_join(dir.path(), "work/main-project");
+        let single_path = home_join(dir.path(), "work/single-project");
+        let updated = unix_millis("2026-07-30T12:00:00Z");
+
+        let connection = create_modern_opencode_db(&database_path);
+        insert_modern_opencode_project(&connection, "p-main", &main_path, updated);
+        insert_modern_opencode_session(
+            &connection,
+            "s-main",
+            "p-main",
+            None,
+            &main_path,
+            updated,
+            (2, false),
+        );
+        insert_modern_opencode_session(
+            &connection,
+            "s-one-shot",
+            "p-main",
+            None,
+            &main_path,
+            updated + 1,
+            (1, true),
+        );
+        insert_modern_opencode_session(
+            &connection,
+            "s-child",
+            "p-main",
+            Some("s-main"),
+            &main_path,
+            updated + 2,
+            (1, false),
+        );
+        insert_modern_opencode_project(&connection, "p-single", &single_path, updated);
+        insert_modern_opencode_session(
+            &connection,
+            "s-single",
+            "p-single",
+            None,
+            &single_path,
+            updated,
+            (1, false),
+        );
+        drop(connection);
+
+        let outcome = OpenCodeScanner::with_availability(|| false).scan();
+        assert_eq!(outcome.status(), ScanStatus::Succeeded);
+        assert_eq!(outcome.projects().len(), 4, "activity rows are retained");
+
+        let normalized_main = path::normalize_native(&main_path).unwrap();
+        let main_rows: Vec<_> = outcome
+            .projects()
+            .iter()
+            .filter(|project| project.path == normalized_main)
+            .collect();
+        assert_eq!(main_rows.len(), 3);
+        assert_eq!(
+            main_rows
+                .iter()
+                .filter_map(|project| project.session_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["s-main"],
+            "only the multi-turn root remains resumable"
+        );
+
+        let single = project_by_path(
+            outcome.projects(),
+            &path::normalize_native(&single_path).unwrap(),
+        );
+        assert_eq!(
+            single.session_id.as_deref(),
+            Some("s-single"),
+            "one isolated one-turn root is not guessed to be delegated"
+        );
+
+        let diagnostic = outcome
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == AUXILIARY_SESSION_FILTERED)
+            .expect("auxiliary-session diagnostic");
+        assert!(diagnostic.message.contains("1 child session"));
+        assert!(diagnostic.message.contains("1 non-interactive run session"));
+        assert!(diagnostic
+            .message
+            .contains("0 likely one-shot delegated session"));
+    });
+}
+
+#[test]
+fn opencode_scanner_repeated_one_turn_roots_are_activity_only() {
+    let dir = tempfile::tempdir().unwrap();
+    with_home(dir.path(), || {
+        let database_path = opencode_home_db(dir.path());
+        let project_path = home_join(dir.path(), "work/delegated-project");
+        let updated = unix_millis("2026-07-30T12:00:00Z");
+
+        let connection = create_message_opencode_db(&database_path);
+        insert_modern_opencode_project(&connection, "p-delegated", &project_path, updated);
+        for (session_id, session_updated) in [("s-task-one", updated), ("s-task-two", updated + 1)]
+        {
+            connection
+                .execute(
+                    "INSERT INTO session
+                        (id, project_id, directory, title, version, time_created, time_updated)
+                     VALUES (?1, 'p-delegated', ?2, 'Fixture', '0.0.0', ?3, ?3)",
+                    rusqlite::params![session_id, project_path, session_updated],
+                )
+                .unwrap();
+            insert_opencode_messages(&connection, session_id, session_updated, 1);
+        }
+        drop(connection);
+
+        let outcome = OpenCodeScanner::with_availability(|| false).scan();
+        assert_eq!(outcome.status(), ScanStatus::Succeeded);
+        assert_eq!(outcome.projects().len(), 2);
+        assert!(
+            outcome
+                .projects()
+                .iter()
+                .all(|project| project.session_id.is_none()),
+            "the repeated one-shot batch has no resume target"
+        );
+        assert!(has_code(&outcome, AUXILIARY_SESSION_FILTERED));
     });
 }
 

@@ -2,6 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests/browser",
+  globalSetup: "./tests/browser-global-setup.mjs",
   fullyParallel: false,
   forbidOnly: true,
   retries: 0,
@@ -10,11 +11,5 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:4173",
     browserName: "chromium",
     headless: true,
-  },
-  webServer: {
-    command: "node tests/static-server.mjs",
-    url: "http://127.0.0.1:4173/index.html",
-    reuseExistingServer: false,
-    timeout: 15_000,
   },
 });

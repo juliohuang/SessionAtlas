@@ -164,6 +164,8 @@ fn config_contract_case_insensitive_property_names_at_appconfig_level() {
         r#"{
             "dEfAuLtTeRmInAl": "kitty",
             "CUSTOMTOOLS": [],
+            "enabledadapters": ["codex", "myagent"],
+            "ACTIVEADAPTERVERSIONS": { "myagent": "1.2.0" },
             "preferredtoolsbypath": { "C:\\repo": "codex" }
         }"#,
     )
@@ -171,6 +173,17 @@ fn config_contract_case_insensitive_property_names_at_appconfig_level() {
 
     let config = config::load(&path).unwrap();
     assert_eq!(config.default_terminal, "kitty");
+    assert_eq!(
+        config.enabled_adapters.as_deref(),
+        Some(["codex".to_string(), "myagent".to_string()].as_slice())
+    );
+    assert_eq!(
+        config
+            .active_adapter_versions
+            .get("myagent")
+            .map(String::as_str),
+        Some("1.2.0")
+    );
     assert_eq!(
         config
             .preferred_tools_by_path
@@ -242,6 +255,8 @@ fn config_contract_wrong_field_types_are_errors() {
         r#"{ "CustomTools": { "not": "an array" } }"#,
         r#"{ "CustomTools": [ 42 ] }"#,
         r#"{ "customtools": [ { "IsEnabled": "yes" } ] }"#,
+        r#"{ "EnabledAdapters": "codex" }"#,
+        r#"{ "ActiveAdapterVersions": ["codex"] }"#,
     ];
     for (index, json) in cases.iter().enumerate() {
         let path = temp.path().join(format!("config-{index}.json"));
@@ -258,6 +273,10 @@ fn config_contract_round_trip_preserves_config_and_pascal_case_keys() {
 
     let mut config = AppConfig::default();
     config.default_terminal = "windows-terminal".to_string();
+    config.enabled_adapters = Some(vec!["codex".to_string(), "mytool".to_string()]);
+    config
+        .active_adapter_versions
+        .insert("mytool".to_string(), "2.1.0".to_string());
     config
         .preferred_tools_by_path
         .insert(r"C:\repo".to_string(), "codex".to_string());
@@ -278,6 +297,8 @@ fn config_contract_round_trip_preserves_config_and_pascal_case_keys() {
 
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains("\"CustomTools\""));
+    assert!(text.contains("\"EnabledAdapters\""));
+    assert!(text.contains("\"ActiveAdapterVersions\""));
     assert!(text.contains("\"PreferredToolsByPath\""));
     assert!(text.contains("\"DefaultTerminal\""));
     assert!(text.contains("\"Key\""));

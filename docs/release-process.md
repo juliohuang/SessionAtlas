@@ -43,6 +43,6 @@ The beta workflow does not currently perform Windows Authenticode signing. Users
 
 ## Publishing
 
-Create an annotated beta tag such as `v0.1.0-beta.1` only after the release gate passes, then push that exact tag. Tags containing `-` are published as GitHub prereleases. The workflow refuses a manual run that is not attached to a tag.
+Create the next annotated beta tag (currently `v0.1.0-beta.3`) only after the release gate passes, then push that exact tag. Tags containing `-` are published as GitHub prereleases. The workflow refuses a manual run that is not attached to a tag.
 
 Repository visibility, private vulnerability reporting, secret scanning, branch protection, and release verification are GitHub settings and must be checked after the repository becomes public.

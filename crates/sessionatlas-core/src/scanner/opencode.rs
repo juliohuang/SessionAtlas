@@ -1,18 +1,19 @@
 //! OpenCode scanner: read-only SQLite open, alternate candidate paths, and a
 //! schema or query mismatch that must never masquerade as an empty success.
 //!
-//! Only the session id, the
-//! directory / project worktree and the two unix timestamps are read from the
-//! `session` and `project` tables; session bodies are never read.
+//! Only session identity/parent/permission metadata, the directory / project
+//! worktree, timestamps, and an aggregate count of user-role messages are
+//! read. Titles, prompts, parts, and message bodies never leave SQLite.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
 use super::base::{
     missing_source, probe_file, source_read_failure, ScanDiagnostic, ScanDiagnosticSeverity,
-    ScanOutcome, ScannedProject, Scanner, SourceProbe, MISSING_PROJECT_PATH, SOURCE_READ_FAILED,
-    TIMESTAMP_FALLBACK,
+    ScanOutcome, ScannedProject, Scanner, SourceProbe, AUXILIARY_SESSION_FILTERED,
+    MISSING_PROJECT_PATH, SOURCE_READ_FAILED, TIMESTAMP_FALLBACK,
 };
 use super::parsing::{home_directory, try_normalize_project_path, try_read_unix_timestamp};
 use crate::path::{self, PathFlavor};
@@ -140,6 +141,30 @@ struct OpenCodeRow {
     project_path: String,
     session_time_updated: Option<i64>,
     project_time_updated: Option<i64>,
+    /// Present only in newer OpenCode schemas. A non-blank value is an exact
+    /// child/subagent relationship and must never become a resume target.
+    parent_id: Option<String>,
+    /// Aggregate only; the scanner never reads message text. `None` means the
+    /// installed OpenCode schema/SQLite build cannot provide the aggregate.
+    user_turn_count: Option<i64>,
+    /// `Some(true)` is the exact permission signature written by the
+    /// non-interactive `opencode run` command. `None` means the schema cannot
+    /// expose that marker and the one-turn fallback may be considered.
+    non_interactive_run: Option<bool>,
+}
+
+struct PreparedOpenCodeRow {
+    session_id: String,
+    normalized_path: String,
+    last_accessed_at: DateTime<Utc>,
+    parent_id: Option<String>,
+    user_turn_count: Option<i64>,
+    non_interactive_run: Option<bool>,
+}
+
+#[derive(Default)]
+struct ProjectSessionShape {
+    root_count: usize,
 }
 
 /// Reads the OpenCode `session`/`project` tables read-only. Any open, schema,
@@ -158,33 +183,33 @@ fn try_read_database(
         Err(_) => return false,
     };
 
-    const QUERY: &str = "\
-        SELECT \
-            session.id, \
-            CASE \
-                WHEN TRIM(session.directory) <> '' THEN session.directory \
-                ELSE project.worktree \
-            END, \
-            session.time_updated, \
-            project.time_updated \
-        FROM session \
-        JOIN project ON project.id = session.project_id \
-        ORDER BY session.id \
-    ";
-
-    let mut statement = match connection.prepare(QUERY) {
-        Ok(statement) => statement,
+    let session_columns = match table_columns(&connection, "session") {
+        Ok(columns) => columns,
         Err(_) => return false,
     };
-    let rows = match statement.query_map([], |row| {
-        Ok(OpenCodeRow {
-            session_id: row.get(0)?,
-            project_path: row.get(1)?,
-            session_time_updated: row.get(2)?,
-            project_time_updated: row.get(3)?,
-        })
-    }) {
+    let message_columns = table_columns(&connection, "message").unwrap_or_default();
+    let has_parent_id = session_columns.iter().any(|column| column == "parent_id");
+    let has_permission = session_columns.iter().any(|column| column == "permission");
+    let can_count_user_turns = message_columns.iter().any(|column| column == "session_id")
+        && message_columns.iter().any(|column| column == "data");
+
+    // JSON role extraction is deliberately attempted only when the modern
+    // message schema is present. If an older SQLite build lacks JSON support,
+    // fall back to exact parent links (or legacy all-primary behaviour) rather
+    // than failing an otherwise trustworthy scan.
+    let rows = match read_database_rows(
+        &connection,
+        has_parent_id,
+        has_permission,
+        can_count_user_turns,
+    ) {
         Ok(rows) => rows,
+        Err(_) if has_permission || can_count_user_turns => {
+            match read_database_rows(&connection, has_parent_id, false, false) {
+                Ok(rows) => rows,
+                Err(_) => return false,
+            }
+        }
         Err(_) => return false,
     };
 
@@ -193,12 +218,8 @@ fn try_read_database(
         .map(|parent| parent.to_string_lossy().into_owned())
         .unwrap_or_default();
 
+    let mut prepared = Vec::with_capacity(rows.len());
     for row in rows {
-        let row = match row {
-            Ok(row) => row,
-            Err(_) => return false,
-        };
-
         let Some(normalized_path) = try_normalize_project_path(&row.project_path, &source_root)
         else {
             diagnostics.push(ScanDiagnostic::new(
@@ -226,14 +247,185 @@ fn try_read_database(
             }
         };
 
-        projects.push(ScannedProject {
-            path: normalized_path,
+        prepared.push(PreparedOpenCodeRow {
+            session_id: row.session_id,
+            normalized_path,
             last_accessed_at,
-            session_id: Some(row.session_id),
+            parent_id: row.parent_id,
+            user_turn_count: row.user_turn_count,
+            non_interactive_run: row.non_interactive_run,
+        });
+    }
+
+    let mut shapes: HashMap<String, ProjectSessionShape> = HashMap::new();
+    for row in &prepared {
+        if is_child_session(row) {
+            continue;
+        }
+        shapes
+            .entry(project_identity_key(&row.normalized_path))
+            .or_default()
+            .root_count += 1;
+    }
+
+    let mut child_count = 0usize;
+    let mut non_interactive_count = 0usize;
+    let mut likely_delegated_count = 0usize;
+    for row in prepared {
+        let is_child = is_child_session(&row);
+        let root_count = shapes
+            .get(&project_identity_key(&row.normalized_path))
+            .map_or(0, |shape| shape.root_count);
+        // Modern OpenCode persists the non-interactive `run` permission
+        // signature, which is stronger than a turn-count guess. Older schemas
+        // fall back conservatively: one isolated one-turn root stays
+        // resumable, while repeated one-turn roots for the same project are
+        // treated as likely delegated/headless activity.
+        let is_non_interactive = !is_child && row.non_interactive_run == Some(true);
+        let is_likely_delegated = !is_child
+            && !is_non_interactive
+            && row.non_interactive_run.is_none()
+            && row.user_turn_count == Some(1)
+            && root_count > 1;
+        if is_child {
+            child_count += 1;
+        } else if is_non_interactive {
+            non_interactive_count += 1;
+        } else if is_likely_delegated {
+            likely_delegated_count += 1;
+        }
+
+        projects.push(ScannedProject {
+            path: row.normalized_path,
+            last_accessed_at: row.last_accessed_at,
+            session_id: if is_child || is_non_interactive || is_likely_delegated {
+                None
+            } else {
+                Some(row.session_id)
+            },
             git_branch: None,
         });
     }
+
+    if child_count + non_interactive_count + likely_delegated_count > 0 {
+        diagnostics.push(ScanDiagnostic::new(
+            "opencode",
+            ScanDiagnosticSeverity::Info,
+            AUXILIARY_SESSION_FILTERED,
+            format!(
+                "Kept {child_count} child session(s), {non_interactive_count} non-interactive run session(s), and {likely_delegated_count} likely one-shot delegated session(s) as activity, but excluded them from resume targets."
+            ),
+        ));
+    }
     true
+}
+
+/// Returns column names without interpolating user input. Callers pass only
+/// hard-coded OpenCode table names.
+fn table_columns(connection: &rusqlite::Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    let query = match table {
+        "session" => "PRAGMA table_info(session)",
+        "message" => "PRAGMA table_info(message)",
+        _ => return Ok(Vec::new()),
+    };
+    let mut statement = connection.prepare(query)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect()
+}
+
+fn read_database_rows(
+    connection: &rusqlite::Connection,
+    has_parent_id: bool,
+    classify_non_interactive: bool,
+    count_user_turns: bool,
+) -> rusqlite::Result<Vec<OpenCodeRow>> {
+    let parent_projection = if has_parent_id {
+        "session.parent_id"
+    } else {
+        "NULL"
+    };
+    let (turn_projection, turn_join) = if count_user_turns {
+        (
+            "COALESCE(message_counts.user_turn_count, 0)",
+            "LEFT JOIN (\
+                SELECT session_id, SUM(\
+                    CASE WHEN json_valid(data) = 1 THEN \
+                        CASE WHEN json_extract(data, '$.role') = 'user' THEN 1 ELSE 0 END \
+                    ELSE 0 END\
+                ) AS user_turn_count \
+                FROM message \
+                GROUP BY session_id\
+             ) AS message_counts ON message_counts.session_id = session.id",
+        )
+    } else {
+        ("NULL", "")
+    };
+    let non_interactive_projection = if classify_non_interactive {
+        "CASE \
+            WHEN session.permission IS NULL OR TRIM(session.permission) = '' THEN 0 \
+            WHEN json_valid(session.permission) = 0 THEN 0 \
+            WHEN EXISTS (\
+                SELECT 1 FROM json_each(session.permission) \
+                WHERE json_extract(value, '$.permission') = 'question' \
+                  AND json_extract(value, '$.action') = 'deny'\
+            ) AND EXISTS (\
+                SELECT 1 FROM json_each(session.permission) \
+                WHERE json_extract(value, '$.permission') = 'plan_enter' \
+                  AND json_extract(value, '$.action') = 'deny'\
+            ) AND EXISTS (\
+                SELECT 1 FROM json_each(session.permission) \
+                WHERE json_extract(value, '$.permission') = 'plan_exit' \
+                  AND json_extract(value, '$.action') = 'deny'\
+            ) THEN 1 \
+            ELSE 0 \
+         END"
+    } else {
+        "NULL"
+    };
+    let query = format!(
+        "SELECT \
+            session.id, \
+            CASE \
+                WHEN TRIM(session.directory) <> '' THEN session.directory \
+                ELSE project.worktree \
+            END, \
+            session.time_updated, \
+            project.time_updated, \
+            {parent_projection}, \
+            {turn_projection}, \
+            {non_interactive_projection} \
+         FROM session \
+         JOIN project ON project.id = session.project_id \
+         {turn_join} \
+         ORDER BY session.id"
+    );
+    let mut statement = connection.prepare(&query)?;
+    let rows = statement.query_map([], |row| {
+        Ok(OpenCodeRow {
+            session_id: row.get(0)?,
+            project_path: row.get(1)?,
+            session_time_updated: row.get(2)?,
+            project_time_updated: row.get(3)?,
+            parent_id: row.get(4)?,
+            user_turn_count: row.get(5)?,
+            non_interactive_run: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn is_child_session(row: &PreparedOpenCodeRow) -> bool {
+    row.parent_id
+        .as_deref()
+        .is_some_and(|parent_id| !parent_id.trim().is_empty())
+}
+
+fn project_identity_key(path: &str) -> String {
+    if cfg!(windows) {
+        path.chars().flat_map(char::to_uppercase).collect()
+    } else {
+        path.to_string()
+    }
 }
 
 /// Session `time_updated`, then project `time_updated`. Returns `None` only

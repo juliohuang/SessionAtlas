@@ -27,8 +27,13 @@ pub const MISSING_SESSION_ID: &str = "missing_session_id";
 pub const TIMESTAMP_FALLBACK: &str = "timestamp_fallback";
 /// Session files were present but none produced a safe project record.
 pub const NO_VALID_SESSIONS: &str = "no_valid_sessions";
+/// Child-agent or likely one-shot delegated sessions were retained as tool
+/// activity but intentionally excluded from resume targets.
+pub const AUXILIARY_SESSION_FILTERED: &str = "auxiliary_session_filtered";
 /// The custom-tool configuration could not be read.
 pub const CONFIG_READ_FAILED: &str = "config_read_failed";
+/// An installed adapter manifest was invalid or unavailable.
+pub const ADAPTER_LOAD_FAILED: &str = "adapter_load_failed";
 /// An unexpected scanner failure escaped the tool-specific logic.
 pub const UNEXPECTED_SCANNER_FAILURE: &str = "unexpected_scanner_failure";
 

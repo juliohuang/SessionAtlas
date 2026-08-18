@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use sessionatlas_core::config::AppConfig;
 use sessionatlas_core::launcher::{
     build_process_spec, is_reserved_tool_key, native_terminal_platform, Launcher, LauncherError,
-    TerminalPlatform, ToolCommands, BUILT_IN_TOOL_KEYS,
+    TerminalPlatform, ToolCommands,
 };
 use sessionatlas_core::model::ToolSource;
 use sessionatlas_core::process::{ProgramResolver, RecordingProcessRunner};
@@ -35,10 +35,15 @@ fn no_wt(_: &Path) -> bool {
 }
 
 fn built_ins_are_the_six_supported_identities() {
-    let mut keys: Vec<&str> = BUILT_IN_TOOL_KEYS.to_vec();
+    let registry = sessionatlas_core::adapter::AdapterRegistry::bundled().unwrap();
+    let mut keys = registry
+        .adapters()
+        .iter()
+        .map(|adapter| adapter.id.as_str())
+        .collect::<Vec<_>>();
     keys.sort_unstable();
     assert_eq!(keys, ["aider", "claude", "codex", "kimi", "opencode", "pi"]);
-    for key in BUILT_IN_TOOL_KEYS {
+    for key in keys {
         assert!(is_reserved_tool_key(key), "{key} must be reserved");
         assert!(
             is_reserved_tool_key(&key.to_uppercase()),
@@ -53,7 +58,12 @@ fn built_ins_are_the_six_supported_identities() {
 fn launcher_contract_built_in_commands_map_to_themselves() {
     built_ins_are_the_six_supported_identities();
     let commands = ToolCommands::built_in();
-    for key in BUILT_IN_TOOL_KEYS {
+    let registry = sessionatlas_core::adapter::AdapterRegistry::bundled().unwrap();
+    for key in registry
+        .adapters()
+        .iter()
+        .map(|adapter| adapter.id.as_str())
+    {
         assert!(commands.known_key(key), "{key} must be a known key");
         assert_eq!(
             commands.build_arguments(key, None).unwrap(),
@@ -152,6 +162,12 @@ fn launcher_contract_build_arguments_appends_resume_as_independent_arguments() {
     assert_eq!(
         commands.build_arguments("pi", Some("session-123")).unwrap(),
         vec!["pi", "--session", "session-123"]
+    );
+    assert_eq!(
+        commands
+            .build_arguments("opencode", Some("ses_feff4ba8"))
+            .unwrap(),
+        vec!["opencode", "--session", "ses_feff4ba8"]
     );
 }
 

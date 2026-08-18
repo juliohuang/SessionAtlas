@@ -51,26 +51,19 @@ pub(crate) fn build_tool_launch_input(
     Ok(Some(build_argv_launch_input(&args)?))
 }
 
+#[cfg(test)]
 pub(crate) fn tool_launch_argv(
     tool_key: &str,
     session_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let tool_key = validate_tool_key(tool_key)?;
-    let mut args = vec![tool_key.to_string()];
-    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
-        args.push(
-            if tool_key.eq_ignore_ascii_case("codex") {
-                "resume"
-            } else if tool_key.eq_ignore_ascii_case("pi") {
-                "--session"
-            } else {
-                "--resume"
-            }
-            .to_string(),
-        );
-        args.push(validate_session_id(session_id)?.to_string());
-    }
-    Ok(args)
+    let registry = sessionatlas_core::adapter::AdapterRegistry::bundled()
+        .map_err(|error| error.to_string())?;
+    registry
+        .find(tool_key)
+        .ok_or_else(|| format!("unsupported TUI adapter: {tool_key}"))?
+        .launch_argv(session_id)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn validate_cli_argv(args: &[String]) -> Result<(), String> {

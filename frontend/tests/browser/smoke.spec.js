@@ -132,6 +132,101 @@ test("mocked Tauri mode publishes backend projects", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test("activity-only OpenCode sessions do not shadow a resumable main session", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("sessionatlas.lang", "en");
+    const project = {
+      id: "delegated-project",
+      path: "C:\\workspace\\delegated-project",
+      name: "delegated-project",
+      source: "local",
+      lastAccessedAt: "2026-08-18T10:00:00Z",
+      gitBranch: "main",
+      toolUsages: [
+        {
+          toolKey: "opencode",
+          toolName: "OpenCode",
+          lastUsedAt: "2026-08-18T10:00:00Z",
+          sessionCount: 0,
+          lastSessionId: null,
+        },
+        {
+          toolKey: "codex",
+          toolName: "Codex CLI",
+          lastUsedAt: "2026-08-18T09:00:00Z",
+          sessionCount: 1,
+          lastSessionId: "codex-main-session",
+        },
+      ],
+    };
+    const capabilities = {
+      source: "local",
+      serverId: null,
+      label: "Local",
+      tools: ["opencode", "codex"].map(toolKey => ({
+        toolKey,
+        toolName: toolKey === "codex" ? "Codex CLI" : "OpenCode",
+        installed: true,
+        enabled: true,
+        adapterEnabled: true,
+      })),
+    };
+    window.__ptyCalls = [];
+    window.__TAURI__ = {
+      core: {
+        invoke: async (command, payload = {}) => {
+          if (command === "local_index_exists") return true;
+          if (command === "list_projects") return [project];
+          if (command === "list_tools") return capabilities.tools;
+          if ([
+            "list_remote_projects", "list_remote_servers", "list_project_ignores",
+            "list_groups", "list_sort_orders", "list_opener_prefs",
+            "list_web_development_tools",
+          ].includes(command)) return [];
+          if (command === "list_group_assignments") return {};
+          if (command === "get_group_revision") return 0;
+          if (command === "get_git_info") return { isRepo: false, remotes: [] };
+          if (command === "probe_tui_capabilities") return capabilities;
+          if (command === "pty_spawn") {
+            window.__ptyCalls.push({ command, payload });
+            return 77;
+          }
+          if (command === "pty_attach") {
+            window.__ptyCalls.push({ command, payload });
+            return null;
+          }
+          return null;
+        },
+      },
+      event: { listen: async () => () => {} },
+      window: { getCurrentWindow: () => ({ isMaximized: async () => false }) },
+    };
+  });
+
+  await page.goto("/index.html");
+  const entry = page.locator('article.entry[data-id="delegated-project"]');
+  await expect(entry).toBeVisible();
+  await entry.locator("[data-expand-toggle]").click();
+
+  const openCodeCard = entry.locator(".session-card").filter({ hasText: "OpenCode" });
+  await expect(openCodeCard).toContainText("Child/delegated activity excluded");
+  await expect(openCodeCard.locator("[data-launch-tool=opencode]")).toHaveText("New session");
+
+  const codexCard = entry.locator(".session-card").filter({ hasText: "Codex CLI" });
+  await expect(codexCard).toContainText("1 resumable session");
+  await expect(codexCard.locator("[data-launch-tool=codex]")).toHaveText("Resume");
+  await expect(codexCard.locator("[data-launch-tool=codex]")).toBeEnabled();
+  await expect(page.locator("#termsSelectedLaunch .overview__session-row")).toHaveCount(1);
+
+  await entry.dispatchEvent("dblclick");
+  await expect.poll(() => page.evaluate(() => window.__ptyCalls
+    .find(call => call.command === "pty_attach")?.payload)).toEqual({
+    id: 77,
+    toolKey: "codex",
+    sessionId: "codex-main-session",
+  });
+});
+
 test("primary reload failure clears the previous search count", async ({ page }) => {
   await page.addInitScript(() => {
     const project = {

@@ -27,7 +27,7 @@ Tauri crate `sessionatlas-tauri`、标识 `com.sessionatlas.console`、
 
 ```text
 Cargo workspace
-├─ crates/sessionatlas-core   # 共享库：model / path / scanner / indexer /
+├─ crates/sessionatlas-core   # 共享库：adapter / model / path / scanner / indexer /
 │                             # store / config / process / security / launcher
 ├─ crates/sessionatlas-cli    # `sessionatlas` 可执行文件（clap 命令）
 └─ src-tauri                  # Tauri 2 桌面应用，依赖 sessionatlas-core
@@ -36,12 +36,13 @@ Cargo workspace
 - 核心 crate 不依赖 Tauri、前端或 CLI 显示库。
 - CLI 与 Tauri 都是同一核心的输入输出适配层；两者链接同一个 `sessionatlas-core`。
 - 数据目录统一为 `~/.sessionatlas/`：`index.db`（CLI 所有、Tauri 只读）、
-  `config.json`、`prefs.db`（Tauri 所有：分组、打开器、远程项目和项目忽略规则）。
+  `config.json`、`adapters/<id>/<version>/adapter.json`、`prefs.db`（Tauri 所有：
+  分组、打开器、Web 开发工具连接地址、远程项目、逐机器 TUI 选择和项目忽略规则）。
 
 ## 三、扫描与索引数据流
 
 ```text
-各 AI 工具数据目录 → scanner/（每工具一个 Scanner + custom）→ ScanOutcome
+活动适配器 → scanner handler（官方解析器桥接或 metadata-v1）→ ScanOutcome
 → indexer（规范化路径去重/合并，读 .git/HEAD 取分支）
 → store（单 SQLite 事务快照替换 + FTS5 重建）
 ```
@@ -50,7 +51,7 @@ Cargo workspace
   （`Failed`）；只有 `Succeeded` 可以替换对应工具快照，其余保留旧数据。
 - 路径语义在 `path.rs`：Windows 大小写不敏感、Unix 字节敏感；根路径不归一化为空。
 - 快照替换、孤儿项目清理、活动时间重算与 FTS 重建在同一事务内原子完成。
-- `prefs.db` 由 Tauri 管理，本地扫描不改其中的分组/排序/打开器/远程项目/忽略规则数据。
+- `prefs.db` 由 Tauri 管理，本地扫描不改其中的分组/排序/打开器/Web 开发工具/远程项目/忽略规则数据。
 
 ## 四、SQLite 存储
 
@@ -62,18 +63,33 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 ## 五、配置与原子写
 
 `config.json` 由 `config.rs` 管理：大小写不敏感读取、跨进程有界锁、fingerprint
-冲突检测、临时文件精确清理与原子替换。CLI 的 `config` 命令与 Tauri 共用该实现。
+冲突检测、临时文件精确清理与原子替换。CLI 的 `config` 命令与 Tauri 共用该实现；
+`EnabledAdapters` 保存本机选择，`ActiveAdapterVersions` 保存当前适配器版本。
 
-## 六、进程安全与执行边界
+## 六、TUI 适配器注册表
+
+- `adapter.rs` 严格解析 API v1 JSON 清单。六个官方清单从 `adapters/official/`
+  编译进程序；用户导入版本不可变地保存到
+  `~/.sessionatlas/adapters/<id>/<semver>/adapter.json`。
+- 清单统一声明工具 ID/名称、版本探测 argv、新建/恢复 argv、可选固定 npm/uv 包、
+  scanner handler、支持平台和远程支持。CLI 扫描、CLI/PTY 启动、Tauri 本地/远程检测、
+  安装与升级都从同一个活动注册表读取，不再按 tool key 复制启动参数。
+- 官方复杂格式暂由 `builtin.<id>` handler 桥接已有 Rust parser；扩展工具使用
+  `metadata-v1`。清单不能装入 JS、原生库、WASM、shell 脚本或任意安装命令。
+- 适配器版本和第三方 TUI 版本相互独立。导入新版后可激活；回滚只切换活动版本指针，
+  不删除旧清单、TUI、会话或索引。v1 采用用户确认的本地清单导入，尚无在线市场或
+  签名信任库。完整契约见
+  [`docs/tui-adapter-contract.md`](./docs/tui-adapter-contract.md)。
+
+## 七、进程安全与执行边界
 
 - 本地进程一律使用「可执行文件 + 参数数组 + 工作目录」模型（`process.rs` /
   `ProcessSpec`）；shell 文本只用于互动终端或 SSH 远端命令的固有场景。
 - `security.rs`（core 与 src-tauri 各自一份）校验/引用工具 key、session ID、
   SSH 用户/主机/身份文件/远端路径、URL 与打开器模板；所有输入先过对应的
   validator/quoting 再插入命令。
-- `launcher.rs` 构造工具对应的恢复命令（Codex 使用 `resume <id>`，Pi 使用 `--session <id>`，其余工具保留各自参数），
-  恢复参数与 session ID 由可信后端追加
-  并打开平台终端。
+- `launcher.rs` 从经过校验的活动适配器构造新建/恢复 argv；`{sessionId}` 只能作为
+  一个完整参数，由可信后端验证并替换，然后打开平台终端。
 - 远程 SSH：`BatchMode=yes` 全量强制，纯免密；连接探测同时报告 tmux 能力。
   每个「远程项目 + 工具」映射到确定性的 tmux 会话，首次打开创建并启动工具，
   后续打开只重连已有 TUI。同一服务器只保留一个前端 SSH PTY；选择该服务器上的
@@ -83,7 +99,7 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
   `classify_ssh_failure` 将 ssh 错误转为可操作的中英双语提示。完整契约见
   [`docs/execution-security-contract.md`](./docs/execution-security-contract.md)。
 
-## 七、Tauri 桌面控制台
+## 八、Tauri 桌面控制台
 
 - **数据源**：查询时只读打开共享扫描核心维护的 `index.db`；首次启动检测到文件缺失时，
   前端先触发一次进程内扫描再加载项目。已有索引（包括可信的空索引）不自动重复扫描；
@@ -101,7 +117,7 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
   重扫即可恢复；远程扫描返回的项目数也只统计最终可见行。
 - **命令层**：`list_projects`、`search_projects`（FTS5 `MATCH`）、`list_tools`、
   `scan_projects`、PTY 一组（`pty_spawn/attach/write/remote_switch/resize/kill`）、远程 SSH 一组、
-  项目忽略、打开器偏好、分组、Git 信息与托盘同步命令。结构体用 `#[serde(rename="camelCase")]`
+  TUI 检测/安装/升级、适配器导入/激活/回滚、项目忽略、打开器偏好、分组、Git 信息与托盘同步命令。结构体用 `#[serde(rename="camelCase")]`
   使 Rust snake_case 以 `lastAccessedAt` 形式到达 JS。
 - **PTY 终端**：右栏多标签，每标签一个伪终端；本地会话由 `pty_attach` 在监听器
   就绪后恰一次启动工具。远程会话由 `pty_spawn` 把结构化工具元数据转换为安全的
@@ -118,7 +134,7 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 - **能力**：`src-tauri/capabilities/default.json` 对 `main` 授予 `core:default` +
   `shell:allow-open`；新增插件权限必须在此登记。
 
-## 八、数据流与并发
+## 九、数据流与并发
 
 - CLI `scan` 是唯一写者，原子替换快照；Tauri 只读读者始终看到完整旧快照或完整
   新快照，绝无半写状态。
@@ -128,16 +144,18 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 - 60 秒自动刷新在没有搜索词时静默重拉；full/auto/search 使用独立 gate，避免
   低信息请求覆盖完整加载（last-known-good 语义）。
 
-## 九、安全模型要点
+## 十、安全模型要点
 
 - 本地优先：索引/偏好/配置只保存在 `~/.sessionatlas/`，无遥测或云同步。
 - 扫描器只取路径、时间、session ID 与必要 Git 元数据；不持久化提示词、消息、
   密钥或认证内容。
 - 所有外部进程为参数数组；shell 元字符、控制字符、选项形 tool key 一律拒绝。
+- 适配器清单大小受限、未知字段拒绝、同版本不可覆盖；平台/远程能力在检测、启用、
+  安装、升级、扫描和启动时由后端重复执行。
 - 搜索词与用户字符串按文本节点渲染，绝不进入 `innerHTML` 执行标记。
 - xterm/高亮/字体全部本地加载，不依赖 CDN。
 
-## 十、测试与验收
+## 十一、测试与验收
 
 - 根命令：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets
   -- -D warnings`、`cargo test --workspace`、`npm --prefix frontend run check` /

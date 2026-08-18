@@ -1,22 +1,16 @@
 //! Built-in tool identities and input validation shared by `scan` and `config`.
 //!
-//! The six built-in keys and the value validators live here so
-//! `config add-tool` and the custom-tool
-//! conflict filtering in `scan` agree on exactly one set of identities.
+//! Official identities come from the bundled adapter manifests. The value
+//! validators remain here for the legacy `config add-tool` surface.
+
+use sessionatlas_core::launcher;
 
 /// Shell metacharacters that are never allowed inside a configured CLI command.
 const SHELL_METACHARACTERS: [char; 7] = ['&', '|', '<', '>', '^', '%', '!'];
 
-/// The six built-in tool keys, in their canonical registration order. A custom tool
-/// whose key collides with one of these (case-insensitive) is rejected by
-/// `config add-tool` and skipped by `scan`'s custom-tool loading.
-pub const BUILT_IN_TOOL_KEYS: [&str; 6] = ["claude", "kimi", "codex", "opencode", "aider", "pi"];
-
 /// Whether `key` is a reserved built-in key, compared ASCII-case-insensitively.
 pub fn is_reserved_tool_key(key: &str) -> bool {
-    BUILT_IN_TOOL_KEYS
-        .iter()
-        .any(|built_in| built_in.eq_ignore_ascii_case(key))
+    launcher::is_reserved_tool_key(key)
 }
 
 /// Validates a custom-tool key, mirroring `CommandSecurity.ValidateToolKey`:
@@ -151,10 +145,15 @@ mod tests {
 
     #[test]
     fn built_in_keys_are_the_six_supported_identities() {
-        let mut keys: Vec<&str> = BUILT_IN_TOOL_KEYS.to_vec();
+        let registry = sessionatlas_core::adapter::AdapterRegistry::bundled().unwrap();
+        let mut keys = registry
+            .adapters()
+            .iter()
+            .map(|adapter| adapter.id.as_str())
+            .collect::<Vec<_>>();
         keys.sort_unstable();
         assert_eq!(keys, ["aider", "claude", "codex", "kimi", "opencode", "pi"]);
-        for key in BUILT_IN_TOOL_KEYS {
+        for key in keys {
             assert!(is_reserved_tool_key(key), "{key} must be reserved");
             assert!(
                 is_reserved_tool_key(&key.to_uppercase()),

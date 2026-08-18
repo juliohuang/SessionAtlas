@@ -20,19 +20,19 @@ SessionAtlas 由两个协作组件组成：
 
 ## 适合谁
 
-如果你同时使用多个 AI 编程 CLI，经常忘记“某个项目上次是用哪个工具、哪个会话做的”，SessionAtlas 可以把这些本地痕迹统一起来。它不会替你购买或登录 AI 服务；桌面设置页会在明确确认后，通过 npm 或 uv 安装白名单内的 CLI 软件包，账号登录仍由用户完成。
+如果你同时使用多个 AI 编程 CLI，经常忘记“某个项目上次是用哪个工具、哪个会话做的”，SessionAtlas 可以把这些本地痕迹统一起来。它不会替你购买或登录 AI 服务；桌面设置页会在明确确认后，通过 npm 或 uv 安装经过校验的活动适配器所声明的固定 CLI 软件包，账号登录仍由用户完成。
 
 ## 安装
 
 ### Windows 桌面版（Beta）
 
-从 [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest) 下载最新的 `.msi` 或 `-setup.exe`。扫描由桌面版在进程内完成，安装包不捆绑独立扫描器，也无需安装 .NET Runtime；首次启动且索引不存在时会自动扫描一次，之后可按需点击“重新扫描”。
+从 [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest) 下载最新的 `.msi` 或 `-setup.exe`。扫描由桌面版在进程内完成，安装包不捆绑独立扫描器，也无需额外语言运行时；首次启动且索引不存在时会自动扫描一次，之后可按需点击“重新扫描”。
 
 要求：
 
 - Windows 10/11 x64；
 - WebView2 Runtime（Windows 11 通常已包含）；
-- 受支持 AI CLI 必须已安装、在对应机器上启用并完成登录，才可启动对应会话。若机器具备 npm 或 uv，可在“设置 → AI TUI 工具”中安装缺失的白名单工具。
+- 受支持 AI CLI 必须已安装、适配器支持对应机器、已启用并完成登录，才可启动对应会话。若活动适配器声明了固定 npm/uv 软件包且机器具备对应管理器，可在“设置 → AI TUI 工具”中一键安装，并在后台检查版本后手动确认升级。
 
 首个公开版本是 Beta。升级前建议保留 `~/.sessionatlas/`；如遇问题请查看[支持说明](./SUPPORT.md)或提交 issue。
 
@@ -69,7 +69,11 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 | Aider | 常用开发目录中的 `.aider.chat.history` | `aider` |
 | Pi Coding Agent | `~/.pi/agent/sessions/**/*.jsonl` | `pi` |
 
-还可以通过 `sessionatlas config add-tool` 添加符合安全约束的自定义工具。
+这六个工具现在也和扩展工具一样由声明式适配器驱动。官方适配器随应用内置；可在
+“设置 → AI TUI 工具”导入经过校验的 `adapter.json`，按机器选择工具，并独立切换、
+升级或无损回滚适配器版本。API v1 不加载脚本、原生库或任意安装命令，完整格式与
+边界见 [`docs/tui-adapter-contract.md`](./docs/tui-adapter-contract.md)。旧的
+`sessionatlas config add-tool` 仍保留用于兼容现有安全自定义工具配置。
 
 ## 主要能力
 
@@ -77,8 +81,10 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 - 按工具和最近访问时间筛选，自定义分组与拖拽排序；
 - 多标签真实 PTY 终端与最近会话继续入口；
 - 可配置 VS Code、资源管理器、终端等外部打开器；
+- 可配置 DSH 等基于浏览器的 Web 开发工具；连接地址必填且仅接受不含嵌入凭据的完整 HTTP(S) URL，并在应用内沙箱 Web 标签页打开；
 - 免密密钥/agent 模式的远程 SSH 索引，以及持久化 tmux TUI 会话；同一服务器的项目共用一个 SSH 终端并直接切换 tmux 会话；
-- 按本机/远程服务器分别检测和启用 TUI，缺失的白名单工具可确认后一键安装；
+- 声明式 TUI 适配器注册表：官方工具和扩展工具走同一套检测、扫描、启动/恢复、安装与升级契约；适配器可独立导入、激活和无损回滚；
+- 按本机/远程服务器分别检测和选择 TUI；只有已安装且适配器支持该系统/远程模式的工具才能启用，缺失的固定 npm/uv 包可确认后一键安装；已安装工具可后台检查更新并在确认后升级、复检版本；
 - 中英文界面与键盘操作；
 - 浏览器演示模式：不在 Tauri 中运行时使用内置样例数据。
 
@@ -86,7 +92,8 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 
 - **本地优先**：索引、偏好和配置只保存在 `~/.sessionatlas/`，项目不包含遥测或云端同步。
 - **读取边界**：扫描器会读取受支持工具留在本机的数据目录，以提取项目路径、时间和会话元数据；不会把这些内容上传给 SessionAtlas 服务。
-- **执行边界**：SessionAtlas 会按用户操作启动本机 AI CLI、终端、Git、SSH，或执行固定的 npm/uv 软件包安装；前端不能提供任意安装命令。第三方工具和包管理器自己的网络访问与数据策略仍由它们负责。
+- **适配器边界**：适配器是严格校验的 JSON 声明，不加载 JavaScript、原生库、WASM 或 shell 脚本；同一 ID/版本不可覆盖，旧版本保留用于回滚。v1 只支持用户明确导入本地清单，尚无在线市场或签名信任库。
+- **执行边界**：SessionAtlas 会按用户操作启动本机 AI CLI、终端、Git、SSH，或执行适配器声明且后端允许的固定 npm/uv 软件包安装；前端不能提供任意安装命令。第三方工具和包管理器自己的网络访问与数据策略仍由它们负责。
 - **正常权限策略**：批量 Claude 任务不会加入跳过权限检查的参数；需要批准的操作可能停下来等待用户。
 - **本地资源**：xterm.js、语法高亮和字体不依赖 CDN。第三方声明见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
 
@@ -127,7 +134,7 @@ cargo tauri dev
 cargo tauri build
 ```
 
-桌面版 `scan_projects` 通过 `spawn_blocking` 在进程内调用 `sessionatlas-core` 扫描管线，不捆绑 sidecar，也不需要 .NET Runtime。测试必须使用临时 `SESSIONATLAS_HOME`，不得读取或修改真实的 `~/.sessionatlas/`。
+桌面版 `scan_projects` 通过 `spawn_blocking` 在进程内调用 `sessionatlas-core` 扫描管线，不捆绑 sidecar，也不需要额外语言运行时。测试必须使用临时 `SESSIONATLAS_HOME`，不得读取或修改真实的 `~/.sessionatlas/`。
 
 架构说明见 [AGENTS.md](./AGENTS.md)，扫描契约见 [`docs/scan-contract.md`](./docs/scan-contract.md)，测试基线见 [`docs/test-baseline.md`](./docs/test-baseline.md)。
 

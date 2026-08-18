@@ -20,6 +20,7 @@
 //! | security  | R10      |
 //! | launcher  | R10      |
 
+pub mod adapter;
 pub mod config;
 pub mod indexer;
 pub mod launcher;

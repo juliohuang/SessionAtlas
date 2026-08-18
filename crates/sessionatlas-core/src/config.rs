@@ -109,6 +109,16 @@ impl std::error::Error for ConfigError {
 pub struct AppConfig {
     /// Custom tool sources (`sessionatlas config add-tool`).
     pub custom_tools: Vec<ToolSource>,
+    /// Explicitly enabled adapter ids. `None` preserves the first-run default:
+    /// bundled official adapters are enabled and locally installed adapters
+    /// remain disabled until the user selects them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_adapters: Option<Vec<String>>,
+    /// Active version overrides for independently installed adapters. Missing
+    /// entries use the bundled version for official adapters and the newest
+    /// installed version for user adapters.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub active_adapter_versions: BTreeMap<String, String>,
     /// Preferred tool per absolute project path.
     pub preferred_tools_by_path: BTreeMap<String, String>,
     /// Terminal used by `open`; `"auto"` picks the platform default.
@@ -163,6 +173,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             custom_tools: Vec::new(),
+            enabled_adapters: None,
+            active_adapter_versions: BTreeMap::new(),
             preferred_tools_by_path: BTreeMap::new(),
             default_terminal: DEFAULT_TERMINAL.to_string(),
             source_path: None,
@@ -174,6 +186,8 @@ impl Default for AppConfig {
 impl PartialEq for AppConfig {
     fn eq(&self, other: &Self) -> bool {
         self.custom_tools == other.custom_tools
+            && self.enabled_adapters == other.enabled_adapters
+            && self.active_adapter_versions == other.active_adapter_versions
             && self.preferred_tools_by_path == other.preferred_tools_by_path
             && self.default_terminal == other.default_terminal
     }
@@ -202,6 +216,22 @@ impl<'de> Deserialize<'de> for AppConfig {
                     .map_err(|error| de::Error::custom(format!("CustomTools[{index}]: {error}")))?;
                 config.custom_tools.push(tool);
             }
+        }
+
+        if let Some(entry) = field_ci(object, "EnabledAdapters") {
+            if entry.is_null() {
+                config.enabled_adapters = None;
+            } else {
+                config.enabled_adapters =
+                    Some(Vec::<String>::deserialize(entry).map_err(|error| {
+                        de::Error::custom(format!("`EnabledAdapters`: {error}"))
+                    })?);
+            }
+        }
+
+        if let Some(entry) = field_ci(object, "ActiveAdapterVersions") {
+            config.active_adapter_versions = BTreeMap::<String, String>::deserialize(entry)
+                .map_err(|error| de::Error::custom(format!("`ActiveAdapterVersions`: {error}")))?;
         }
 
         if let Some(entry) = field_ci(object, "PreferredToolsByPath") {
@@ -426,7 +456,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
                 "forced atomic replace failure (test hook)",
             )));
         }
-        replace_file(&temp_path, path)
+        atomic_replace_file(&temp_path, path).map_err(ConfigError::Io)
     })();
 
     if outcome.is_err() {
@@ -446,11 +476,19 @@ fn write_temp_and_sync(temp_path: &Path, bytes: &[u8]) -> Result<(), ConfigError
     Ok(())
 }
 
-/// Crash-safe atomic replacement. Windows uses the same `ReplaceFileW`
-/// primitive as .NET `File.Replace` when the target already exists and
-/// `MoveFileExW` for the first write; elsewhere `rename` replaces atomically.
+/// Replaces `target_path` with the sibling temporary file atomically.
+///
+/// Windows uses `ReplaceFileW` when the target already exists and `MoveFileExW`
+/// for the first write; elsewhere `rename` replaces atomically. Scanner and
+/// Tauri caches use this helper too,
+/// so their second write has the same overwrite semantics as config writes.
+pub fn atomic_replace_file(temp_path: &Path, target_path: &Path) -> io::Result<()> {
+    replace_file(temp_path, target_path)
+}
+
+/// Crash-safe atomic replacement implementation.
 #[cfg(windows)]
-fn replace_file(temp_path: &Path, target_path: &Path) -> Result<(), ConfigError> {
+fn replace_file(temp_path: &Path, target_path: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
     use windows_sys::Win32::Foundation::GetLastError;
@@ -487,17 +525,17 @@ fn replace_file(temp_path: &Path, target_path: &Path) -> Result<(), ConfigError>
         }
     };
     if ok == 0 {
-        Err(ConfigError::Io(io::Error::from_raw_os_error(
-            unsafe { GetLastError() } as i32,
-        )))
+        Err(io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ))
     } else {
         Ok(())
     }
 }
 
 #[cfg(not(windows))]
-fn replace_file(temp_path: &Path, target_path: &Path) -> Result<(), ConfigError> {
-    fs::rename(temp_path, target_path).map_err(ConfigError::Io)
+fn replace_file(temp_path: &Path, target_path: &Path) -> io::Result<()> {
+    fs::rename(temp_path, target_path)
 }
 
 /// Removes stale generated temp files older than 24 h from the config's

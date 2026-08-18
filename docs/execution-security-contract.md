@@ -21,14 +21,15 @@ data can cause an external process to start.
   sessions; it never sends a ready-made command or tmux target.
 - Tool keys are bounded identifiers and cannot begin with `-` or contain
   whitespace, control characters, or shell punctuation.
-- Session IDs are bounded identifiers. The tool-specific resume selector and
-  value are appended by trusted backend code (`codex resume <id>` for Codex,
-  `pi --session <id>` for Pi Coding Agent).
+- Session IDs are bounded identifiers. A validated active adapter supplies the
+  fixed resume argv template; trusted backend code replaces exactly one complete
+  `{sessionId}` token with the validated value.
 - The shared `crates/sessionatlas-core` `security.rs` and the Tauri
   `src-tauri/src/security.rs` apply the same rules before recording a session
   or launching a CLI.
-- Only built-in identities or enabled custom tools from config may be launched;
-  unknown keys and attempts to override a built-in key are rejected.
+- Only enabled identities from the adapter registry or compatible legacy custom
+  tools may be launched. Unknown keys and attempts by a legacy entry to
+  override any installed adapter identity are rejected.
 - Custom CLI commands may contain a program and ordinary quoted arguments, but
   not shell metacharacters, shell/script executables, or unbalanced quotes.
 
@@ -72,34 +73,69 @@ data can cause an external process to start.
   failure in a custom root list remains fail-closed and preserves the previous
   remote snapshot.
 
-## Per-machine TUI capabilities and installation
+## Declarative adapters and per-machine TUI lifecycle
 
-- The desktop probes the six built-in TUI commands separately on the local
-  machine and on each configured SSH server. A tool can be enabled only after
-  the backend has detected its executable; explicit disable preferences are
-  enforced again by local attach, external launch, remote spawn, and remote
-  tmux-switch commands.
-- Capability and installation work runs on blocking workers. Remote probes use
+- Six official API v1 manifests are compiled into the application. Explicitly
+  imported manifests are stored immutably under
+  `~/.sessionatlas/adapters/<id>/<semantic-version>/adapter.json`; a different
+  file cannot overwrite an existing ID/version. Active-version changes and
+  rollback update only `config.json` and do not delete manifests or sessions.
+- Manifests are strict, size-bounded JSON declarations. Unknown fields,
+  unsupported API versions, unsafe commands/argv, unknown placeholders,
+  shell/script executables, unapproved scanner handlers, unsupported package
+  managers, and invalid package names fail validation. API v1 loads no adapter
+  code, JavaScript, native library, WASM, hook, or arbitrary shell command.
+- Automatic version probes are structurally limited to one executable token
+  followed by one recognized version argument (`--version`, `-V`, `-v`, or
+  `version`). Interpreter evaluator forms such as `python -c` and `node -e`
+  fail manifest validation before any process starts.
+- Manifest import requires an absolute local regular-file path and explicit UI
+  confirmation. API v1 has no online marketplace, automatic adapter download,
+  signature trust store, or claim that an unsigned local manifest is trusted.
+  The confirmation states that activation immediately executes the manifest's
+  constrained version probe when that executable is present; “no embedded
+  code” does not mean an adapter is unable to select an installed program for
+  execution.
+- The desktop probes the active adapter catalog separately on the local machine
+  and on each configured SSH server. `platforms` and `supportsRemote` are
+  backend-enforced. A tool can be enabled only after the backend has detected
+  its executable; explicit disable preferences are enforced again by local
+  attach, external launch, remote spawn, and remote tmux-switch commands.
+- Capability, update-check, installation, and upgrade work runs on blocking
+  workers with hard process timeouts. Remote probes use
   one fixed script that emits bounded, prefixed records; no frontend-provided
   shell text is inserted into it.
-- The frontend sends only a built-in `toolKey` plus an optional server ID to
-  `install_tui`. The backend maps that enum-like key to one fixed npm package
-  package (including Pi's fixed official package) or the fixed Aider uv package.
-  Unknown keys are rejected before any process
-  starts.
+- The frontend sends only an installed adapter `toolKey` plus an optional
+  server ID to `install_tui` or `upgrade_tui`. The backend resolves the active,
+  already-validated manifest and permits only its fixed npm or uv package.
+  Unknown/disabled/unsupported identities are rejected before any process
+  starts; the frontend cannot provide package names or installer text.
+- Update checks are explicit and read-only: npm tools use `npm view`, while
+  Aider uses uv's dry-run resolver. Only installed tools are queried. The
+  backend parses and compares semantic versions and enables an upgrade only
+  when the registry version is newer than the detected version.
 - Local installers are represented as `ProcessSpec` program/argument arrays.
-  Remote installers are selected from fixed backend strings and travel through
-  the same validated SSH command builder. Installer output included in an error
-  is reduced to one bounded, control-character-free line.
-- Installation requires an explicit UI confirmation, never supplies service
-  credentials, and re-probes the machine before auto-enabling the tool. A
-  missing npm or uv prerequisite is reported instead of falling back to an
-  arbitrary shell bootstrapper.
+  Remote installers and upgraders are selected from fixed backend strings and
+  travel through the same validated SSH command builder. Process output
+  included in an error is reduced to one bounded, control-character-free line.
+- Installation and upgrade require explicit UI confirmation and never supply
+  service credentials. Installation re-probes before auto-enabling; upgrade
+  rechecks availability server-side and verifies the command version after the
+  package manager exits. A missing npm or uv prerequisite is reported instead
+  of falling back to an arbitrary shell bootstrapper.
+
+The full schema, scanner-handler boundary, activation rules, and verification
+commands are in [`tui-adapter-contract.md`](./tui-adapter-contract.md).
 
 ## URLs and openers
 
 - External URLs must be absolute `http` or `https` URLs with a host and without
   embedded credentials. They are passed directly to the platform opener.
+- Browser-based development tools (for example, a user-configured DSH instance)
+  persist only a display name, enabled state, and a URL that passes the same
+  backend validation. The frontend validates it again before opening a web tab;
+  the iframe omits `allow-same-origin`, uses a no-referrer policy, and exposes a
+  normal external link when the service cannot be embedded.
 - A custom opener must contain `{path}` as one complete argument. The backend
   replaces that token with one process argument, preserving spaces and shell
   punctuation as data.
@@ -119,7 +155,7 @@ data can cause an external process to start.
   `quick-xml >=0.41.0`, and `portable-pty >=0.9.0`; these remove the actionable
   soundness, XML denial-of-service, and abandoned `serial` dependency findings
   present in the previous lockfile.
-- On 2026-08-16, `cargo audit 0.22.2` scanned all 542 locked Rust crates and
+- On 2026-08-18, `cargo audit 0.22.2` scanned all 538 locked Rust crates and
   reported zero vulnerabilities. It emitted 17 allowed upstream warnings:
   ten GTK3 maintenance notices, five `rust-unic` maintenance notices, one
   `proc-macro-error` maintenance notice, and the Linux-only

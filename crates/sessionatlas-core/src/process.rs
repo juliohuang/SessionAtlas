@@ -235,16 +235,20 @@ pub fn search_path(program: &str, path_var: &str, path_ext: &str) -> Option<Path
         }
         let base = Path::new(directory).join(program);
         if cfg!(windows) {
-            if let Some(path) = executable_file(&base) {
-                return Some(path.to_path_buf());
-            }
             if Path::new(program).extension().is_none() {
+                // Windows package managers such as npm place both a POSIX
+                // extensionless shim and a native `.cmd` launcher on PATH.
+                // `CreateProcessW` cannot execute the POSIX shim, so respect
+                // PATHEXT before considering an exact extensionless file.
                 for extension in &extensions {
                     let with_extension = base.with_extension(extension.trim_start_matches('.'));
                     if let Some(path) = executable_file(&with_extension) {
                         return Some(path.to_path_buf());
                     }
                 }
+            }
+            if let Some(path) = executable_file(&base) {
+                return Some(path.to_path_buf());
             }
         } else if let Some(path) = executable_file(&base) {
             return Some(path.to_path_buf());
