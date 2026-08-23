@@ -3,12 +3,12 @@
 //! exclusive lock, fingerprint conflict detection, crash-safe atomic replace
 //! and strict stale temp cleanup.
 //!
-//! Compatibility contract with `Core/Config/AppConfig.cs`:
+//! Persisted configuration contract:
 //! * property names are matched ASCII-case-insensitively on read at both the
 //!   `AppConfig` and the `ToolSource` levels. Serde's derive only matches
 //!   exact names, so deserialization goes through `serde_json::Value` and a
-//!   case-insensitive member lookup; serialization still emits PascalCase
-//!   keys identical to `System.Text.Json`;
+//!   case-insensitive member lookup; serialization emits the established
+//!   PascalCase keys;
 //! * `~/.sessionatlas/config.json` resolves against `SESSIONATLAS_HOME` when
 //!   set, otherwise the user profile on Windows and `$HOME` (or `/`) on POSIX;
 //! * writers run under a `config.json.lock` exclusive lock acquired with a
@@ -44,11 +44,11 @@ use crate::model::{ToolSource, DEFAULT_OPEN_COMMAND_TEMPLATE};
 /// Default terminal used when `config.json` omits `DefaultTerminal`.
 pub const DEFAULT_TERMINAL: &str = "auto";
 
-/// Lock timeout used when callers do not supply one (mirrors the C# default).
+/// Lock timeout used when callers do not supply one.
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// A generated temp file is reclaimed only when it is strictly older than
-/// this age (mirrors the C# 24 h threshold).
+/// this age.
 const STALE_TEMP_HOURS: i64 = 24;
 
 /// Typed failure modes for config reads and writes.
@@ -99,8 +99,8 @@ impl std::error::Error for ConfigError {
 
 /// User configuration with atomic, cross-process-safe mutation.
 ///
-/// The three public fields mirror the C# `AppConfig` properties. Serialization
-/// emits PascalCase keys identical to `System.Text.Json`; deserialization is
+/// The three public fields define the persisted application configuration. Serialization
+/// emits the established PascalCase keys; deserialization is
 /// ASCII-case-insensitive for every property name. The private fields only
 /// track where this instance was loaded from so [`AppConfig::save`] can detect
 /// stale-object conflicts; they never participate in equality or JSON output.
@@ -152,7 +152,7 @@ impl AppConfig {
     }
 
     /// Saves to the path this instance was loaded from, or to the default
-    /// path when it was created fresh. Mirrors `AppConfig.Save()`.
+    /// path when it was created fresh.
     pub fn save_default(&mut self, lock_timeout: Option<Duration>) -> Result<(), ConfigError> {
         let path = self.source_path.clone().unwrap_or_else(default_config_path);
         self.save(path, lock_timeout)
@@ -224,9 +224,8 @@ impl<'de> Deserialize<'de> for AppConfig {
 ///
 /// `SESSIONATLAS_HOME` (when set to a non-blank value) wins; otherwise the
 /// user profile on Windows and `$HOME` on POSIX, with `/` as the final POSIX
-/// fallback. A blank override (empty or whitespace-only) is treated as unset,
-/// matching `string.IsNullOrWhiteSpace` in `ScannerRegistry.GetHomeDirectory`.
-/// An override is made absolute the way `Path.GetFullPath` resolves it.
+/// fallback. A blank override (empty or whitespace-only) is treated as unset.
+/// An override is converted to an absolute path without requiring it to exist.
 pub fn home_directory() -> PathBuf {
     if let Some(override_home) = std::env::var_os("SESSIONATLAS_HOME") {
         if !override_home.to_string_lossy().trim().is_empty() {
@@ -341,8 +340,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Reads the config bytes with a bounded retry for transient I/O failures, the
-/// way the C# implementation retries on share violations. A missing file is
+/// Reads the config bytes with a bounded retry for transient I/O failures such
+/// as Windows share violations. A missing file is
 /// reported as `Ok(None)`.
 fn read_config_bytes(path: &Path) -> Result<Option<Vec<u8>>, ConfigError> {
     for attempt in 0..5u32 {
@@ -504,7 +503,7 @@ fn replace_file(temp_path: &Path, target_path: &Path) -> Result<(), ConfigError>
 /// Removes stale generated temp files older than 24 h from the config's
 /// directory. A candidate is reclaimed only when it has a strictly generated
 /// name, is not a reparse/symlink entry, and its last-write time is strictly
-/// older than 24 h. Individual deletion failures are ignored, as in the C#.
+/// older than 24 h. Individual deletion failures are ignored.
 fn cleanup_stale_temps(config_path: &Path, now: DateTime<Utc>) -> Result<(), ConfigError> {
     let directory = config_path
         .parent()
@@ -559,8 +558,7 @@ fn is_generated_temp_name(suffix: &str) -> bool {
     guid_part.len() == 32 && guid_part.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Detects a reparse point on Windows (exactly like the C#
-/// `FileAttributes.ReparsePoint` check) and a symlink on POSIX. Used to keep
+/// Detects a reparse point on Windows and a symlink on POSIX. Used to keep
 /// cleanup from ever following or deleting link entries that merely look like
 /// generated temps.
 fn is_reparse_or_symlink(path: &Path) -> bool {
@@ -612,9 +610,8 @@ fn ci_bool(object: &Map<String, Value>, name: &str) -> Result<Option<bool>, serd
     }
 }
 
-/// ASCII-case-insensitive `ToolSource` deserialization mirroring the C#
-/// `PropertyNameCaseInsensitive` behavior for custom-tool objects. Unknown
-/// members are ignored; defaults match the C# initializers.
+/// ASCII-case-insensitive `ToolSource` deserialization for custom-tool objects.
+/// Unknown members are ignored and omitted members use the domain defaults.
 fn tool_source_ci(value: &Value) -> Result<ToolSource, serde_json::Error> {
     let object = value
         .as_object()

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use sessionatlas_core::model::{project_path_missing, Project, Session, ToolSource, ToolUsage};
 
 #[test]
-fn model_contract_tool_source_defaults_match_csharp() {
+fn model_contract_tool_source_defaults_are_stable() {
     let source = ToolSource::default();
     assert!(source.is_enabled);
     assert!(!source.is_installed);
@@ -52,7 +52,7 @@ fn model_contract_tool_source_missing_fields_use_defaults() {
 }
 
 #[test]
-fn model_contract_project_derived_members_match_csharp() {
+fn model_contract_project_derived_members_are_stable() {
     let project = Project {
         path: if cfg!(windows) {
             r"C:\repo".to_string()

@@ -77,7 +77,7 @@
     </section>
 
     <!-- ───────── MAIN: PROJECTS + OVERVIEW + TERMINAL ───────── -->
-    <main class="stage">
+    <main class="stage" id="stage">
       <section class="stage__left">
         <div class="stage__left__view" data-view="ledger">
           <div class="ledger__count" id="ledgerCount"></div>
@@ -101,8 +101,12 @@
       <section class="stage__overview" data-i18n-aria="overview.aria">
         <header class="overview__bar">
           <span class="overview__bar-dot" aria-hidden="true"></span>
-          <span data-i18n="overview.kicker">PROJECT OVERVIEW</span>
+          <span class="overview__bar-label" data-i18n="overview.kicker">PROJECT OVERVIEW</span>
           <span class="overview__bar-status" data-i18n="workspace.ready">READY</span>
+          <button class="overview__toggle" id="overviewToggleBtn" type="button"
+                  aria-controls="termsSelectedLaunch" aria-expanded="true">
+            <span aria-hidden="true">‹</span>
+          </button>
         </header>
         <div class="terms__selected-launch" id="termsSelectedLaunch">
           <div class="overview__empty">
@@ -150,6 +154,7 @@
         <div class="foot__health"><span class="foot__health-dot"></span><span data-i18n="foot.health">Healthy</span></div>
         <div class="foot__git-inline foot__row--git" id="footGit" hidden>
           <button class="foot__git-branch" id="footGitBranch" type="button" data-i18n-title="foot.gitBranchTitle">⎇ —</button>
+          <span class="foot__git-sync" id="footGitSync"></span>
           <div class="foot__git-head" id="footGitHead"></div>
           <div class="foot__git-remotes" id="footGitRemotes"></div>
           <button class="foot__git-add" id="footGitAdd" hidden data-i18n="foot.addRemote">+ add remote</button>

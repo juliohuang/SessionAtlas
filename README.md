@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/juliohuang/SessionAtlas?include_prereleases)](https://github.com/juliohuang/SessionAtlas/releases)
 
-把 Claude Code、Codex、Kimi、OpenCode 和 Aider 分散在本机的项目与会话，整理成一张可搜索、可继续工作的地图。
+把 Claude Code、Codex、Kimi、OpenCode、Aider 和 Pi Coding Agent 分散在本机的项目与会话，整理成一张可搜索、可继续工作的地图。
 
 ![SessionAtlas 浏览器演示界面](./docs/images/sessionatlas-browser-demo.png)
 
@@ -20,19 +20,19 @@ SessionAtlas 由两个协作组件组成：
 
 ## 适合谁
 
-如果你同时使用多个 AI 编程 CLI，经常忘记“某个项目上次是用哪个工具、哪个会话做的”，SessionAtlas 可以把这些本地痕迹统一起来。它不会替你购买、安装或登录 AI 服务。
+如果你同时使用多个 AI 编程 CLI，经常忘记“某个项目上次是用哪个工具、哪个会话做的”，SessionAtlas 可以把这些本地痕迹统一起来。它不会替你购买或登录 AI 服务；桌面设置页会在明确确认后，通过 npm 或 uv 安装白名单内的 CLI 软件包，账号登录仍由用户完成。
 
 ## 安装
 
 ### Windows 桌面版（Beta）
 
-从 [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest) 下载最新的 `.msi` 或 `-setup.exe`。扫描由桌面版在进程内完成，安装包不捆绑独立扫描器，也无需安装 .NET Runtime；首次启动后点击“重新扫描”即可建立索引。
+从 [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest) 下载最新的 `.msi` 或 `-setup.exe`。扫描由桌面版在进程内完成，安装包不捆绑独立扫描器，也无需安装 .NET Runtime；首次启动且索引不存在时会自动扫描一次，之后可按需点击“重新扫描”。
 
 要求：
 
 - Windows 10/11 x64；
 - WebView2 Runtime（Windows 11 通常已包含）；
-- 至少一个已安装并完成登录的受支持 AI CLI，才可启动对应会话。
+- 受支持 AI CLI 必须已安装、在对应机器上启用并完成登录，才可启动对应会话。若机器具备 npm 或 uv，可在“设置 → AI TUI 工具”中安装缺失的白名单工具。
 
 首个公开版本是 Beta。升级前建议保留 `~/.sessionatlas/`；如遇问题请查看[支持说明](./SUPPORT.md)或提交 issue。
 
@@ -67,7 +67,7 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 | Kimi CLI | `~/.kimi-code/sessions/**/state.json` | `kimi` |
 | OpenCode | `~/.local/share/opencode/opencode.db` | `opencode` |
 | Aider | 常用开发目录中的 `.aider.chat.history` | `aider` |
-| Pi Coding Agent | `~/.pi/agent/sessions/**/*.jsonl`（支持官方目录覆盖） | `pi` |
+| Pi Coding Agent | `~/.pi/agent/sessions/**/*.jsonl` | `pi` |
 
 还可以通过 `sessionatlas config add-tool` 添加符合安全约束的自定义工具。
 
@@ -79,14 +79,15 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 - 多标签真实 PTY 终端与最近会话继续入口；
 - 可配置 VS Code、资源管理器、终端等外部打开器；
 - 免密密钥/agent 模式的远程 SSH 索引，以及持久化 tmux TUI 会话；同一服务器的项目共用一个 SSH 终端并直接切换 tmux 会话；
+- 按本机/远程服务器分别检测和启用 TUI，缺失的白名单工具可确认后一键安装；
 - 中英文界面与键盘操作；
 - 浏览器演示模式：不在 Tauri 中运行时使用内置样例数据。
 
 ## 隐私与安全
 
 - **本地优先**：索引、偏好和配置只保存在 `~/.sessionatlas/`，项目不包含遥测或云端同步。
-- **读取边界**：扫描器会读取受支持工具留在本机的数据目录以提取项目元数据，并在本机限额读取项目源码/文档以建立内容索引；敏感形态文件、依赖和构建目录被排除，正文不写入普通表，也不会上传给 SessionAtlas 服务。
-- **执行边界**：SessionAtlas 会按用户操作启动本机 AI CLI、终端、Git 或 SSH。第三方工具自己的网络访问和数据策略仍由它们负责。
+- **读取边界**：扫描器会读取受支持工具留在本机的数据目录，以提取项目路径、时间和会话元数据；不会把这些内容上传给 SessionAtlas 服务。
+- **执行边界**：SessionAtlas 会按用户操作启动本机 AI CLI、终端、Git、SSH，或执行固定的 npm/uv 软件包安装；前端不能提供任意安装命令。第三方工具和包管理器自己的网络访问与数据策略仍由它们负责。
 - **正常权限策略**：批量 Claude 任务不会加入跳过权限检查的参数；需要批准的操作可能停下来等待用户。
 - **本地资源**：xterm.js、语法高亮和字体不依赖 CDN。第三方声明见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
 

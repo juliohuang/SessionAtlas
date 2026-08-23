@@ -31,10 +31,10 @@ use crate::render::sanitize;
 use crate::Io;
 
 /// Builds the canonical scanner set for the config file at `config_path`: the
-/// six built-in scanners, then each enabled custom
+/// six built-in scanners in canonical registration order, then each enabled custom
 /// tool whose key does not collide with a built-in (case-insensitive). When
 /// the config cannot be read or parsed, built-ins remain available and a
-/// `config_read_failed` diagnostic is returned, mirroring `ScannerRegistry`.
+/// a `config_read_failed` diagnostic is returned.
 pub fn build_default_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec<ScanDiagnostic>) {
     let mut scanners: Vec<Box<dyn Scanner>> = vec![
         Box::new(ClaudeScanner::new()),

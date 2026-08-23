@@ -4,12 +4,12 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## What this is
 
-`SessionAtlas` aggregates projects that have been worked on by multiple AI CLI coding tools (Claude Code, Codex, Kimi, OpenCode, Aider). The repo is a **pure Rust workspace** with two cooperating components sharing one data directory (`~/.sessionatlas/`):
+`SessionAtlas` aggregates projects that have been worked on by multiple AI CLI coding tools (Claude Code, Codex, Kimi, OpenCode, Aider, Pi Coding Agent). The repo is a **pure Rust workspace** with two cooperating components sharing one data directory (`~/.sessionatlas/`):
 
 1. **`sessionatlas` CLI** (`crates/sessionatlas-cli`, Rust) — the canonical scanner. Walks each AI tool's data directory, deduplicates by normalized path, and writes a unified index to `~/.sessionatlas/index.db` (SQLite + FTS5). Also launches AI CLIs in project dirs via `sessionatlas open`.
 2. **Tauri desktop console** (`src-tauri/` + `frontend/`, Rust + plain HTML/JS) — the **current primary GUI**. Opens the CLI's SQLite index read-only, browses/searches projects, and runs interactive AI-CLI terminals in-app via PTY. This is the actively-developed frontend.
 
-Both binaries link the shared `crates/sessionatlas-core` library in-process. The Tauri console **does not own its data** — it opens a read-only view of the index the CLI maintains. If the DB is missing, every Tauri command returns *"run `sessionatlas scan` first"*.
+Both binaries link the shared `crates/sessionatlas-core` library in-process. The Tauri console **does not own its data** — it opens a read-only view of the index the shared scanner maintains. On first launch, the frontend checks for a missing `index.db` and runs the in-process scan once before loading the project list. Existing indexes, including intentionally empty ones, are never rescanned automatically; failed first scans keep the index absent and show an actionable retry state.
 
 **Identity contract:** the only supported identities are the `sessionatlas` CLI,
 `SessionAtlas` product identifiers, Tauri crate `sessionatlas-tauri`,
@@ -102,7 +102,7 @@ successful scans replace snapshots atomically.
 `list_projects`, `search_projects` (FTS5 `MATCH`), `list_tools`,
 `scan_projects`, `pty_spawn`/`pty_attach`/`pty_write`/`pty_resize`/`pty_kill`,
 the remote-SSH set (`test_remote_connection`/`add_remote_server`/`scan_remote_server`),
-opener prefs, groups, git info, and the tray-sync commands.
+project ignores, opener prefs, groups, git info, and the tray-sync commands.
 
 **In-app terminals (PTY)**: the right pane hosts multiple interactive terminal
 tabs, one PTY each. `pty_spawn` creates and registers an unattached
@@ -141,7 +141,7 @@ is in `docs/execution-security-contract.md`.
 
 ## Conventions
 
-- Data dir for all components: `~/.sessionatlas/` (`index.db`, `config.json`, `prefs.db`). `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
+- Data dir for all components: `~/.sessionatlas/` (`index.db`, `config.json`, `prefs.db`). `prefs.db` also owns source-scoped project ignore rules; any path component starting with `.` is always hidden in the desktop project view. `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
 - Tool keys are lowercase short strings (`claude`, `codex`, `kimi`, `opencode`, `aider`, `pi`) — keep consistent across CLI scanners, launcher templates, config, and the Tauri `TOOL_COLOR`/`TOOL_DOT` maps.
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` must stay green; use `#![deny(...)]`/strict clippy where the code already does.
 - Tauri frontend: keyboard is first-class (`/` search, `Esc` clear, `↑↓` nav, `Enter` launch) — don't break these. Match existing CSS tokens in `styles.css` rather than introducing new design primitives.

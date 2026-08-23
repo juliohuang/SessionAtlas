@@ -16,6 +16,7 @@ import {
   findOpenTerminalTab,
   findReusableRemoteTerminalTab,
   mergeProjectSources,
+  parseSshConnectionInput,
   projectGroupKey,
   projectCatalogFingerprint,
   projectMatchesFilters,
@@ -23,6 +24,64 @@ import {
   sortProjectsForView,
   terminalSessionKey,
 } from "../core.js";
+
+test("SSH connection input accepts the fixed-prefix value and a pasted full command", () => {
+  assert.deepEqual(parseSshConnectionInput("developer@example.test"), {
+    ok: true,
+    value: {
+      user: "developer",
+      host: "example.test",
+      port: null,
+      identityFile: null,
+    },
+  });
+
+  assert.deepEqual(parseSshConnectionInput("root@101.133.150.255:9336"), {
+    ok: true,
+    value: {
+      user: "root",
+      host: "101.133.150.255",
+      port: 9336,
+      identityFile: null,
+    },
+  });
+
+  assert.deepEqual(
+    parseSshConnectionInput('SSH -p 2222 -i "C:\\Users\\Developer\\.ssh\\work key" developer@[::1]'),
+    {
+      ok: true,
+      value: {
+        user: "developer",
+        host: "[::1]",
+        port: 2222,
+        identityFile: "C:\\Users\\Developer\\.ssh\\work key",
+      },
+    },
+  );
+
+  assert.deepEqual(parseSshConnectionInput("developer@[::1]:2200"), {
+    ok: true,
+    value: {
+      user: "developer",
+      host: "[::1]",
+      port: 2200,
+      identityFile: null,
+    },
+  });
+});
+
+test("SSH connection input rejects ambiguous or executable command syntax", () => {
+  assert.equal(parseSshConnectionInput("").error, "empty");
+  assert.equal(parseSshConnectionInput("example.test").error, "destination");
+  assert.equal(parseSshConnectionInput("developer@example.test whoami").error, "extraArgument");
+  assert.equal(parseSshConnectionInput("-o ProxyCommand=calc developer@example.test").error, "unsupportedOption");
+  assert.equal(parseSshConnectionInput("-p 0 developer@example.test").error, "port");
+  assert.equal(parseSshConnectionInput("developer@example.test:not-a-port").error, "port");
+  assert.equal(parseSshConnectionInput("developer@example.test:70000").error, "port");
+  assert.equal(parseSshConnectionInput("-p 22 developer@example.test:2222").error, "duplicateOption");
+  assert.equal(parseSshConnectionInput("-i \"unterminated developer@example.test").error, "unterminatedQuote");
+  assert.equal(parseSshConnectionInput("-p 22 -p 2222 developer@example.test").error, "duplicateOption");
+});
 
 test("PTY attach sends structured tool metadata instead of a shell command", () => {
   assert.deepEqual(

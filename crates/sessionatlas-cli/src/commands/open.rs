@@ -2,7 +2,7 @@
 //! terminal through the injectable process boundary, and record the session
 //! only after the launch was accepted.
 //!
-//! Mirrors `CLI/Commands/OpenCommand.cs` (R10). All interactive selection goes
+//! All interactive selection goes
 //! through [`crate::select::prompt_select`], every external interaction
 //! (process start, PATH probing, Windows Terminal detection) is injected via
 //! [`OpenEnvironment`], and every value originating in the database, config,
@@ -43,8 +43,7 @@ pub fn run_open(
     args: &OpenArgs,
     env: &OpenEnvironment<'_>,
 ) -> i32 {
-    // `open` records sessions, so it may create the index database, matching
-    // the C# `new SqliteStore()` behavior.
+    // `open` records sessions, so it may create the index database.
     let store = match SqliteStore::new(db_path) {
         Ok(store) => store,
         Err(error) => {
@@ -206,7 +205,7 @@ pub fn run_open(
     ));
     if let Some(id) = &resume_session_id {
         io.out(&format!(
-            "尝试恢复会话 {}（使用对应工具的原生会话参数）\n",
+            "尝试恢复会话 {}（使用对应工具的恢复语法）\n",
             sanitize(id)
         ));
     }
@@ -335,7 +334,7 @@ fn choose(io: &mut Io<'_>, title: &str, choices: &[String]) -> SelectionOutcome 
 }
 
 /// Resolves a possibly-relative existing directory to its native normalized
-/// absolute form, the way C# `Path.GetFullPath` followed by path semantics do.
+/// absolute form.
 fn absolute_normalize(candidate: &str) -> Option<String> {
     let rooted = if Path::new(candidate).has_root() {
         candidate.to_string()

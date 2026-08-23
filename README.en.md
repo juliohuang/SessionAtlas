@@ -7,7 +7,7 @@ English | [简体中文](./README.md)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/juliohuang/SessionAtlas?include_prereleases)](https://github.com/juliohuang/SessionAtlas/releases)
 
-A searchable workspace map for projects and sessions scattered across Claude Code, Codex, Kimi, OpenCode, and Aider.
+A searchable workspace map for projects and sessions scattered across Claude Code, Codex, Kimi, OpenCode, Aider, and Pi Coding Agent.
 
 ![SessionAtlas browser demo](./docs/images/sessionatlas-browser-demo.png)
 
@@ -20,19 +20,19 @@ SessionAtlas has two cooperating components:
 
 ## Who it is for
 
-SessionAtlas helps people who use several AI coding CLIs and regularly lose track of which tool or session was last used for a project. It does not purchase, install, or authenticate any AI service for you.
+SessionAtlas helps people who use several AI coding CLIs and regularly lose track of which tool or session was last used for a project. It does not purchase or authenticate any AI service for you. The desktop settings can install an allowlisted CLI package through npm or uv after an explicit confirmation; account login remains the user's responsibility.
 
 ## Install
 
 ### Windows desktop beta
 
-Download the latest `.msi` or `-setup.exe` from [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest). Scanning runs in-process inside the desktop app; the installer does not bundle a separate scanner binary and no .NET runtime is required. Click **Rescan** after first launch to build the index.
+Download the latest `.msi` or `-setup.exe` from [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest). Scanning runs in-process inside the desktop app; the installer does not bundle a separate scanner binary and no .NET runtime is required. When the index is missing, the first launch scans automatically; use **Rescan** for later refreshes.
 
 Requirements:
 
 - Windows 10/11 x64;
 - WebView2 Runtime (normally included with Windows 11);
-- at least one supported AI CLI installed and authenticated before SessionAtlas can launch its sessions.
+- a supported AI CLI must be installed, enabled for that machine, and authenticated before SessionAtlas can launch its sessions. Missing allowlisted CLIs can be installed from **Settings → AI TUI tools** when npm or uv is available.
 
 The first public release is a beta. Keep a copy of `~/.sessionatlas/` before upgrading and see [SUPPORT.md](./SUPPORT.md) when reporting a problem.
 
@@ -67,6 +67,7 @@ The CLI source is built and tested on Windows, macOS, and Linux. Automated deskt
 | Kimi CLI | `~/.kimi-code/sessions/**/state.json` | `kimi` |
 | OpenCode | `~/.local/share/opencode/opencode.db` | `opencode` |
 | Aider | `.aider.chat.history` in common development roots | `aider` |
+| Pi Coding Agent | `~/.pi/agent/sessions/**/*.jsonl` | `pi` |
 
 Additional tools that meet the command-safety contract can be registered with `sessionatlas config add-tool`.
 
@@ -77,6 +78,7 @@ Additional tools that meet the command-safety contract can be registered with `s
 - real multi-tab PTY terminals and recent-session resume actions;
 - configurable VS Code, file manager, terminal, and custom openers;
 - remote SSH indexing through passwordless key/agent authentication, with persistent tmux TUI sessions and one reused SSH terminal per server;
+- per-machine local/remote TUI detection, enable switches, and confirmed one-click installation for missing allowlisted tools;
 - Chinese and English UI with keyboard-first navigation;
 - browser demo mode backed by bundled sample data when Tauri is unavailable.
 
@@ -84,7 +86,7 @@ Additional tools that meet the command-safety contract can be registered with `s
 
 - **Local first:** indexes, preferences, and configuration stay in `~/.sessionatlas/`; the project contains no telemetry or cloud-sync service.
 - **Read boundary:** scanners read supported tools' local data directories to extract project paths, timestamps, and session metadata. SessionAtlas does not upload this content to a SessionAtlas service.
-- **Execution boundary:** a user action can launch local AI CLIs, terminals, Git, or SSH. Those third-party tools retain their own network and data policies.
+- **Execution boundary:** a user action can launch local AI CLIs, terminals, Git, SSH, or a fixed npm/uv package installation. SessionAtlas never accepts an installer command from the frontend; those third-party tools and package managers retain their own network and data policies.
 - **Normal permission policy:** queued Claude tasks do not add a permission-bypass flag; tasks requiring approval may pause for the user.
 - **Local assets:** xterm.js, highlighting, and fonts do not depend on a CDN. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 

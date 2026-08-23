@@ -21,8 +21,7 @@ use super::tools::{
     is_reserved_tool_key, parse_safe_command, validate_display_label, validate_tool_key,
 };
 
-/// Terminal choices accepted by `set-default-terminal`, mirroring the C#
-/// `SelectionPrompt` choices.
+/// Terminal choices accepted by `set-default-terminal`.
 const DEFAULT_TERMINALS: [&str; 7] = [
     "auto",
     "windows-terminal",
@@ -206,8 +205,8 @@ fn set_default_terminal(io: &mut Io<'_>, config_path: &Path) -> i32 {
     }
 }
 
-/// Maps core config failures to the C# `ConfigCommand` messages. Every path
-/// leaves any existing file untouched.
+/// Maps core config failures to user-facing command messages. Every path leaves
+/// any existing file untouched.
 fn report_config_error(io: &mut Io<'_>, error: ConfigError) -> i32 {
     match error {
         ConfigError::Busy(_) => {
@@ -238,8 +237,7 @@ fn read_line(io: &mut Io<'_>, prompt: &str) -> Option<String> {
     }
 }
 
-/// Resolves the entered data directory, mirroring the C# `~` expansion in
-/// `ConfigCommand.AddCustomTool`: a bare `~` is the sessionatlas home and a
+/// Resolves the entered data directory: a bare `~` is the SessionAtlas home and a
 /// `~/`/`~\` prefix is joined to it; everything else is stored as typed.
 fn resolve_data_directory(directory: &str, home: &Path) -> String {
     if directory == "~" {

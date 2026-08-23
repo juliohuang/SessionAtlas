@@ -591,14 +591,14 @@ fn scan_unreadable_config_keeps_builtins_and_reports_config_read_failed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_scanner_set_instantiates_the_six_built_ins() {
+fn default_scanner_set_instantiates_the_six_built_ins_in_canonical_order() {
     let dir = TestDir::new();
     let (scanners, diagnostics) = build_default_scanners(&dir.config());
     let keys: Vec<&str> = scanners.iter().map(|scanner| scanner.tool_key()).collect();
     assert_eq!(
         keys,
         ["claude", "kimi", "codex", "opencode", "aider", "pi"],
-        "all built-ins must be instantiated"
+        "built-ins must be instantiated in canonical registration order"
     );
     assert!(diagnostics.is_empty());
 }

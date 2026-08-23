@@ -22,6 +22,7 @@ import {
   findOpenTerminalTab,
   findReusableRemoteTerminalTab,
   mergeProjectSources,
+  parseSshConnectionInput,
   projectGroupKey,
   projectCatalogFingerprint,
   projectMatchesFilters,
@@ -75,6 +76,13 @@ function loadProjectOrder() {
 
 // Dropdown to assign a project to a group (or "未分组"). Rendered in
 // both the popover and the right-pane launch panel.
+const OVERVIEW_COLLAPSED_KEY = "sessionatlas.overviewCollapsed";
+
+function readOverviewCollapsed() {
+  try { return localStorage.getItem(OVERVIEW_COLLAPSED_KEY) === "true"; }
+  catch { return false; }
+}
+
 function groupPickerHtml(projectId) {
   const currentGid = state.assignments[projectId];
   const ungrouped = tr("group.ungrouped");
@@ -113,11 +121,23 @@ const state = {
   sortOrders: {},           // {projectId: sortOrder} from list_sort_orders (manual order)
   viewMode: "ledger",       // "ledger" | "files" — which view occupies the left pane
   expandedId: null,         // project id whose inline session panel is open, or null
-  remoteServers: [],         // [{id, label, user, host, port, identityFile, scanRoots}] from list_remote_servers
+  remoteServers: [],         // [{id, label, user, host, port, identityFile, scanRoots, lastScannedAt, osFamily}] from list_remote_servers
   remoteServerById: {},     // {id: server} for tooltip lookup
   remoteProjects: [],       // last successful remote project list used by catalog
-  staleSources: { remote: false, tools: false, servers: false, groups: false, openers: false },
-  settingsView: "menu",     // "menu" | "openers" | "groups" | "remote" — current settings drawer page
+  projectIgnores: [],       // user-managed local/remote directory-tree exclusions
+  sessionCleanup: null,     // latest Codex/Claude cleanup analysis
+  sessionCleanupTrash: [],  // recoverable cleanup batches
+  sessionCleanupSelected: new Set(),
+  sessionCleanupLoading: false,
+  gitStatusByProject: {},   // local/remote-ref GitInfo cache by project id
+  remoteScanIds: new Set(), // server ids currently scanning on background workers
+  tuiMachines: {},          // {local|remote:<id>: live installed/enabled capabilities}
+  tuiLoadingKeys: new Set(),
+  tuiInstallingKeys: new Set(),
+  staleSources: { remote: false, tools: false, servers: false, ignores: false, groups: false, openers: false },
+  firstRunError: null,       // preserved across async preference/group renders until a retry succeeds
+  settingsView: "menu",     // "menu" | "cleanup" | "tui" | "openers" | "groups" | "remote" | "ignores" | "language"
+  overviewCollapsed: readOverviewCollapsed(), // new users default to the full overview
   _dragId: null,            // project id being dragged (transient)
 };
 const reloadCoordinator = createReloadCoordinator();
@@ -131,7 +151,7 @@ const leftTreeGate = createLatestRequestGate();
 
 /* ── tool visuals ───────────────────────────────────────── */
 const TOOL_DOT = { claude:"dot--claude", codex:"dot--codex", kimi:"dot--kimi", opencode:"dot--opencode", aider:"dot--aider", pi:"dot--pi" };
-const TOOL_COLOR = { claude:"#d97757", codex:"#10a37f", kimi:"#6c8aff", opencode:"#e8b339", aider:"#c6f24e", pi:"#a78bfa" };
+const TOOL_COLOR = { claude:"#d97757", codex:"#10a37f", kimi:"#6c8aff", opencode:"#e8b339", aider:"#c6f24e", pi:"#f472b6" };
 // Two-letter monograms used in the .tool-icon tile. Short, all-caps, and
 // distinct so each tool is recognisable in a 16×16 chip. Plain shell
 // gets "SH" so the generic strip is also branded.
@@ -194,6 +214,10 @@ async function searchRemoteProjects(query) {
 async function fetchRemoteServers() {
   if (!HAS_TAURI) return [];
   return await invoke("list_remote_servers");
+}
+async function fetchProjectIgnores() {
+  if (!HAS_TAURI) return [];
+  return await invoke("list_project_ignores");
 }
 async function fetchTools() {
   if (HAS_TAURI) {
@@ -377,10 +401,214 @@ const termsViewport = document.getElementById("termsViewport");
 const termsEmpty = document.getElementById("termsEmpty");
 const termsSelectedLaunch = document.getElementById("termsSelectedLaunch");
 const termsCount = document.getElementById("termsCount");
+const stage = document.getElementById("stage");
+const overviewToggleBtn = document.getElementById("overviewToggleBtn");
 const entryModal = document.getElementById("entryModal");
 const entryModalBody = document.getElementById("entryModalBody");
 const entryModalTitle = document.getElementById("entryModalTitle");
 const scanProgress = document.getElementById("scanProgress");
+
+/* ── collapsible project overview ──────────────────────── */
+function syncOverviewCollapseUI() {
+  if (!stage || !overviewToggleBtn || !termsSelectedLaunch) return;
+  const collapsed = state.overviewCollapsed;
+  const label = tr(collapsed ? "overview.expand" : "overview.collapse");
+  stage.classList.toggle("stage--overview-collapsed", collapsed);
+  overviewToggleBtn.setAttribute("aria-expanded", String(!collapsed));
+  overviewToggleBtn.setAttribute("aria-label", label);
+  overviewToggleBtn.setAttribute("title", label);
+  overviewToggleBtn.querySelector("span").textContent = collapsed ? "›" : "‹";
+  termsSelectedLaunch.setAttribute("aria-hidden", String(collapsed));
+  termsSelectedLaunch.inert = collapsed;
+}
+
+function setOverviewCollapsed(collapsed, { persist = true } = {}) {
+  state.overviewCollapsed = Boolean(collapsed);
+  syncOverviewCollapseUI();
+  if (persist) {
+    try { localStorage.setItem(OVERVIEW_COLLAPSED_KEY, String(state.overviewCollapsed)); }
+    catch {}
+  }
+}
+
+function setupOverviewToggle() {
+  if (!overviewToggleBtn) return;
+  syncOverviewCollapseUI();
+  overviewToggleBtn.addEventListener("click", () => {
+    setOverviewCollapsed(!state.overviewCollapsed);
+  });
+}
+
+/* ── modal focus + background isolation ────────────────── */
+// `aria-modal` describes a dialog to assistive technology, but it does not
+// prevent keyboard focus from wandering into the dimmed workspace. Keep one
+// small shared controller for the entry modal, document preview and settings
+// drawer so every overlay behaves the same: background is inert, focus enters
+// the surface, Tab wraps inside it, and closing returns to the invoking control.
+const dialogReturnFocus = new WeakMap();
+const DIALOG_FOCUSABLE = [
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "a[href]",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
+function visibleDialog() {
+  return [
+    document.getElementById("docModal"),
+    entryModal,
+    document.getElementById("drawer"),
+  ].find(surface => surface && !surface.hidden) || null;
+}
+
+const BUILTIN_TUI_DEMO = [
+  ["claude", "Claude Code"],
+  ["codex", "Codex CLI"],
+  ["kimi", "Kimi Code"],
+  ["opencode", "OpenCode"],
+  ["aider", "Aider"],
+  ["pi", "Pi Coding Agent"],
+];
+function tuiMachineKey(serverId) {
+  return serverId == null ? "local" : `remote:${Number(serverId)}`;
+}
+function tuiMachineForProject(project) {
+  return state.tuiMachines[tuiMachineKey(
+    project?.source === "remote" ? project.remoteServerId : null,
+  )];
+}
+function tuiCapabilityForProject(project, toolKey) {
+  if (!toolKey || toolKey === "shell") return { installed: true, enabled: true };
+  return tuiMachineForProject(project)?.tools?.find(tool => tool.toolKey === toolKey) || null;
+}
+function canLaunchTui(project, toolKey) {
+  if (!toolKey || toolKey === "shell") return true;
+  const capability = tuiCapabilityForProject(project, toolKey);
+  return Boolean(capability?.installed && capability?.enabled);
+}
+function disabledTuiAttrs(project, toolKey) {
+  if (canLaunchTui(project, toolKey)) return "";
+  const capability = tuiCapabilityForProject(project, toolKey);
+  const title = capability && !capability.installed
+    ? tr("tui.launchMissing")
+    : capability && !capability.enabled
+      ? tr("tui.launchDisabled")
+      : tr("tui.launchChecking");
+  return `disabled aria-disabled="true" title="${escapeHtml(title)}"`;
+}
+
+async function refreshTuiMachine(serverId, { force = false } = {}) {
+  const key = tuiMachineKey(serverId);
+  if (!force && (state.tuiMachines[key] || state.tuiLoadingKeys.has(key))) return;
+  state.tuiLoadingKeys.add(key);
+  if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
+  try {
+    let capabilities;
+    if (HAS_TAURI) {
+      capabilities = await invoke("probe_tui_capabilities", { serverId: serverId ?? null });
+    } else {
+      capabilities = {
+        source: serverId == null ? "local" : "remote",
+        serverId: serverId ?? null,
+        label: serverId == null ? "Local" : (state.remoteServerById[serverId]?.label || "Remote"),
+        tools: BUILTIN_TUI_DEMO.map(([toolKey, toolName]) => ({
+          toolKey, toolName, installed: true, version: "demo", enabled: true,
+          installAvailable: true, installManager: toolKey === "aider" ? "uv" : "npm",
+        })),
+      };
+    }
+    state.tuiMachines[key] = { ...capabilities, error: null };
+  } catch (error) {
+    state.tuiMachines[key] = {
+      source: serverId == null ? "local" : "remote",
+      serverId: serverId ?? null,
+      label: serverId == null ? "Local" : (state.remoteServerById[serverId]?.label || "Remote"),
+      tools: [], error: String(error),
+    };
+  } finally {
+    state.tuiLoadingKeys.delete(key);
+    if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
+    applyFilters();
+    renderSelectedLaunchPanel();
+  }
+}
+
+function refreshAllTuiCapabilities({ force = false } = {}) {
+  const validKeys = new Set(["local", ...state.remoteServers.map(server => tuiMachineKey(server.id))]);
+  Object.keys(state.tuiMachines).forEach(key => {
+    if (!validKeys.has(key)) delete state.tuiMachines[key];
+  });
+  void refreshTuiMachine(null, { force });
+  state.remoteServers.forEach(server => void refreshTuiMachine(Number(server.id), { force }));
+}
+
+function dialogFocusables(surface) {
+  return [...surface.querySelectorAll(DIALOG_FOCUSABLE)]
+    .filter(element => element.getClientRects().length > 0);
+}
+
+function syncDialogIsolation() {
+  const app = document.querySelector(".console");
+  if (app) app.inert = Boolean(visibleDialog());
+}
+
+function focusDialogStart(surface, preferredSelector = null) {
+  const focusTarget = () => {
+    if (surface.hidden) return;
+    const preferred = preferredSelector
+      ? [...surface.querySelectorAll(preferredSelector)]
+        .find(element => element.matches(DIALOG_FOCUSABLE)
+          && element.getClientRects().length > 0 && !element.disabled)
+      : null;
+    const target = preferred || dialogFocusables(surface)[0];
+    target?.focus({ preventScroll: true });
+  };
+  // Focus synchronously for keyboard/click activation. Re-apply once after
+  // layout as a guard for WebView engines that temporarily reject focus while
+  // the dialog changes from `hidden` to visible in the same task.
+  focusTarget();
+  requestAnimationFrame(() => {
+    if (!surface.contains(document.activeElement)) focusTarget();
+  });
+}
+
+function activateDialog(surface, preferredSelector = null) {
+  const current = document.activeElement;
+  dialogReturnFocus.set(surface, current instanceof HTMLElement ? current : null);
+  syncDialogIsolation();
+  focusDialogStart(surface, preferredSelector);
+}
+
+function deactivateDialog(surface) {
+  const returnTarget = dialogReturnFocus.get(surface);
+  dialogReturnFocus.delete(surface);
+  syncDialogIsolation();
+  if (!visibleDialog() && returnTarget?.isConnected) {
+    returnTarget.focus({ preventScroll: true });
+  }
+}
+
+document.addEventListener("keydown", event => {
+  if (event.key !== "Tab") return;
+  const surface = visibleDialog();
+  if (!surface) return;
+  const focusables = dialogFocusables(surface);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (!surface.contains(document.activeElement)) {
+    event.preventDefault();
+    first.focus();
+  } else if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}, true);
 
 /* ── ledger rendering ───────────────────────────────────── */
 function replaceTextMarker(root, marker, value) {
@@ -482,7 +710,11 @@ function buildLedgerModel() {
   }
   const ungrouped = buckets.get("ungrouped");
   if (ungrouped?.length) {
-    sections.push({ key: "ungrouped", name: tr("group.ungrouped"), items: sortBucket(ungrouped) });
+    sections.push({
+      key: "ungrouped",
+      name: tr("group.ungrouped"),
+      items: sortBucket(ungrouped),
+    });
   }
   const ordered = sections.flatMap(section =>
     isGroupCollapsed(section.key) ? [] : section.items,
@@ -491,20 +723,41 @@ function buildLedgerModel() {
 }
 
 function renderLedger(model = buildLedgerModel()) {
+  if (state.firstRunError !== null) {
+    ledger.innerHTML = `
+      <div class="ledger__empty">
+        <div class="ledger__empty-num">!</div>
+        <div class="ledger__empty-title">${escapeHtml(tr("ledger.firstRunErrorTitle"))}</div>
+        <div class="ledger__empty-body">${escapeHtml(tr("ledger.firstRunErrorBody"))}</div>
+        <div class="ledger__empty-body ledger__empty-detail">${escapeHtml(tr("ledger.firstRunErrorDetail", { err: state.firstRunError }))}</div>
+        <button class="scan-btn" id="firstRunRetry" style="margin-top:14px">${escapeHtml(tr("ledger.tryAgain"))}</button>
+      </div>`;
+    document.getElementById("firstRunRetry")?.addEventListener("click", () => {
+      runLocalScan({ initial: true });
+    });
+    return;
+  }
   state.filtered = model.ordered;
   state.matchingCount = model.matching.length;
-  if (!model.matching.length) {
-    ledger.classList.remove("is-large");
+  const visible = model.matching;
+  if (!visible.length) {
     const marker = "__SESSIONATLAS_EMPTY_QUERY__";
+    const catalogEmpty = !state.query && state.all.length === 0;
+    const title = state.query
+      ? tr("ledger.emptySearchTitle")
+      : tr(catalogEmpty ? "ledger.emptyCatalogTitle" : "ledger.emptyFilteredTitle");
+    const body = state.query
+      ? tr("ledger.emptyBodySearch", { query: marker })
+      : escapeHtml(tr(catalogEmpty ? "ledger.emptyCatalogBody" : "ledger.emptyFilteredBody"));
     ledger.innerHTML = `
       <div class="ledger__empty">
         <div class="ledger__empty-num">∅</div>
-        <div class="ledger__empty-title">${escapeHtml(tr("ledger.emptyTitle"))}</div>
-        <div class="ledger__empty-body">${state.query
-          ? tr("ledger.emptyBodySearch", { query: marker })
-          : escapeHtml(tr("ledger.emptyBody"))}</div>
+        <div class="ledger__empty-title">${escapeHtml(title)}</div>
+        <div class="ledger__empty-body">${body}</div>
+        ${catalogEmpty ? `<button class="scan-btn" id="emptyScan" style="margin-top:14px">${escapeHtml(tr("ledger.scanNow"))}</button>` : ""}
       </div>`;
     if (state.query) replaceTextMarker(ledger, marker, state.query);
+    document.getElementById("emptyScan")?.addEventListener("click", () => runLocalScan());
     return;
   }
   const renderContext = { activeTabs: model.activeTabs };
@@ -518,6 +771,95 @@ function renderLedger(model = buildLedgerModel()) {
   }
   ledger.classList.toggle("is-large", model.ordered.length > 200);
   ledger.innerHTML = parts.join("");
+}
+
+function normalizeOsFamily(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized.includes("windows") || /^(mingw|msys|cygwin)/.test(normalized)) return "windows";
+  if (normalized.includes("darwin") || normalized.includes("macos") || normalized.includes("mac os")) return "macos";
+  if (normalized.includes("linux")) return "linux";
+  if (/(bsd|sunos|solaris|aix|unix)/.test(normalized)) return "unix";
+  return "unknown";
+}
+
+function currentBrowserOsFamily() {
+  return normalizeOsFamily(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent);
+}
+
+function operatingSystemPresentation(value) {
+  const family = normalizeOsFamily(value);
+  return {
+    family,
+    icon: family === "unknown" ? "unknownOs" : family,
+    label: {
+      windows: "Windows",
+      linux: "Linux",
+      macos: "macOS",
+      unix: "Unix",
+      unknown: "Unknown OS",
+    }[family],
+  };
+}
+
+function machineIdentityIconsHtml(kind, osFamily, className = "") {
+  const os = operatingSystemPresentation(osFamily);
+  const deviceIcon = kind === "remote" ? "remoteServer" : "localMachine";
+  return `<span class="machine-identity ${className}" data-machine-kind="${kind}"
+                data-os-family="${os.family}" title="${escapeHtml(os.label)}">
+    <span class="machine-identity__device">${iconSvg(deviceIcon, { size: 12 })}</span>
+    <span class="machine-identity__os machine-identity__os--${os.family}">${iconSvg(os.icon, { size: 10 })}</span>
+  </span>`;
+}
+
+function projectSourcePresentation(project) {
+  if (project?.source !== "remote") {
+    const os = operatingSystemPresentation(project?.osFamily || currentBrowserOsFamily());
+    return {
+      kind: "local",
+      label: tr("entry.sourceLocal"),
+      os,
+      title: `${tr("entry.sourceLocalTitle", { path: project?.path || "" })} · ${os.label}`,
+    };
+  }
+
+  const server = state.remoteServerById[project.remoteServerId];
+  const label = server?.label || server?.host || tr("entry.sourceRemoteUnknown");
+  const connection = server
+    ? `${server.user}@${server.host}:${server.port}`
+    : project?.path || "";
+  const os = operatingSystemPresentation(server?.osFamily || project?.osFamily);
+  return {
+    kind: "remote",
+    label: tr("entry.sourceRemote", { label }),
+    os,
+    title: `${tr("entry.sourceRemoteTitle", { label, connection })} · ${os.label}`,
+  };
+}
+
+function projectSourceBadgeHtml(project, className) {
+  const source = projectSourcePresentation(project);
+  return `<span class="project-source project-source--${source.kind} ${className}"
+                data-project-source="${source.kind}"
+                data-os-family="${source.os.family}"
+                aria-label="${escapeHtml(`${source.label} · ${source.os.label}`)}"
+                title="${escapeHtml(source.title)}">
+    <span class="project-source__device">${iconSvg(source.kind === "remote" ? "remoteServer" : "localMachine", { size: 10 })}</span>
+    <span class="project-source__label">${escapeHtml(source.label)}</span>
+    <span class="project-source__os project-source__os--${source.os.family}">${iconSvg(source.os.icon, { size: 9 })}</span>
+  </span>`;
+}
+
+function projectGitSyncBadgeHtml(project) {
+  const info = state.gitStatusByProject[project.id];
+  if (!info?.isRepo || !info.upstream) return "";
+  const badges = [];
+  if (Number(info.ahead) > 0) {
+    badges.push(`<span class="entry__git-state entry__git-state--ahead" title="${escapeHtml(tr("git.aheadTitle", { count: info.ahead }))}">${escapeHtml(tr("git.needsPush", { count: info.ahead }))}</span>`);
+  }
+  if (Number(info.behind) > 0) {
+    badges.push(`<span class="entry__git-state entry__git-state--behind" title="${escapeHtml(tr("git.behindTitle", { count: info.behind }))}">${escapeHtml(tr("git.notLatest", { count: info.behind }))}</span>`);
+  }
+  return badges.join("");
 }
 
 function entryHtml(p, renderContext) {
@@ -568,11 +910,12 @@ function entryHtml(p, renderContext) {
           ${contentMatch}
         </div>
         ${missingBadge}
+        ${projectSourceBadgeHtml(p, "entry__source")}
+        ${projectGitSyncBadgeHtml(p)}
       </div>
       <div class="entry__meta-col">
         ${sessionMarker}
         ${dot}
-        ${p.source === "remote" ? `<span class="entry__remote-dot" title="${escapeHtml(tr("entry.remoteTooltip", { label: state.remoteServerById[p.remoteServerId]?.label || p.path }))}">●</span>` : ""}
         <div class="entry__time">${t}</div>
         <button class="entry__tree-btn" data-tree-btn draggable="false" aria-label="${escapeHtml(tr("entry.showFileTree"))}" title="${escapeHtml(tr("entry.showFileTree"))}">${ICON_FILES}</button>
         <button class="entry__menu-btn" data-menu-toggle draggable="false" aria-label="${escapeHtml(tr("entry.more"))}" title="${escapeHtml(tr("entry.more"))}">⋯</button>
@@ -581,9 +924,8 @@ function entryHtml(p, renderContext) {
     </article>`;
 }
 
-// The expanded panel is intentionally built only for the single open row.
-// Large catalogs no longer pay to construct hidden session cards, queue
-// controls, and launch buttons for every project on each ledger repaint.
+// Build the heavier session/queue controls only for the one expanded row.
+// This keeps large project catalogs cheap to repaint.
 function entryExpandedPanelHtml(p) {
   const sessionCards = (p.toolUsages || []).map(u => {
     const sid = u.lastSessionId || "";
@@ -601,7 +943,7 @@ function entryExpandedPanelHtml(p) {
           </div>
         </div>
         <div class="session-card__actions">
-          <button class="launch-pill" data-launch-tool="${escapeHtml(u.toolKey)}" data-launch-sid="${escapeHtml(sid)}" draggable="false">${escapeHtml(tr("entry.resume"))}</button>
+          <button class="launch-pill" data-launch-tool="${escapeHtml(u.toolKey)}" data-launch-sid="${escapeHtml(sid)}" draggable="false" ${disabledTuiAttrs(p, u.toolKey)}>${escapeHtml(tr("entry.resume"))}</button>
         </div>
       </div>`;
   }).join("");
@@ -609,18 +951,19 @@ function entryExpandedPanelHtml(p) {
   // tools the project has never opened a session with. Offer those as "new
   // session" pills so a user can start e.g. a fresh Kimi session even when
   // only Claude has a recorded usage. They reuse the data-launch-tool path
-  // (no data-launch-sid → bare command, no --resume) so the existing ledger
+  // (no data-launch-sid → bare command, no resume selector) so the existing ledger
   // delegated handler launches them with zero logic change.
   const recorded = new Set((p.toolUsages || []).map(u => u.toolKey));
   const newToolPills = (state.tools || [])
-    .filter(t => !recorded.has(t.toolKey))
+    .filter(t => !recorded.has(t.toolKey) && canLaunchTui(p, t.toolKey))
     .map(t => `<button class="launch-pill launch-pill--ghost" data-launch-tool="${escapeHtml(t.toolKey)}" draggable="false">${toolIcon(t.toolKey)}${escapeHtml(t.toolName)}</button>`)
     .join("");
   // Claude task queue panel. Only shown for projects that have a Claude
   // usage record — the queue runs `claude -p` so it only makes sense when
   // the project is a Claude Code project. If a queue tab is already open
   // for this project, the button label switches to "add to queue".
-  const hasClaude = (p.toolUsages || []).some(u => u.toolKey === "claude");
+  const hasClaude = (p.toolUsages || []).some(u => u.toolKey === "claude")
+    && canLaunchTui(p, "claude");
   const existingQueueTab = hasClaude
     ? state.tabs.find(t => t.isQueue && t.project?.id === p.id)
     : null;
@@ -637,8 +980,7 @@ function entryExpandedPanelHtml(p) {
         </div>
         ${existingQueueTab ? `<div class="entry__expanded__queue-status">${escapeHtml(tr("queue.queueOpen", { idx: existingQueueTab.queueIdx + 1, total: existingQueueTab.queueTotal }))}</div>` : ""}
       </div>` : "";
-  return `
-    <div class="entry__expanded">
+  return `<div class="entry__expanded">
       <div class="entry__expanded__label">${escapeHtml(tr("entry.label.openSession"))}</div>
       ${sessionCards || `<div class="entry__expanded__empty">${escapeHtml(tr("entry.noInstrumentsHint"))}</div>`}
       ${newToolPills ? `<div class="entry__expanded__new">
@@ -664,7 +1006,7 @@ function entryMenuHtml(p, isOpen) {
     ? `<span class="tag tag--branch">⎇ ${escapeHtml(p.gitBranch)}</span>` : "";
 
   const pills = usages.map(u =>
-    `<button class="launch-pill" data-project-id="${p.id}" data-tool="${escapeHtml(u.toolKey)}">
+    `<button class="launch-pill" data-project-id="${p.id}" data-tool="${escapeHtml(u.toolKey)}" ${disabledTuiAttrs(p, u.toolKey)}>
        <i class="dot ${toolDotClass(u.toolKey)}" style="background:${toolColor(u.toolKey)}"></i>
        ${escapeHtml(u.toolName)}<small>${u.sessionCount} ${escapeHtml(sessAbbr)}</small>
      </button>`).join("");
@@ -682,6 +1024,12 @@ function entryMenuHtml(p, isOpen) {
   return `
     ${groupPickerHtml(p.id)}
     <div class="entry-menu__path">${escapeHtml(p.path)}</div>
+    <div class="entry-menu__ignore">
+      <span class="entry__launch-label">${escapeHtml(tr("entry.label.visibility"))}</span>
+      <button class="launch-pill launch-pill--danger" data-ignore-project>
+        ${escapeHtml(tr("entry.ignoreTree"))}
+      </button>
+    </div>
     <div class="entry-menu__tags">${tags}${branch}</div>
     ${p.source === "remote"
       ? `<div class="entry-menu__docs">
@@ -805,11 +1153,13 @@ const COMMON_COMMANDS_BY_TOOL = {
     title: "PI",
     items: [
       { cmd: "/help",                hint: "help"    },
+      { cmd: "/model",               hint: "model"   },
       { cmd: "/settings",            hint: "config"  },
       { cmd: "/session",             hint: "session" },
       { cmd: "/tree",                hint: "tree"    },
-      { cmd: "/model",               hint: "model"   },
-      { cmd: "/exit",                hint: "exit"    },
+      { cmd: "/resume",              hint: "resume"  },
+      { cmd: "/compact",             hint: "memory"  },
+      { cmd: "/quit",                hint: "exit"    },
     ],
   },
 };
@@ -957,6 +1307,7 @@ async function openDocModal(project, relPath, name) {
   title.textContent = `${project.name} · ${name}`;
   body.innerHTML = `<div class="docs-status">${escapeHtml(tr("common.loading"))}</div>`;
   modal.hidden = false;
+  activateDialog(modal, "[data-doc-modal-close]");
   const requestId = docModalGate.begin();
   const identity = `${project.id}\0${relPath}`;
   modal.dataset.docIdentity = identity;
@@ -981,6 +1332,7 @@ function closeDocModal() {
   const modal = document.getElementById("docModal");
   modal.hidden = true;
   delete modal.dataset.docIdentity;
+  deactivateDialog(modal);
 }
 
 /* ── project file tree ───────────────────────────────────── */
@@ -1732,12 +2084,34 @@ function renderMarkdown(md) {
   return out.join("");
 }
 
-// Inline tokens: escape first, then expand `code`, **bold**, *italic*, [link](url).
-// Link URLs are protocol-validated against a whitelist (http/https/mailto)
-// so a README can't smuggle a `javascript:` / `data:` link through — that
-// would otherwise be a real XSS vector once the markdown is innerHTML'd.
+// Inline tokens: escape first, then expand images, `code`, **bold**, *italic,
+// and links. Images are represented as compact labelled chips rather than
+// fetched inside the app: this avoids leaking document-view activity to a
+// third-party image host and keeps the strict `img-src 'self'` CSP intact.
+// Only HTTP(S) targets become clickable because those are exactly the schemes
+// supported by `open_external_url`; relative/mail links remain readable text
+// instead of navigating the Tauri webview away from the application.
 function renderInline(text) {
   let s = escapeHtml(text);
+  const decodeUrl = rawUrl => rawUrl
+    .replace(/&amp;/g, "&")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"');
+  const imageToken = (label, rawUrl, rawTarget = null) => {
+    const imageUrl = decodeUrl(rawUrl);
+    const targetUrl = decodeUrl(rawTarget || rawUrl);
+    const safeLabel = label || escapeHtml(imageUrl);
+    const body = `<span class="md-image-mark" aria-hidden="true">▧</span><span>${safeLabel}</span>`;
+    if (/^https?:\/\//i.test(targetUrl) && isSafeUrl(targetUrl)) {
+      return `<a href="${escapeHtml(targetUrl)}" class="md-link md-image-link" target="_blank" rel="noopener noreferrer" title="${escapeHtml(imageUrl)}">${body}</a>`;
+    }
+    return `<span class="md-image-placeholder" title="${escapeHtml(imageUrl)}">${body}</span>`;
+  };
+  // Linked image badges must be handled before standalone images or links.
+  s = s.replace(/\[!\[([^\]]*)\]\(([^)\s]+)\)\]\(([^)\s]+)\)/g,
+    (_, label, imageUrl, targetUrl) => imageToken(label, imageUrl, targetUrl));
+  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g,
+    (_, label, imageUrl) => imageToken(label, imageUrl));
   // inline code
   s = s.replace(/`([^`]+)`/g, (_, c) => `<code class="md-inline-code">${c}</code>`);
   // bold (** before italic so ** isn't eaten)
@@ -1747,9 +2121,12 @@ function renderInline(text) {
   // links — whitelist the scheme. The URL was captured AFTER escaping, so
   // reverse the few entities we produced before validating the scheme.
   s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, rawUrl) => {
-    const url = rawUrl.replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+    const url = decodeUrl(rawUrl);
     if (!isSafeUrl(url)) return escapeHtml(label || url);
     const safeLabel = label || escapeHtml(url);
+    if (!/^https?:\/\//i.test(url)) {
+      return `<span class="md-link-muted" title="${escapeHtml(url)}">${safeLabel}</span>`;
+    }
     return `<a href="${escapeHtml(url)}" class="md-link" target="_blank" rel="noopener noreferrer">${safeLabel}</a>`;
   });
   return s;
@@ -2024,6 +2401,16 @@ async function switchRemoteTerminalTab(tab, project, usage) {
 
 async function openTerminalTabOnce(project, usage) {
   const toolKey = usage?.toolKey || "shell";
+  if (!canLaunchTui(project, toolKey)) {
+    const capability = tuiCapabilityForProject(project, toolKey);
+    const message = capability && !capability.installed
+      ? tr("tui.launchMissing")
+      : capability && !capability.enabled
+        ? tr("tui.launchDisabled")
+        : tr("tui.launchChecking");
+    showActionError(message);
+    return;
+  }
   const isShell = toolKey === "shell";
   const title = isShell ? project.name : `${project.name} · ${toolKey}`;
   setStatus(tr("status.openingTool", { tool: toolKey, name: project.name }));
@@ -2110,8 +2497,9 @@ async function openTerminalTabOnce(project, usage) {
   // tab is rendered and closed.
   const tab = {
     tabId: ptyId, kind: "pty", ptyId, title, term, fit, pane,
-    project, usage, dead: false, switching: false,
+    project, usage, dead: false, switching: false, composing: false,
   };
+  tab.disposeImeStability = wireTerminalImeStability(tab);
   state.tabs.push(tab);
 
   // Forward keystrokes to the PTY.
@@ -2356,6 +2744,72 @@ function addTabButton(tab) {
   termsBar.appendChild(btn);
 }
 
+// xterm positions a hidden textarea and a visible composition view beside the
+// cursor while an IME is active. Chromium may horizontally scroll one of the
+// terminal ancestors to keep that temporary element visible, which makes the
+// whole workspace appear to jump left. The application has no intentional
+// horizontal scrolling, so keep every ancestor on its zero origin throughout
+// composition and refit only after the committed text has landed.
+function resetTerminalHorizontalScroll(tab) {
+  let node = tab.pane;
+  while (node instanceof HTMLElement) {
+    if (node.scrollLeft !== 0) node.scrollLeft = 0;
+    node = node.parentElement;
+  }
+  const terminalViewport = tab.term.element?.querySelector(".xterm-viewport");
+  if (terminalViewport?.scrollLeft) terminalViewport.scrollLeft = 0;
+  const documentScroller = document.scrollingElement;
+  if (documentScroller?.scrollLeft) documentScroller.scrollLeft = 0;
+}
+
+function refitTerminalAfterComposition(tab) {
+  if (tab.dead || tab.composing || state.activeTabId !== tab.tabId) return;
+  try {
+    tab.fit.fit();
+    invoke("pty_resize", {
+      id: tab.ptyId,
+      cols: tab.term.cols,
+      rows: tab.term.rows,
+    }).catch(() => {});
+  } catch {}
+}
+
+function wireTerminalImeStability(tab) {
+  const textarea = tab.term.textarea;
+  if (!textarea) return () => {};
+
+  let resetFrame = 0;
+  const scheduleReset = () => {
+    if (resetFrame) cancelAnimationFrame(resetFrame);
+    resetFrame = requestAnimationFrame(() => {
+      resetFrame = 0;
+      resetTerminalHorizontalScroll(tab);
+    });
+  };
+  const onCompositionStart = () => {
+    tab.composing = true;
+    tab.pane.classList.add("is-composing");
+    resetTerminalHorizontalScroll(tab);
+  };
+  const onCompositionUpdate = () => scheduleReset();
+  const onCompositionEnd = () => {
+    tab.composing = false;
+    tab.pane.classList.remove("is-composing");
+    scheduleReset();
+    requestAnimationFrame(() => refitTerminalAfterComposition(tab));
+  };
+
+  textarea.addEventListener("compositionstart", onCompositionStart);
+  textarea.addEventListener("compositionupdate", onCompositionUpdate);
+  textarea.addEventListener("compositionend", onCompositionEnd);
+  return () => {
+    textarea.removeEventListener("compositionstart", onCompositionStart);
+    textarea.removeEventListener("compositionupdate", onCompositionUpdate);
+    textarea.removeEventListener("compositionend", onCompositionEnd);
+    if (resetFrame) cancelAnimationFrame(resetFrame);
+  };
+}
+
 function switchTab(tabId) {
   state.activeTabId = tabId;
   termsEmpty.style.display = "none";
@@ -2389,6 +2843,7 @@ function closeTab(tabId) {
   // just need their DOM node removed.
   if (tab.kind === "pty") {
     tab.dead = true;
+    tab.disposeImeStability?.();
     if (HAS_TAURI) { invoke("pty_kill", { id: tab.ptyId }).catch(()=>{}); }
     try { tab.term.dispose(); } catch {}
   }
@@ -2494,6 +2949,7 @@ function renderSelectedLaunchPanel() {
       const actionAttrs = openTab
         ? `data-switch-tab="${escapeHtml(String(openTab.tabId))}"`
         : `data-project-id="${escapeHtml(project.id)}" data-tool="${escapeHtml(u.toolKey)}"`;
+      const disabledAttrs = openTab ? "" : disabledTuiAttrs(project, u.toolKey);
       const actionLabel = openTab ? tr("overview.openTerminal") : tr("entry.resume");
       const rawId = String(u.lastSessionId);
       const shortId = rawId.length > 14 ? `${rawId.slice(0, 8)}…${rawId.slice(-4)}` : rawId;
@@ -2505,7 +2961,7 @@ function renderSelectedLaunchPanel() {
             <strong>${escapeHtml(u.toolName)}</strong>
             <small>${escapeHtml(tr("overview.sessionMeta", { id: shortId, time: usageTime }))}</small>
           </span>
-          <button class="launch-pill overview__session-resume" ${actionAttrs}>${escapeHtml(actionLabel)}</button>
+          <button class="launch-pill overview__session-resume" ${actionAttrs} ${disabledAttrs}>${escapeHtml(actionLabel)}</button>
         </div>`;
     }).join("");
   const openers = project.source === "remote" ? [] : (state.openerPrefs || []).filter(o => o.enabled);
@@ -2533,7 +2989,10 @@ function renderSelectedLaunchPanel() {
     <div class="overview__hero">
       <div class="overview__project-mark">${escapeHtml(projectMark)}</div>
       <div class="overview__identity">
-        <div class="terms__selected-launch__name">${escapeHtml(project.name)}</div>
+        <div class="overview__identity-head">
+          <div class="terms__selected-launch__name">${escapeHtml(project.name)}</div>
+          ${projectSourceBadgeHtml(project, "overview__source")}
+        </div>
         <div class="terms__selected-launch__path">${escapeHtml(project.path)}</div>
       </div>
       <div class="overview__facts">
@@ -2576,6 +3035,7 @@ function renderSelectedLaunchPanel() {
         <button class="launch-pill launch-pill--new" data-project-id="${escapeHtml(project.id)}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
         <button class="launch-pill" data-overview-files>${escapeHtml(tr("overview.files"))}</button>
         <button class="launch-pill" data-overview-settings>${escapeHtml(tr("overview.settings"))}</button>
+        <button class="launch-pill launch-pill--danger" data-ignore-project>${escapeHtml(tr("entry.ignoreTree"))}</button>
         ${openerPills}
       </div>
     </div>
@@ -2590,6 +3050,9 @@ function renderSelectedLaunchPanel() {
   wireLaunchPills(termsSelectedLaunch);
   termsSelectedLaunch.querySelector("[data-overview-files]")?.addEventListener("click", () => setViewMode("files"));
   termsSelectedLaunch.querySelector("[data-overview-settings]")?.addEventListener("click", openSettings);
+  termsSelectedLaunch.querySelector("[data-ignore-project]")?.addEventListener("click", () => {
+    ignoreProjectTree(project);
+  });
 }
 
 // Centralized launch-pill click wiring — used by the ledger popover
@@ -2936,7 +3399,7 @@ function wireResize() {
   if (typeof ResizeObserver === "undefined") return;
   const ro = new ResizeObserver(() => {
     const tab = state.tabs.find(t => t.ptyId === state.activeTabId);
-    if (!tab) return;
+    if (!tab || tab.composing) return;
     try {
       tab.fit.fit();
       invoke("pty_resize", { id: tab.ptyId, cols: tab.term.cols, rows: tab.term.rows }).catch(()=>{});
@@ -2962,11 +3425,15 @@ function openEntryMenu(projectId) {
   // entryMenuHtml(p, true) renders the content with the menu visible.
   entryModalBody.innerHTML = entryMenuHtml(p, true);
   entryModal.hidden = false;
+  activateDialog(entryModal, "[data-entry-modal-close]");
   wireLaunchPills(entryModalBody);
   // Pills inside the modal fire then close it.
   entryModalBody.querySelectorAll(".launch-pill").forEach(el => {
     el.addEventListener("click", () => closeEntryMenu(), { once: true });
   });
+  entryModalBody.querySelector("[data-ignore-project]")?.addEventListener("click", () => {
+    ignoreProjectTree(p);
+  }, { once: true });
   // Lazily load the project's markdown docs list into the placeholder.
   loadProjectDocsIntoEntryMenu(p);
   // Lazily load the project's file tree (root only) into the placeholder.
@@ -2980,6 +3447,7 @@ function closeEntryMenu() {
   state.menuOpenId = null;
   entryModal.hidden = true;
   entryModalBody.innerHTML = "";
+  deactivateDialog(entryModal);
 }
 function wireEntryMenuDelegation() {
   ledger.addEventListener("click", (e) => {
@@ -3107,6 +3575,7 @@ function openSettings() {
   state.settingsView = "menu";
   renderDrawerBody();
   drawer.hidden = false;
+  activateDialog(drawer, "[data-settings-view]");
   document.addEventListener("keydown", escCloseDrawer);
   document.addEventListener("click", backdropCloseDrawer);
 }
@@ -3114,6 +3583,7 @@ function closeSettings() {
   if (drawer.hidden) return; // already closed
   drawer.hidden = true;
   state.settingsView = "menu";
+  deactivateDialog(drawer);
   document.removeEventListener("keydown", escCloseDrawer);
   document.removeEventListener("click", backdropCloseDrawer);
   // Reconcile with whatever the user changed in the drawer.
@@ -3127,6 +3597,7 @@ function escCloseDrawer(e) {
     if (state.settingsView !== "menu") {
       state.settingsView = "menu";
       renderDrawerBody();
+      focusDialogStart(drawer, "[data-settings-view]");
     } else {
       closeSettings();
     }
@@ -3157,6 +3628,9 @@ function renderDrawerHead() {
 function setSettingsView(view) {
   state.settingsView = view;
   renderDrawerBody();
+  if (view === "tui") refreshAllTuiCapabilities();
+  if (view === "cleanup") void refreshSessionCleanup();
+  focusDialogStart(drawer, view === "menu" ? "[data-settings-view]" : "#drawerBackBtn");
 }
 
 // Catalog of settings sub-pages. Order here is the order they appear in
@@ -3164,10 +3638,25 @@ function setSettingsView(view) {
 // body function below. `titleKey` / `blurbKey` are i18n keys so the menu
 // re-localizes when the language changes.
 const SETTINGS_VIEWS = {
+  cleanup: {
+    titleKey: "settings.cleanup.title",
+    blurbKey: "settings.cleanup.blurb",
+    body: renderSessionCleanupViewBody,
+  },
+  tui: {
+    titleKey: "settings.tui.title",
+    blurbKey: "settings.tui.blurb",
+    body: renderTuiViewBody,
+  },
   remote: {
     titleKey: "settings.remote.title",
     blurbKey: "settings.remote.blurb",
     body: renderRemoteViewBody,
+  },
+  ignores: {
+    titleKey: "settings.ignores.title",
+    blurbKey: "settings.ignores.blurb",
+    body: renderIgnoresViewBody,
   },
   groups: {
     titleKey: "settings.groups.title",
@@ -3185,7 +3674,7 @@ const SETTINGS_VIEWS = {
     body: renderLanguageViewBody,
   },
 };
-const SETTINGS_ORDER = ["language", "remote", "groups", "openers"];
+const SETTINGS_ORDER = ["language", "cleanup", "tui", "remote", "ignores", "groups", "openers"];
 
 // Localized title/blurb for a settings view (used by the menu + header).
 function settingsTitleFor(view) {
@@ -3218,46 +3707,328 @@ function renderSettingsMenuBody() {
 // the menu shows the current number of items without a roundtrip.
 function settingsCountFor(view) {
   switch (view) {
+    case "tui": return String(1 + state.remoteServers.length);
     case "remote": return String(state.remoteServers.length);
+    case "ignores": return String(state.projectIgnores.length);
     case "groups": return String(state.groups.length);
     case "openers": return String((state.openerPrefs || []).length);
     case "language": return currentLang() === "zh" ? "中" : "EN";
+    case "cleanup": {
+      const candidates = state.sessionCleanup?.candidates || [];
+      return candidates.length ? String(candidates.filter(item => item.canClean).length) : "—";
+    }
     default: return "";
   }
 }
 
 // Sub-page: remote servers list + the "Add SSH server" form, both
 // inlined so the user only sees them after drilling into this view.
+function publishRemoteServer(server) {
+  state.remoteServers = [
+    ...state.remoteServers.filter(item => Number(item.id) !== Number(server.id)),
+    server,
+  ].sort((left, right) => Number(left.id) - Number(right.id));
+  state.remoteServerById = Object.fromEntries(state.remoteServers.map(item => [item.id, item]));
+}
+
+function renderTuiViewBody() {
+  const localOsFamily = state.all.find(project => project.source !== "remote")?.osFamily
+    || currentBrowserOsFamily();
+  const machines = [
+    { key: "local", serverId: null, label: tr("tui.localMachine"), source: "local", osFamily: localOsFamily },
+    ...state.remoteServers.map(server => ({
+      key: tuiMachineKey(server.id),
+      serverId: Number(server.id),
+      label: server.label || server.host,
+      source: "remote",
+      osFamily: server.osFamily,
+    })),
+  ];
+  return `<div class="tui-intro">${escapeHtml(tr("tui.intro"))}</div>${machines.map(machine => {
+    const capabilities = state.tuiMachines[machine.key];
+    const loading = state.tuiLoadingKeys.has(machine.key);
+    const scopeValue = machine.serverId == null ? "" : String(machine.serverId);
+    let body;
+    if (loading && !capabilities) {
+      body = `<div class="drawer__empty tui-machine__state">${escapeHtml(tr("tui.detecting"))}</div>`;
+    } else if (capabilities?.error) {
+      body = `<div class="tui-machine__error">${escapeHtml(capabilities.error)}</div>`;
+    } else if (capabilities?.tools?.length) {
+      body = capabilities.tools.map(tool => {
+        const installKey = `${machine.key}:${tool.toolKey}`;
+        const installing = state.tuiInstallingKeys.has(installKey);
+        const version = tool.version || tr("tui.versionUnknown");
+        const status = tool.installed ? tr("tui.installed") : tr("tui.notInstalled");
+        const installTitle = tool.installAvailable
+          ? tr("tui.installWith", { manager: tool.installManager })
+          : tr("tui.managerMissing", { manager: tool.installManager });
+        return `<div class="tui-row" data-tui-tool="${escapeHtml(tool.toolKey)}">
+          <span class="tui-row__icon">${toolIcon(tool.toolKey)}</span>
+          <span class="tui-row__main">
+            <strong>${escapeHtml(tool.toolName)}</strong>
+            <small class="${tool.installed ? "is-installed" : "is-missing"}">${escapeHtml(status)}${tool.installed ? ` · ${escapeHtml(version)}` : ""}</small>
+          </span>
+          ${tool.installed
+            ? `<label class="tui-row__toggle" title="${escapeHtml(tr("tui.enableTitle"))}">
+                <input type="checkbox" data-tui-toggle data-server-id="${scopeValue}" ${tool.enabled ? "checked" : ""} ${installing ? "disabled" : ""} />
+                <span>${escapeHtml(tr("tui.enabled"))}</span>
+              </label>`
+            : `<button class="tui-row__install" data-tui-install data-server-id="${scopeValue}"
+                       title="${escapeHtml(installTitle)}" ${!tool.installAvailable || installing ? "disabled" : ""}>
+                ${escapeHtml(tr(installing ? "tui.installing" : "tui.install"))}
+              </button>`}
+        </div>`;
+      }).join("");
+    } else {
+      body = `<div class="drawer__empty tui-machine__state">${escapeHtml(tr("tui.notDetected"))}</div>`;
+    }
+    return `<section class="tui-machine" data-tui-machine="${machine.key}">
+      <div class="tui-machine__head">
+        <div class="tui-machine__identity">
+          ${machineIdentityIconsHtml(machine.source, machine.osFamily, "tui-machine__icons")}
+          <div class="tui-machine__identity-copy">
+            <strong>${escapeHtml(machine.label)}</strong>
+            <small>${escapeHtml(tr(machine.source === "local" ? "tui.sourceLocal" : "tui.sourceRemote"))}</small>
+          </div>
+        </div>
+        <button class="tui-machine__refresh" data-tui-refresh data-server-id="${scopeValue}" ${loading ? "disabled" : ""}>${escapeHtml(tr(loading ? "tui.detectingShort" : "tui.refresh"))}</button>
+      </div>
+      <div class="tui-machine__tools">${body}</div>
+    </section>`;
+  }).join("")}`;
+}
+
+async function ignoreProjectTree(project) {
+  if (!project) return false;
+  if (!HAS_TAURI) {
+    setStatus(tr("status.demoIgnoreUnavailable"));
+    return false;
+  }
+  try {
+    await invoke("add_project_ignore", {
+      source: project.source === "remote" ? "remote" : "local",
+      remoteServerId: project.source === "remote" ? project.remoteServerId : null,
+      path: project.path,
+    });
+    closeEntryMenu();
+    await reload();
+    if (!drawer.hidden && state.settingsView === "ignores") renderDrawerBody();
+    setStatus(tr("status.projectIgnored", { path: project.path }));
+    return true;
+  } catch (error) {
+    showActionError(tr("status.projectIgnoreFailed", { err: error }));
+    return false;
+  }
+}
+
+function setServerFormFeedback(form, message, { error = false } = {}) {
+  const feedback = form?.querySelector?.("[data-server-form-feedback]");
+  const commandInput = form?.querySelector?.('[name="sshCommand"]');
+  const commandField = commandInput?.closest?.(".ssh-command-field");
+  if (feedback) {
+    feedback.textContent = String(message ?? "");
+    feedback.classList.toggle("is-error", error);
+  }
+  if (commandField) commandField.classList.toggle("is-invalid", error);
+  if (commandInput) commandInput.setAttribute("aria-invalid", String(error));
+}
+
+function resetServerFormFeedback(form) {
+  const feedback = form?.querySelector?.("[data-server-form-feedback]");
+  const commandInput = form?.querySelector?.('[name="sshCommand"]');
+  const commandField = commandInput?.closest?.(".ssh-command-field");
+  if (feedback) {
+    feedback.innerHTML = tr("server.hintKeyless");
+    feedback.classList.remove("is-error");
+  }
+  if (commandField) commandField.classList.remove("is-invalid");
+  if (commandInput) commandInput.setAttribute("aria-invalid", "false");
+}
+
+function setServerFormBusy(form, busy) {
+  const submitButton = form?.querySelector?.('[type="submit"]');
+  if (!submitButton) return;
+  submitButton.disabled = busy;
+  submitButton.classList.toggle("is-working", busy);
+  submitButton.setAttribute("aria-busy", String(busy));
+  submitButton.textContent = tr(busy ? "form.submit.connecting" : "form.submit.addScan");
+}
+
+function remoteServerScanPresentation(server) {
+  const iso = server?.lastScannedAt;
+  const date = iso ? new Date(iso) : null;
+  if (!date || Number.isNaN(date.getTime())) {
+    return {
+      text: tr("server.neverScanned"),
+      title: tr("server.neverScannedTitle"),
+    };
+  }
+  const relative = relTime(iso);
+  const compact = relative === "now" ? tr("server.justNow") : relative;
+  const exact = date.toLocaleString(currentLocaleTag(), {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  return {
+    text: tr("server.lastScanned", { time: compact }),
+    title: tr("server.lastScannedTitle", { time: exact }),
+  };
+}
+
+function syncRemoteScanTime(row, server) {
+  const element = row?.querySelector?.("[data-server-last-scan]");
+  if (!element) return;
+  const presentation = remoteServerScanPresentation(server);
+  element.textContent = presentation.text;
+  element.title = presentation.title;
+}
+
+function syncRemoteScanRow(serverId) {
+  if (drawer.hidden || state.settingsView !== "remote") return;
+  const row = drawerBody.querySelector(`.server-row[data-id="${Number(serverId)}"]`);
+  if (!row) return;
+  const scanning = state.remoteScanIds.has(Number(serverId));
+  row.classList.toggle("is-scanning", scanning);
+  const scanButton = row.querySelector("[data-server-scan]");
+  if (scanButton) {
+    scanButton.disabled = scanning;
+    scanButton.textContent = tr(scanning ? "server.scanning" : "server.scan");
+    scanButton.title = tr(scanning ? "server.scanningTitle" : "server.scanTitle");
+  }
+  const deleteButton = row.querySelector("[data-server-del]");
+  if (deleteButton) deleteButton.disabled = scanning;
+  syncRemoteScanTime(
+    row,
+    state.remoteServers.find(server => Number(server.id) === Number(serverId)),
+  );
+}
+
+async function scanRemoteServerInBackground(serverId, { initial = false, probe = null } = {}) {
+  const id = Number(serverId);
+  const server = state.remoteServers.find(item => Number(item.id) === id);
+  const initialName = server?.label || "server";
+  if (state.remoteScanIds.has(id)) {
+    setStatus(tr("status.remoteScanAlreadyRunning", { name: initialName }));
+    return false;
+  }
+
+  state.remoteScanIds.add(id);
+  syncRemoteScanRow(id);
+  setStatus(tr(initial ? "status.serverAddedScanningBackground" : "status.scanningBackground", {
+    name: initialName,
+  }));
+
+  try {
+    const count = await invoke("scan_remote_server", { serverId: id });
+    await reload();
+    const currentName = state.remoteServers.find(item => Number(item.id) === id)?.label || initialName;
+    if (initial && probe?.tmuxAvailable === false) {
+      showActionError(tr("status.serverAddedTmuxMissing", { name: currentName }));
+    } else {
+      const scanResult = tr("status.scanResult", { name: currentName, count });
+      const tmuxStatus = initial && probe?.tmuxVersion
+        ? ` · ${tr("status.tmuxReady", { version: probe.tmuxVersion })}`
+        : "";
+      setStatus(`${scanResult}${tmuxStatus}`);
+    }
+    return true;
+  } catch (error) {
+    if (initial) {
+      showActionError(tr("status.serverAddedScanFailed", { name: initialName, err: error }));
+    } else {
+      showActionError(error);
+    }
+    return false;
+  } finally {
+    state.remoteScanIds.delete(id);
+    syncRemoteScanRow(id);
+  }
+}
+
 function renderRemoteViewBody() {
   const list = state.remoteServers.length
     ? `<div class="drawer__section">
         <div class="drawer__section__label">${escapeHtml(tr("settings.configuredServers"))}</div>
-        ${state.remoteServers.map(s => `
-          <div class="server-row" data-id="${s.id}">
+        ${state.remoteServers.map(s => {
+          const scanning = state.remoteScanIds.has(Number(s.id));
+          const scanTime = remoteServerScanPresentation(s);
+          return `
+          <div class="server-row ${scanning ? "is-scanning" : ""}" data-id="${s.id}">
             <div class="server-row__main">
-              <span class="server-row__label">${escapeHtml(s.label)}</span>
-              <span class="server-row__conn">${escapeHtml(s.user)}@${escapeHtml(s.host)}:${s.port}</span>
+              <div class="server-row__identity">
+                ${machineIdentityIconsHtml("remote", s.osFamily, "server-row__icons")}
+                <div class="server-row__identity-copy">
+                  <input class="server-row__label" data-server-rename value="${escapeHtml(s.label)}"
+                         aria-label="${escapeHtml(tr("server.nameAria"))}"
+                         title="${escapeHtml(tr("server.nameTitle"))}" spellcheck="false" />
+                  <span class="server-row__conn">${escapeHtml(s.user)}@${escapeHtml(s.host)}:${s.port}</span>
+                </div>
+              </div>
+              <span class="server-row__scan-time" data-server-last-scan
+                    title="${escapeHtml(scanTime.title)}">${escapeHtml(scanTime.text)}</span>
             </div>
             <div class="server-row__actions">
-              <button class="server-row__scan" data-server-scan title="${escapeHtml(tr("server.scanTitle"))}">${escapeHtml(tr("server.scan"))}</button>
-              <button class="server-row__del" data-server-del title="${escapeHtml(tr("common.delete"))}">✕</button>
+              <button class="server-row__scan" data-server-scan
+                      title="${escapeHtml(tr(scanning ? "server.scanningTitle" : "server.scanTitle"))}"
+                      ${scanning ? "disabled" : ""}>${escapeHtml(tr(scanning ? "server.scanning" : "server.scan"))}</button>
+              <button class="server-row__del" data-server-del title="${escapeHtml(tr("common.delete"))}"
+                      ${scanning ? "disabled" : ""}>✕</button>
             </div>
-          </div>`).join("")}
+          </div>`;
+        }).join("")}
       </div>`
     : `<div class="drawer__empty">${escapeHtml(tr("settings.noRemote"))}</div>`;
   return list + `
-    <form id="serverForm" class="custom-form drawer__form">
+    <form id="serverForm" class="custom-form drawer__form server-form">
       <span class="entry__launch-label">${escapeHtml(tr("settings.addSshServer"))}</span>
-      <p class="custom-form__hint">${tr("server.hintKeyless")}</p>
-      <input class="custom-form__input" name="label" data-i18n-placeholder="form.labelPh" autocomplete="off" />
-      <input class="custom-form__input" name="user"  data-i18n-placeholder="form.userPh" autocomplete="off" />
-      <input class="custom-form__input" name="host"  data-i18n-placeholder="form.hostPh" autocomplete="off" />
-      <input class="custom-form__input custom-form__input--narrow" name="port" data-i18n-placeholder="form.portPh" autocomplete="off" />
-      <input class="custom-form__input custom-form__input--wide" name="identityFile"
-             data-i18n-placeholder="form.identityPh"
-             autocomplete="off" spellcheck="false" />
+      <p class="custom-form__hint" data-server-form-feedback role="status" aria-live="polite">${tr("server.hintKeyless")}</p>
+      <label class="ssh-command-field">
+        <span class="ssh-command-field__prefix" aria-hidden="true">ssh</span>
+        <input class="ssh-command-field__input" name="sshCommand"
+               data-i18n-placeholder="form.sshCommandPh" data-i18n-aria="form.sshCommandAria"
+               autocomplete="off" autocapitalize="none" spellcheck="false" />
+      </label>
+      <input class="custom-form__input server-form__label" name="label"
+             data-i18n-placeholder="form.labelPh" autocomplete="off" />
       <button class="scan-btn" type="submit">${escapeHtml(tr("form.submit.addScan"))}</button>
     </form>`;
+}
+
+// Sub-page: user-managed directory trees excluded from the ledger. The
+// built-in dot-directory rule is intentionally not removable; manual rules
+// preserve their source/server scope and can be restored from this list.
+function renderIgnoresViewBody() {
+  const automatic = `
+    <div class="ignore-rule-note">
+      <strong>${escapeHtml(tr("settings.ignoresAutomaticTitle"))}</strong>
+      <span>${escapeHtml(tr("settings.ignoresAutomaticBody"))}</span>
+    </div>`;
+  if (!state.projectIgnores.length) {
+    return `${automatic}<div class="drawer__empty">${escapeHtml(tr("settings.noIgnores"))}</div>`;
+  }
+  const rows = state.projectIgnores.map(rule => `
+    <div class="ignore-row" data-id="${escapeHtml(String(rule.id))}">
+      <div class="ignore-row__main">
+        ${projectSourceBadgeHtml({
+          source: rule.source,
+          remoteServerId: rule.remoteServerId,
+          path: rule.path,
+        }, "ignore-row__source")}
+        <span class="ignore-row__path" title="${escapeHtml(rule.path)}">${escapeHtml(rule.path)}</span>
+      </div>
+      <button class="ignore-row__del" data-ignore-del title="${escapeHtml(tr("settings.restoreIgnoredTitle"))}">
+        ${escapeHtml(tr("settings.restoreIgnored"))}
+      </button>
+    </div>`).join("");
+  return `${automatic}
+    <div class="drawer__section">
+      <div class="drawer__section__label">${escapeHtml(tr("settings.ignoredPaths"))}</div>
+      ${rows}
+    </div>`;
 }
 
 // Sub-page: groups list + "Add group" form.
@@ -3313,27 +4084,118 @@ function renderOpenersViewBody() {
     </form>`;
 }
 
-// Sub-page: interface language picker. Two option rows (中文 / English),
-// the active one highlighted; clicking either switches immediately and
-// re-renders the whole UI (the drawer included). Reuses the
-// .settings-menu__row styling so it visually matches the main menu.
+// Sub-page: interface language picker. The selected language is expressed by
+// the whole row's highlight instead of a checkbox/checkmark. Native buttons
+// keep Enter/Space activation, while radio semantics expose the exclusive
+// choice to assistive technology.
 function renderLanguageViewBody() {
   const cur = currentLang();
   const rows = [
     { code: "zh", label: tr("settings.language.zh") },
     { code: "en", label: tr("settings.language.en") },
   ].map(o => `
-    <div class="settings-menu__row lang-row ${o.code === cur ? "is-active" : ""}"
-         data-lang-select="${o.code}" role="button" tabindex="0">
+    <button class="settings-menu__row lang-row ${o.code === cur ? "is-active" : ""}"
+            type="button" data-lang-select="${o.code}" role="radio"
+            aria-checked="${o.code === cur}">
       <div class="settings-menu__main">
         <div class="settings-menu__title">${escapeHtml(o.label)}</div>
       </div>
-      <div class="settings-menu__count">${o.code === cur ? "✓" : ""}</div>
-    </div>`).join("");
-  return `<div class="drawer__section">
-    <div class="drawer__section__label">${escapeHtml(tr("lang.rowTitle"))}</div>
+    </button>`).join("");
+  return `<div class="drawer__section lang-picker" role="radiogroup"
+               aria-label="${escapeHtml(tr("lang.rowTitle"))}">
+    <div class="drawer__section__label" aria-hidden="true">${escapeHtml(tr("lang.rowTitle"))}</div>
     ${rows}
   </div>`;
+}
+
+async function refreshSessionCleanup() {
+  if (state.sessionCleanupLoading) return;
+  state.sessionCleanupLoading = true;
+  if (!drawer.hidden && state.settingsView === "cleanup") renderDrawerBody();
+  try {
+    if (HAS_TAURI) {
+      const [analysis, trash] = await Promise.all([
+        invoke("analyze_session_cleanup"),
+        invoke("list_session_trash"),
+      ]);
+      state.sessionCleanup = analysis;
+      state.sessionCleanupTrash = trash;
+    } else {
+      state.sessionCleanup = {
+        scannedAt: new Date().toISOString(),
+        supportedTools: ["codex", "claude"],
+        candidates: [
+          { key:"codex:active:demo-child", toolKey:"codex", sessionId:"demo-child", parentSessionId:"demo-parent", title:"review generated patch", cliVersion:"0.139.0", agentKind:"guardian", classification:"likely", reasons:["guardianDelivered"], protections:[], ageDays:48, sizeBytes:32100, userTurns:1, toolCalls:2, canClean:true },
+          { key:"claude:active:demo-short", toolKey:"claude", sessionId:"demo-short", title:"quick question", agentKind:"root", classification:"possible", reasons:["shortSingleTurn"], protections:["latestForProject"], ageDays:38, sizeBytes:8400, userTurns:1, toolCalls:0, canClean:false },
+        ],
+      };
+      state.sessionCleanupTrash = [];
+    }
+    state.sessionCleanupSelected = new Set(
+      [...state.sessionCleanupSelected].filter(key =>
+        state.sessionCleanup.candidates.some(item => item.key === key && item.canClean)),
+    );
+  } catch (error) {
+    showActionError(tr("cleanup.analysisFailed", { err: error }));
+  } finally {
+    state.sessionCleanupLoading = false;
+    if (!drawer.hidden && state.settingsView === "cleanup") renderDrawerBody();
+  }
+}
+
+function cleanupReasonText(key) {
+  const translated = tr(`cleanup.reason.${key}`);
+  return translated === `cleanup.reason.${key}` ? key : translated;
+}
+
+function renderSessionCleanupViewBody() {
+  if (state.sessionCleanupLoading && !state.sessionCleanup) {
+    return `<div class="drawer__empty cleanup-loading">${escapeHtml(tr("cleanup.analyzing"))}</div>`;
+  }
+  const candidates = state.sessionCleanup?.candidates || [];
+  const actionable = candidates.filter(item => item.classification !== "keep");
+  const likely = actionable.filter(item => item.classification === "likely").length;
+  const possible = actionable.filter(item => item.classification === "possible").length;
+  const protectedCount = actionable.filter(item => !item.canClean).length;
+  const selectedSize = actionable
+    .filter(item => state.sessionCleanupSelected.has(item.key))
+    .reduce((sum, item) => sum + Number(item.sizeBytes || 0), 0);
+  const rows = actionable.map(item => {
+    const checked = state.sessionCleanupSelected.has(item.key);
+    const reasonText = item.reasons.map(cleanupReasonText).join(" · ");
+    const protectionText = item.protections.map(cleanupReasonText).join(" · ");
+    const parent = item.parentSessionId ? tr("cleanup.childAgent") : tr("cleanup.rootSession");
+    return `<label class="cleanup-row ${item.canClean ? "" : "is-protected"}" data-cleanup-key="${escapeHtml(item.key)}">
+      <input type="checkbox" data-cleanup-select ${checked ? "checked" : ""} ${item.canClean ? "" : "disabled"} />
+      <span class="cleanup-row__main">
+        <span class="cleanup-row__title">${escapeHtml(item.title || item.sessionId.slice(0, 12))}</span>
+        <span class="cleanup-row__meta">${escapeHtml(item.toolKey)} · ${escapeHtml(parent)} · ${escapeHtml(tr("cleanup.age", { days: item.ageDays }))} · ${escapeHtml(formatBytes(item.sizeBytes))}</span>
+        <span class="cleanup-row__reason">${escapeHtml(reasonText)}${protectionText ? ` · ${escapeHtml(tr("cleanup.protected", { reason: protectionText }))}` : ""}</span>
+      </span>
+      <span class="cleanup-row__class cleanup-row__class--${item.classification}">${escapeHtml(tr(`cleanup.class.${item.classification}`))}</span>
+    </label>`;
+  }).join("");
+  const trash = state.sessionCleanupTrash.map(batch => `
+    <div class="cleanup-trash-row">
+      <span>${escapeHtml(new Date(batch.createdAt).toLocaleString(currentLocaleTag()))} · ${escapeHtml(tr("cleanup.sessions", { count: batch.sessionCount }))} · ${escapeHtml(formatBytes(batch.sizeBytes))}</span>
+      <button type="button" data-cleanup-restore="${escapeHtml(batch.batchId)}">${escapeHtml(tr("cleanup.restore"))}</button>
+    </div>`).join("");
+  return `<div class="cleanup-intro">${escapeHtml(tr("cleanup.intro"))}</div>
+    <div class="cleanup-summary">
+      <span class="cleanup-summary__likely">${escapeHtml(tr("cleanup.likelyCount", { count: likely }))}</span>
+      <span>${escapeHtml(tr("cleanup.possibleCount", { count: possible }))}</span>
+      <span>${escapeHtml(tr("cleanup.protectedCount", { count: protectedCount }))}</span>
+      <button type="button" data-cleanup-refresh ${state.sessionCleanupLoading ? "disabled" : ""}>${escapeHtml(tr(state.sessionCleanupLoading ? "cleanup.analyzing" : "cleanup.reanalyze"))}</button>
+    </div>
+    <div class="cleanup-actions">
+      <button type="button" data-cleanup-select-likely>${escapeHtml(tr("cleanup.selectLikely"))}</button>
+      <button type="button" class="cleanup-actions__primary" data-cleanup-run ${state.sessionCleanupSelected.size ? "" : "disabled"}>${escapeHtml(tr("cleanup.moveSelected", { count: state.sessionCleanupSelected.size, size: formatBytes(selectedSize) }))}</button>
+    </div>
+    <div class="cleanup-list">${rows || `<div class="drawer__empty">${escapeHtml(tr("cleanup.noCandidates"))}</div>`}</div>
+    <div class="drawer__section cleanup-trash">
+      <div class="drawer__section__label">${escapeHtml(tr("cleanup.recovery"))}</div>
+      ${trash || `<div class="drawer__empty">${escapeHtml(tr("cleanup.noRecovery"))}</div>`}
+    </div>`;
 }
 
 function renderDrawerBody() {
@@ -3341,6 +4203,9 @@ function renderDrawerBody() {
     drawerBody.innerHTML = `<div class="drawer__empty">${tr("settings.prefsUnavailable", { error: escapeHtml(state.openerPrefsError) })}</div>`;
     renderDrawerHead();
     renderDrawerFoot();
+    if (!drawer.hidden && !drawer.contains(document.activeElement)) {
+      focusDialogStart(drawer, "#drawerBackBtn");
+    }
     return;
   }
   if (state.settingsView === "menu") {
@@ -3350,6 +4215,15 @@ function renderDrawerBody() {
     drawerBody.innerHTML = view ? view.body() : "";
   }
   renderDrawerHead();
+  // Startup reconciliation and language changes can repaint an already-open
+  // drawer. If that removed the focused row, restore focus inside the dialog
+  // instead of silently dropping keyboard users back onto <body>.
+  if (!drawer.hidden && !drawer.contains(document.activeElement)) {
+    const preferred = state.settingsView === "menu"
+      ? "[data-settings-view]"
+      : "#drawerBackBtn";
+    focusDialogStart(drawer, preferred);
+  }
 }
 
 /* One-shot delegated listeners attached at module init. Replaces the
@@ -3358,6 +4232,42 @@ const _debouncedCmdTimers = new Map();
 function wireDrawerDelegation() {
   drawerBody.addEventListener("change", async (e) => {
     const cb = e.target;
+    if (cb?.matches?.("[data-cleanup-select]")) {
+      const key = cb.closest("[data-cleanup-key]")?.dataset.cleanupKey;
+      if (key) {
+        if (cb.checked) state.sessionCleanupSelected.add(key);
+        else state.sessionCleanupSelected.delete(key);
+        renderDrawerBody();
+      }
+      return;
+    }
+    if (cb?.matches?.("[data-tui-toggle]")) {
+      const row = cb.closest("[data-tui-tool]");
+      const toolKey = row?.dataset.tuiTool;
+      const serverId = cb.dataset.serverId === "" ? null : Number(cb.dataset.serverId);
+      const key = tuiMachineKey(serverId);
+      const previous = !cb.checked;
+      cb.disabled = true;
+      try {
+        if (HAS_TAURI) {
+          state.tuiMachines[key] = await invoke("set_tui_enabled", {
+            serverId, toolKey, enabled: cb.checked,
+          });
+        } else {
+          const tool = state.tuiMachines[key]?.tools?.find(item => item.toolKey === toolKey);
+          if (tool) tool.enabled = cb.checked;
+        }
+        setStatus(tr(cb.checked ? "status.tuiEnabled" : "status.tuiDisabled", { tool: toolKey }));
+        renderDrawerBody();
+        applyFilters();
+        renderSelectedLaunchPanel();
+      } catch (error) {
+        cb.checked = previous;
+        cb.disabled = false;
+        showActionError(tr("status.tuiToggleFailed", { err: error }));
+      }
+      return;
+    }
     if (!cb?.matches?.("[data-opener-toggle]")) return;
     const id = cb.closest(".opener-row").dataset.id;
     const checked = cb.checked;
@@ -3378,6 +4288,10 @@ function wireDrawerDelegation() {
   });
   drawerBody.addEventListener("input", (e) => {
     const inp = e.target;
+    if (inp?.matches?.('#serverForm [name="sshCommand"]')) {
+      resetServerFormFeedback(inp.form);
+      return;
+    }
     if (inp?.matches?.("[data-opener-cmd]")) {
       const id = inp.closest(".opener-row").dataset.id;
       clearTimeout(_debouncedCmdTimers.get(id));
@@ -3419,9 +4333,114 @@ function wireDrawerDelegation() {
           }
         });
       }, 350));
+      return;
+    }
+    if (inp?.matches?.("[data-server-rename]")) {
+      const id = Number(inp.closest(".server-row").dataset.id);
+      clearTimeout(_debouncedCmdTimers.get(`s${id}`));
+      _debouncedCmdTimers.set(`s${id}`, setTimeout(async () => {
+        const draft = inp.value;
+        await settingsMutationQueue.run(`server-rename:${id}`, async () => {
+          try {
+            if (HAS_TAURI) {
+              await invoke("rename_remote_server", { serverId: id, label: draft });
+            }
+            const server = state.remoteServers.find(item => Number(item.id) === id);
+            if (server) server.label = draft.trim();
+            inp.classList.remove("is-unsaved");
+            renderLedger();
+            renderSelectedLaunchPanel();
+          } catch (error) {
+            inp.classList.add("is-unsaved");
+            showActionError(error);
+          }
+        });
+      }, 350));
     }
   });
   drawerBody.addEventListener("click", async (e) => {
+    if (e.target.closest("[data-cleanup-refresh]")) {
+      void refreshSessionCleanup();
+      return;
+    }
+    if (e.target.closest("[data-cleanup-select-likely]")) {
+      const likely = (state.sessionCleanup?.candidates || [])
+        .filter(item => item.classification === "likely" && item.canClean)
+        .map(item => item.key);
+      state.sessionCleanupSelected = new Set(likely);
+      renderDrawerBody();
+      return;
+    }
+    if (e.target.closest("[data-cleanup-run]")) {
+      const keys = [...state.sessionCleanupSelected];
+      if (!keys.length || !window.confirm(tr("cleanup.confirm", { count: keys.length }))) return;
+      try {
+        if (HAS_TAURI) await invoke("quarantine_session_candidates", { keys });
+        state.sessionCleanup = null;
+        state.sessionCleanupSelected.clear();
+        setStatus(tr("cleanup.moved", { count: keys.length }));
+        await refreshSessionCleanup();
+        if (HAS_TAURI) void reload();
+      } catch (error) {
+        showActionError(tr("cleanup.moveFailed", { err: error }));
+      }
+      return;
+    }
+    const restore = e.target.closest("[data-cleanup-restore]");
+    if (restore) {
+      if (!window.confirm(tr("cleanup.restoreConfirm"))) return;
+      try {
+        const count = HAS_TAURI
+          ? await invoke("restore_session_trash", { batchId: restore.dataset.cleanupRestore })
+          : 1;
+        state.sessionCleanup = null;
+        setStatus(tr("cleanup.restored", { count }));
+        await refreshSessionCleanup();
+        if (HAS_TAURI) void reload();
+      } catch (error) {
+        showActionError(tr("cleanup.restoreFailed", { err: error }));
+      }
+      return;
+    }
+    const tuiRefresh = e.target.closest("[data-tui-refresh]");
+    if (tuiRefresh) {
+      const serverId = tuiRefresh.dataset.serverId === "" ? null : Number(tuiRefresh.dataset.serverId);
+      void refreshTuiMachine(serverId, { force: true });
+      return;
+    }
+    const tuiInstall = e.target.closest("[data-tui-install]");
+    if (tuiInstall) {
+      const row = tuiInstall.closest("[data-tui-tool]");
+      const toolKey = row?.dataset.tuiTool;
+      const serverId = tuiInstall.dataset.serverId === "" ? null : Number(tuiInstall.dataset.serverId);
+      const machineKey = tuiMachineKey(serverId);
+      const machine = state.tuiMachines[machineKey];
+      const tool = machine?.tools?.find(item => item.toolKey === toolKey);
+      if (!tool) return;
+      if (!window.confirm(tr("tui.installConfirm", { tool: tool.toolName, machine: machine.label || tr("tui.localMachine") }))) return;
+      const installKey = `${machineKey}:${toolKey}`;
+      state.tuiInstallingKeys.add(installKey);
+      renderDrawerBody();
+      setStatus(tr("status.tuiInstalling", { tool: tool.toolName, machine: machine.label }));
+      try {
+        if (HAS_TAURI) {
+          state.tuiMachines[machineKey] = await invoke("install_tui", { serverId, toolKey });
+        } else {
+          tool.installed = true;
+          tool.enabled = true;
+          tool.version = "demo";
+        }
+        setStatus(tr("status.tuiInstalled", { tool: tool.toolName, machine: machine.label }));
+      } catch (error) {
+        showActionError(tr("status.tuiInstallFailed", { err: error }));
+      } finally {
+        state.tuiInstallingKeys.delete(installKey);
+        renderDrawerBody();
+        applyFilters();
+        renderSelectedLaunchPanel();
+      }
+      return;
+    }
     const openerBtn = e.target.closest("[data-opener-del]");
     if (openerBtn) {
       const id = openerBtn.closest(".opener-row").dataset.id;
@@ -3434,6 +4453,19 @@ function wireDrawerDelegation() {
       await loadOpenerPrefs();
       renderDrawerBody();
       renderLedger();
+      return;
+    }
+    const ignoreBtn = e.target.closest("[data-ignore-del]");
+    if (ignoreBtn) {
+      const id = Number(ignoreBtn.closest(".ignore-row").dataset.id);
+      try {
+        if (HAS_TAURI) await invoke("delete_project_ignore", { ignoreId: id });
+        await reload();
+        renderDrawerBody();
+        setStatus(tr("status.projectIgnoreRemoved"));
+      } catch (error) {
+        showActionError(tr("status.projectIgnoreRemoveFailed", { err: error }));
+      }
       return;
     }
     const groupBtn = e.target.closest("[data-group-del]");
@@ -3454,18 +4486,7 @@ function wireDrawerDelegation() {
     const serverScan = e.target.closest("[data-server-scan]");
     if (serverScan) {
       const id = Number(serverScan.closest(".server-row").dataset.id);
-      const s = state.remoteServers.find(x => x.id === id);
-      const name = s?.label || "server";
-      setStatus(tr("status.scanning", { name }));
-      try {
-        const n = await invoke("scan_remote_server", { serverId: id });
-        setStatus(tr("status.scanResult", { name, count: n }));
-      } catch (err) {
-        showActionError(err);
-        return;
-      }
-      await reload();
-      renderDrawerBody();
+      void scanRemoteServerInBackground(id);
       return;
     }
     const serverDel = e.target.closest("[data-server-del]");
@@ -3485,6 +4506,7 @@ function wireDrawerDelegation() {
     const langRow = e.target.closest("[data-lang-select]");
     if (langRow) {
       setLanguage(langRow.dataset.langSelect);
+      setSettingsView("menu");
       return;
     }
     // Main-menu row: drill into the corresponding sub-page. Keyboard
@@ -3535,76 +4557,71 @@ async function submitDrawerForm(form, e) {
       break;
     }
     case "serverForm": {
-      const label = (fd.get("label") || "").toString().trim();
-      const user = (fd.get("user") || "").toString().trim();
-      const host = (fd.get("host") || "").toString().trim();
-      const portRaw = (fd.get("port") || "").toString().trim();
-      const identityFile = (fd.get("identityFile") || "").toString().trim();
-      if (!label || !user || !host) {
-        setStatus(tr("status.serverFieldsRequired"));
+      const parsed = parseSshConnectionInput(fd.get("sshCommand"));
+      if (!parsed.ok) {
+        const errorKey = {
+          empty: "status.sshCommandRequired",
+          unterminatedQuote: "status.sshUnterminatedQuote",
+          missingOptionValue: "status.sshMissingOptionValue",
+          duplicateOption: "status.sshDuplicateOption",
+          unsupportedOption: "status.sshUnsupportedOption",
+          extraArgument: "status.sshExtraArgument",
+          destination: "status.sshDestinationRequired",
+          port: "status.portRange",
+        }[parsed.error] || "status.sshDestinationRequired";
+        const message = tr(errorKey, { value: parsed.detail || "" });
+        setStatus(message);
+        setServerFormFeedback(form, message, { error: true });
+        form.querySelector('[name="sshCommand"]')?.focus();
         return;
       }
-      const port = portRaw ? Number(portRaw) : null;
-      if (port !== null && (!(Number.isInteger(port)) || port < 1 || port > 65535)) {
-        setStatus(tr("status.portRange"));
-        return;
-      }
+      const { user, host, port, identityFile } = parsed.value;
+      const requestedLabel = (fd.get("label") || "").toString().trim();
+      const label = requestedLabel || host;
       if (!HAS_TAURI) {
-        setStatus(tr("status.demoRemoteUnavailable"));
+        const message = tr("status.demoRemoteUnavailable");
+        setStatus(message);
+        setServerFormFeedback(form, message, { error: true });
         form.reset();
         return;
       }
-      // Disable the submit button during the async probe + scan so the
-      // user can't double-submit. Re-enabled in finally.
-      const submitBtn = form.querySelector('[type=submit]');
-      if (submitBtn) submitBtn.disabled = true;
+      // Disable only during the connection probe + save. The potentially long
+      // project discovery starts after persistence and continues in the
+      // background, so the form and the rest of the window recover promptly.
+      setServerFormBusy(form, true);
       try {
         // Pre-check connectivity + passwordless auth BEFORE persisting the
         // server, so a host that can't be reached (or lacks key auth) never
         // lands in the DB as a zombie record. The command returns a friendly,
         // bilingual, actionable message on failure.
-        setStatus(tr("status.probing", { name: label }));
+        const probingMessage = tr("status.probing", { name: label });
+        setStatus(probingMessage);
+        setServerFormFeedback(form, probingMessage);
         const probe = await invoke("test_remote_connection", {
           user, host, port: port || null, identityFile: identityFile || null,
         });
 
-        setStatus(tr("status.adding", { name: label }));
+        const addingMessage = tr("status.adding", { name: label });
+        setStatus(addingMessage);
+        setServerFormFeedback(form, addingMessage);
         const server = await invoke("add_remote_server", {
           label, user, host,
           port: port || null,
           identityFile: identityFile || null,
           scanRoots: null,
+          osFamily: probe.osFamily || "unknown",
         });
-        // Auto-scan right after add so the ledger populates without a
-        // separate "SCAN" click — mirrors how local sessionatlas scan runs
-        // when the user adds a project root.
-        setStatus(tr("status.scanning", { name: label }));
-        let count;
-        try {
-          count = await invoke("scan_remote_server", { serverId: server.id });
-        } catch (scanError) {
-          form.reset();
-          await reload();
-          renderDrawerBody();
-          showActionError(tr("status.serverAddedScanFailed", { name: label, err: scanError }));
-          return;
-        }
         form.reset();
-        await reload();
+        publishRemoteServer(server);
         renderDrawerBody();
-        if (probe?.tmuxAvailable === false) {
-          showActionError(tr("status.serverAddedTmuxMissing", { name: label }));
-        } else {
-          const scanResult = tr("status.scanResult", { name: label, count });
-          const tmuxVersion = probe?.tmuxVersion || "tmux";
-          setStatus(`${scanResult} · ${tr("status.tmuxReady", { version: tmuxVersion })}`);
-        }
+        void scanRemoteServerInBackground(server.id, { initial: true, probe });
       } catch (e) {
         // Pre-check (or add/scan) failed: show the classified message but
         // keep the form values so the user can fix and retry.
+        setServerFormFeedback(form, String(e ?? ""), { error: true });
         showActionError(e);
       } finally {
-        if (submitBtn) submitBtn.disabled = false;
+        setServerFormBusy(form, false);
       }
       break;
     }
@@ -3680,11 +4697,12 @@ async function reload() {
     : reloadCoordinator.beginFull();
   try {
     const searching = query.trim().length > 0;
-    const [projectsResult, toolsResult, remoteResult, serversResult] = await Promise.all([
+    const [projectsResult, toolsResult, remoteResult, serversResult, ignoresResult] = await Promise.all([
       captureResult(fetchProjects(query)),
       captureResult(fetchTools()),
       captureResult(searching ? searchRemoteProjects(query) : fetchRemoteProjects()),
       captureResult(fetchRemoteServers()),
+      captureResult(fetchProjectIgnores()),
     ]);
     if (!reloadCoordinator.isCurrent(request)) return;
     if (!projectsResult.ok) throw projectsResult.error;
@@ -3708,8 +4726,15 @@ async function reload() {
       state.remoteServers = serversResult.value || [];
       state.remoteServerById = Object.fromEntries(state.remoteServers.map(s => [s.id, s]));
       state.staleSources.servers = false;
+      refreshAllTuiCapabilities();
     } else {
       state.staleSources.servers = true;
+    }
+    if (ignoresResult.ok) {
+      state.projectIgnores = ignoresResult.value || [];
+      state.staleSources.ignores = false;
+    } else {
+      state.staleSources.ignores = true;
     }
     const projects = searching
       ? [
@@ -3729,8 +4754,16 @@ async function reload() {
     renderTools();
     renderMeta(state.all);
     applyFilters();
-    if (state.filtered.length && !state.all.find(p => p.id === state.selectedId)) {
-      select(state.filtered[0].id);
+    if (!state.all.find(p => p.id === state.selectedId)) {
+      if (state.filtered.length) {
+        select(state.filtered[0].id);
+      } else {
+        state.selectedId = null;
+        state.cursor = -1;
+        renderSelectedLaunchPanel();
+        renderTermsTitle();
+        updateCommonCommandsEnabled();
+      }
     }
     const stale = Object.entries(state.staleSources)
       .filter(([, value]) => value)
@@ -3831,6 +4864,7 @@ function setStatus(msg) { document.getElementById("footStatus").textContent = ms
 const _footGit = {
   row:        document.getElementById("footGit"),
   branch:     document.getElementById("footGitBranch"),
+  sync:       document.getElementById("footGitSync"),
   head:       document.getElementById("footGitHead"),
   remotes:    document.getElementById("footGitRemotes"),
   addBtn:     document.getElementById("footGitAdd"),
@@ -3851,7 +4885,22 @@ async function refreshFootGit() {
     return;
   }
   if (!HAS_TAURI) {
-    renderFootGit({ isRepo: true, branch: "demo", remotes: [], headShort: null, headSummary: null, dirty: false });
+    renderFootGit({ isRepo: true, branch: "demo", remotes: [], headShort: null, headSummary: null, dirty: false, upstream: "origin/demo", ahead: 1, behind: 0, remoteChecked: true });
+    return;
+  }
+  if (p.source === "remote") {
+    renderFootGit({ isRepo: true, branch: p.gitBranch, remotes: [], headShort: null, headSummary: null, dirty: false, upstream: "remote", ahead: 0, behind: 0, remoteChecked: false });
+    try {
+      const info = await invoke("refresh_remote_git_info", { serverId: Number(p.remoteServerId), path: p.path });
+      if (_footGit.current !== p.id) return;
+      _footGit.info = info;
+      state.gitStatusByProject[p.id] = info;
+      renderFootGit(info);
+      renderLedger();
+    } catch (error) {
+      if (_footGit.current !== p.id) return;
+      renderFootGit({ isRepo: false, remotes: [], error: String(error) });
+    }
     return;
   }
   let info;
@@ -3863,7 +4912,19 @@ async function refreshFootGit() {
     return;
   }
   _footGit.info = info;
+  state.gitStatusByProject[p.id] = info;
   renderFootGit(info);
+  try {
+    const refreshed = await invoke("refresh_git_info", { path: p.path });
+    if (_footGit.current !== p.id) return;
+    _footGit.info = refreshed;
+    state.gitStatusByProject[p.id] = refreshed;
+    renderFootGit(refreshed);
+    renderLedger();
+  } catch (error) {
+    if (_footGit.current !== p.id) return;
+    renderFootGit({ ...info, remoteChecked: true, fetchError: String(error) });
+  }
 }
 
 function renderFootGit(info) {
@@ -3875,6 +4936,30 @@ function renderFootGit(info) {
   } else {
     _footGit.branch.textContent = tr("git.notARepo");
     _footGit.branch.classList.remove("is-dirty");
+  }
+  _footGit.sync.className = "foot__git-sync";
+  _footGit.sync.title = "";
+  if (!info.isRepo) {
+    _footGit.sync.textContent = "";
+  } else if (!info.upstream) {
+    _footGit.sync.textContent = tr("git.noUpstream");
+    _footGit.sync.classList.add("is-muted");
+  } else if (Number(info.behind) > 0) {
+    _footGit.sync.textContent = tr("git.notLatest", { count: info.behind });
+    _footGit.sync.classList.add("is-behind");
+  } else if (Number(info.ahead) > 0) {
+    _footGit.sync.textContent = tr("git.needsPush", { count: info.ahead });
+    _footGit.sync.classList.add("is-ahead");
+  } else if (!info.remoteChecked) {
+    _footGit.sync.textContent = tr("git.checking");
+    _footGit.sync.classList.add("is-muted");
+  } else if (info.fetchError) {
+    _footGit.sync.textContent = tr("git.checkFailed");
+    _footGit.sync.title = info.fetchError;
+    _footGit.sync.classList.add("is-warning");
+  } else {
+    _footGit.sync.textContent = tr("git.synced");
+    _footGit.sync.classList.add("is-synced");
   }
   // Head summary: short SHA + last subject, dimmed.
   const headText = info.isRepo
@@ -3895,7 +4980,8 @@ function renderFootGit(info) {
   // gets a one-click "make this a git project" affordance. Once at
   // least one remote exists, the button disappears (mirrors the no-
   // delete guardrail — fewer buttons, more deliberate operations).
-  _footGit.addBtn.hidden = info.remotes.length > 0;
+  const currentProject = state.all.find(project => project.id === _footGit.current);
+  _footGit.addBtn.hidden = currentProject?.source === "remote" || info.remotes.length > 0;
   _footGit.addBtn.title = info.isRepo
     ? tr("git.addRemoteTitle_repo")
     : tr("git.addRemoteTitle_init");
@@ -4116,8 +5202,7 @@ _footGit.branch.addEventListener("click", (e) => {
   e.stopPropagation();
   openBranchMenu();
 });
-function showError(msg) {
-  const text = String(msg ?? "");
+function clearCatalogAfterError() {
   // A failed primary catalog read invalidates the visible ledger. Clear the
   // derived catalog/count as well; otherwise a previous search count can stay
   // in the footer while the ledger shows an error, which is misleading and
@@ -4130,6 +5215,12 @@ function showError(msg) {
   state.selectedId = null;
   renderCount();
   renderMeta([]);
+}
+
+function showError(msg) {
+  const text = String(msg ?? "");
+  clearCatalogAfterError();
+  state.firstRunError = null;
   setStatus(tr("status.errorPrefix", { text }));
   ledger.innerHTML = `
     <div class="ledger__empty">
@@ -4139,6 +5230,14 @@ function showError(msg) {
       <button class="scan-btn" id="errRetry" style="margin-top:14px">${escapeHtml(tr("ledger.retry"))}</button>
     </div>`;
   document.getElementById("errRetry")?.addEventListener("click", () => reload());
+}
+
+function showFirstRunError(msg) {
+  const text = String(msg ?? "");
+  clearCatalogAfterError();
+  state.firstRunError = text;
+  setStatus(tr("status.firstRunScanFailed"));
+  renderLedger();
 }
 
 function showActionError(msg) {
@@ -4199,6 +5298,12 @@ function refreshTimeLabels() {
   const latest = state.all.reduce((m, p) => p.lastAccessedAt > (m || "") ? p.lastAccessedAt : m, "");
   const mr = document.getElementById("metaRecent");
   if (mr) mr.textContent = latest ? relTime(latest) : "—";
+  if (!drawer.hidden && state.settingsView === "remote") {
+    for (const row of drawerBody.querySelectorAll(".server-row[data-id]")) {
+      const server = state.remoteServers.find(item => Number(item.id) === Number(row.dataset.id));
+      syncRemoteScanTime(row, server);
+    }
+  }
 }
 function startTimeRefresh() {
   if (timeTimer) clearInterval(timeTimer);
@@ -4306,6 +5411,7 @@ function applyLocalizedUI() {
   renderTermsTitle();
   if (!drawer.hidden) { renderDrawerBody(); renderDrawerHead(); }
   renderSelectedLaunchPanel();
+  syncOverviewCollapseUI();
   refreshFootGit();
   syncThemeButton();                    // theme button label is translated
 }
@@ -4371,13 +5477,20 @@ document.getElementById("projectOrderFilters").addEventListener("click", e => {
 });
 
 const scanBtn = document.getElementById("scanBtn");
-scanBtn.addEventListener("click", async () => {
+function setLocalScanBusy(busy) {
+  scanBtn.classList.toggle("is-working", busy);
+  scanBtn.disabled = busy;
+  scanBtn.setAttribute("aria-busy", String(busy));
+  if (scanProgress) scanProgress.hidden = !busy;
+}
+
+async function runLocalScan({ initial = false } = {}) {
+  const recoveringFirstRun = state.firstRunError !== null;
   reloadCoordinator.invalidateFull();
   reloadCoordinator.invalidateSearch();
   reloadCoordinator.invalidateAuto();
-  scanBtn.classList.add("is-working");
-  if (scanProgress) scanProgress.hidden = false;
-  setStatus(tr("status.scanningInstruments"));
+  setLocalScanBusy(true);
+  setStatus(tr(initial ? "status.firstRunScanning" : "status.scanningInstruments"));
   try {
     // Run the scan WITHOUT touching state.all — the ledger stays exactly
     // as-is so the user doesn't see their project list vanish or flicker
@@ -4385,23 +5498,37 @@ scanBtn.addEventListener("click", async () => {
     // the list once, after `sessionatlas scan` has finished writing the index.
     if (HAS_TAURI) { await invoke("scan_projects"); }
     else { await new Promise(r => setTimeout(r, 700)); }
+    state.firstRunError = null;
     await reload();
     const stale = Object.entries(state.staleSources)
       .filter(([, value]) => value)
       .map(([key]) => key);
     setStatus(stale.length
       ? tr("status.staleSources", { sources: stale.join(", ") })
-      : tr("status.scanComplete", { count: state.all.length }));
-  } catch (e) { showActionError(tr("status.scanFailed", { err: e })); }
-  finally {
-    scanBtn.classList.remove("is-working");
-    if (scanProgress) scanProgress.hidden = true;
+      : tr(initial ? "status.firstRunComplete" : "status.scanComplete", { count: state.all.length }));
+    if (initial || recoveringFirstRun) startAutoRefresh();
+    return true;
+  } catch (e) {
+    if (initial) showFirstRunError(e);
+    else showActionError(tr("status.scanFailed", { err: e }));
+    return false;
   }
-});
+  finally {
+    setLocalScanBusy(false);
+  }
+}
+
+scanBtn.addEventListener("click", () => runLocalScan());
 
 document.addEventListener("keydown", e => {
-  // Drawer consumes Esc on its own; otherwise let the global handler run.
-  if (!drawer.hidden) return;
+  // Dialogs and focused controls own their keystrokes. Without this guard,
+  // pressing Enter on a project action also fell through to the global
+  // "open selected project" shortcut, launching an unintended terminal.
+  if (visibleDialog()) return;
+  const target = e.target instanceof Element ? e.target : null;
+  const isTextEntry = Boolean(target?.matches("input, textarea, select, [contenteditable='true']"));
+  const isControl = Boolean(target?.closest("button, a[href]"));
+  if ((isTextEntry && target !== searchInput) || isControl) return;
   const ctrlSearch = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k";
   const slashSearch = e.key === "/" && document.activeElement !== searchInput;
   if (ctrlSearch || slashSearch) {
@@ -4426,6 +5553,7 @@ document.addEventListener("keydown", e => {
 (async function boot() {
   setStatus(tr("status.boot", { tauri: HAS_TAURI, term: HAS_TERM }));
   setupThemeToggle();
+  setupOverviewToggle();
   setupViewToggle();
   localizeStaticHtml();        // localize chrome text + placeholders from <html lang>
   renderProjectOrder();
@@ -4445,11 +5573,28 @@ document.addEventListener("keydown", e => {
   wireDrag();
   renderCommonCommands();
   document.getElementById("settingsBtn").addEventListener("click", openSettings);
-  await reload();
+  let localIndexReady = true;
+  let localCatalogLoaded = false;
+  if (HAS_TAURI) {
+    try {
+      // `false` is the only value that starts a scan. This keeps older test
+      // fixtures and mixed-version installations from mistaking an unknown
+      // command result for a missing index.
+      const indexExists = await invoke("local_index_exists");
+      if (indexExists === false) {
+        localIndexReady = await runLocalScan({ initial: true });
+        localCatalogLoaded = localIndexReady;
+      }
+    } catch (e) {
+      localIndexReady = false;
+      showFirstRunError(e);
+    }
+  }
+  if (localIndexReady && !localCatalogLoaded) await reload();
   if (state.filtered.length) select(state.filtered[0].id);
   loadOpenerPrefs();
   loadGroups();
   pushLangToTray();            // keep the tray menu's language in sync on startup
-  startAutoRefresh();
+  if (localIndexReady) startAutoRefresh();
   startTimeRefresh();
 })();

@@ -1,6 +1,6 @@
 //! Data model types: `Project`, `ToolUsage`, `Session`, `ToolSource`.
 //!
-//! Types mirror `SessionAtlas.Models`; defaults match the C# initializers.
+//! Shared domain types and their serialization defaults.
 //! `Project`/`ToolUsage`/`Session` serialize timestamps as RFC 3339 strings;
 //! `ToolSource` serializes with PascalCase keys to match `config.json`.
 
@@ -14,7 +14,7 @@ use crate::path;
 /// Default open-command template, matching `ToolSource.OpenCommandTemplate`.
 pub const DEFAULT_OPEN_COMMAND_TEMPLATE: &str = "cd \"{projectPath}\" && {cliCommand}";
 
-/// Unique identifier matching C# `Guid.NewGuid().ToString("N")`.
+/// Generates a lowercase 32-character UUID without separators.
 fn generate_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }

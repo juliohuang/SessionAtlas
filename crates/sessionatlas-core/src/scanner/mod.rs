@@ -20,7 +20,7 @@
 //! | opencode | R05B     |
 //! | aider    | R05C     |
 //! | custom   | R05C     |
-//! | pi       | current  |
+//! | pi       | native   |
 
 pub mod aider;
 pub mod base;

@@ -1,6 +1,6 @@
 //! Contract tests for `sessionatlas_core::config`.
 //!
-//! Mirrors `SessionAtlas.Tests/AppConfigTests.cs` and the R03 pass conditions:
+//! Covers the R03 pass conditions:
 //! empty config, invalid JSON, concurrent updates, busy-lock timeout, stale
 //! object conflict, replace failure keeping the old file, and strict cleanup
 //! of stale generated temps. Every test uses `tempfile` — never the real user
@@ -134,7 +134,7 @@ fn config_contract_empty_object_loads_default() {
 }
 
 #[test]
-fn config_contract_utf8_bom_is_accepted_like_csharp_read_all_text() {
+fn config_contract_utf8_bom_is_accepted() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.json");
     fs::write(&path, b"\xef\xbb\xbf{\"DefaultTerminal\":\"kitty\"}").unwrap();

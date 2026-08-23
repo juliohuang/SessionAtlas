@@ -30,5 +30,5 @@ materials so recipients can inspect the complete dependency inventory for a
 specific build.
 
 SessionAtlas does not claim ownership of third-party names, trademarks, or
-logos. Claude, Codex, Kimi, OpenCode, Aider, Tauri, xterm.js, and other names
+logos. Claude, Codex, Kimi, OpenCode, Aider, Pi Coding Agent, Tauri, xterm.js, and other names
 belong to their respective owners.

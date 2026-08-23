@@ -337,7 +337,10 @@ fn recent_open_launches_the_selected_session_through_the_injected_runner() {
     assert_eq!(runner.start_count(), 1);
     let started = runner.started();
     assert_eq!(started[0].working_directory, dir.project_path("api-server"));
-    assert!(started[0].arguments.join(" ").contains("codex-old"));
+    let launched_arguments = started[0].arguments.join(" ");
+    assert!(launched_arguments.contains("codex-old"));
+    assert!(launched_arguments.contains("resume"));
+    assert!(!launched_arguments.contains("--resume"));
 
     let store = SqliteStore::new(dir.db()).unwrap();
     let latest = store.get_recent_sessions(1).unwrap().remove(0);
@@ -473,6 +476,10 @@ fn open_existing_directory_launches_with_project_last_session_id() {
 
     assert_eq!(runner.start_count(), 1);
     assert_eq!(runner.started()[0].working_directory, project_path);
+    let launched_arguments = runner.started()[0].arguments.join(" ");
+    assert!(launched_arguments.contains("codex-last"));
+    assert!(launched_arguments.contains("resume"));
+    assert!(!launched_arguments.contains("--resume"));
 
     let store = SqliteStore::new(dir.db()).unwrap();
     let sessions = store.get_recent_sessions(1).unwrap();

@@ -1,6 +1,6 @@
 //! Contract tests for `sessionatlas_core::launcher`: tool identity resolution
 //! (built-ins, enabled non-overriding custom tools), argv construction with
-//! independent native resume arguments, cross-platform terminal shapes, and the
+//! independent tool-specific resume arguments, cross-platform terminal shapes, and the
 //! injectable launch boundary. Recording runners and fake resolvers are used
 //! throughout so no test starts a real terminal, AI CLI, `where`, or `which`.
 
@@ -147,7 +147,11 @@ fn launcher_contract_build_arguments_appends_resume_as_independent_arguments() {
         commands
             .build_arguments("codex", Some("s:1.2_3+4-5"))
             .unwrap(),
-        vec!["codex", "--resume", "s:1.2_3+4-5"]
+        vec!["codex", "resume", "s:1.2_3+4-5"]
+    );
+    assert_eq!(
+        commands.build_arguments("pi", Some("session-123")).unwrap(),
+        vec!["pi", "--session", "session-123"]
     );
     assert_eq!(
         commands.build_arguments("pi", Some("pi-session")).unwrap(),

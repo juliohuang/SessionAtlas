@@ -1,7 +1,7 @@
 //! Contract tests for `sessionatlas_core::store` (task R07).
 //!
-//! These tests mirror `SessionAtlas.Tests/SqliteSnapshotTests.cs` and
-//! `SqlitePathSemanticsTests.cs`. They use `tempfile` for isolated database
+//! These tests cover snapshot replacement and platform-specific path semantics.
+//! They use `tempfile` for isolated database
 //! directories and `rusqlite` only to seed legacy schemas or attach triggers —
 //! never the real `~/.sessionatlas`.
 

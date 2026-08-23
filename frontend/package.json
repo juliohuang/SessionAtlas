@@ -9,7 +9,7 @@
     "build:static": "node scripts/stage-static.mjs",
     "test:unit": "node --test tests/*.test.js",
     "test:browser": "playwright test",
-    "check": "node --check app.js && node --check core.js && node --check i18n.js && node --check icons.js && node --check scripts/stage-static.mjs && node --check scripts/sync-vendor.mjs && node --check playwright.config.js && node --check tests/static-server.mjs && node --check tests/browser/smoke.spec.js && node --check tests/browser/search-safety.spec.js && node --check tests/browser/xterm-links.spec.js && node --check tests/browser/mutation-failures.spec.js && node --check tests/browser/reload-consistency.spec.js && node --check tests/browser/surface-races.spec.js && node --check tests/browser/remote-terminal-reuse.spec.js"
+    "check": "node --check app.js && node --check core.js && node --check i18n.js && node --check icons.js && node --check scripts/stage-static.mjs && node --check scripts/sync-vendor.mjs && node --check playwright.config.js && node --check tests/static-server.mjs && node --check tests/browser/smoke.spec.js && node --check tests/browser/search-safety.spec.js && node --check tests/browser/xterm-links.spec.js && node --check tests/browser/mutation-failures.spec.js && node --check tests/browser/reload-consistency.spec.js && node --check tests/browser/surface-races.spec.js && node --check tests/browser/remote-terminal-reuse.spec.js && node --check tests/browser/first-run.spec.js && node --check tests/browser/tui-tools.spec.js && node --check tests/browser/session-cleanup-git.spec.js"
   },
   "devDependencies": {
     "@highlightjs/cdn-assets": "11.12.0",

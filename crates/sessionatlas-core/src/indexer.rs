@@ -1,7 +1,7 @@
 //! Project indexer: merge scan results by native path semantics, deduplicate
 //! session IDs per `(project, tool)`, and read git branch/remote metadata.
 //!
-//! Mirrors `Core/Indexer/ProjectIndexer.cs`. The indexer is injectable: it
+//! The indexer is injectable: it
 //! consumes plain [`ScannedProject`] rows grouped by tool (`[IndexedToolScan]`)
 //! and never touches `~/.sessionatlas`. Git metadata is read directly from the
 //! repository's `.git` directory (or the `.git` worktree file form) without
@@ -170,7 +170,7 @@ fn path_identity_key(path: &str) -> String {
     }
 }
 
-/// Unicode case folding closest to C# `OrdinalIgnoreCase`.
+/// Unicode case folding used for case-insensitive identity matching.
 fn fold_case(value: &str) -> String {
     value.chars().flat_map(char::to_uppercase).collect()
 }
@@ -242,7 +242,7 @@ fn resolve_common_git_dir(git_dir: &Path) -> Option<std::path::PathBuf> {
 
 /// Reads the branch from `HEAD`. A symbolic ref (`ref: ...`) becomes the
 /// branch name with the `refs/heads/` prefix stripped; a detached HEAD is
-/// shortened to its first seven characters (matching the C# behavior).
+/// shortened to its first seven characters.
 fn read_head(head_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(head_path).ok()?;
     let trimmed = content.trim();

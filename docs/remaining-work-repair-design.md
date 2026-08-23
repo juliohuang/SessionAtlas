@@ -1,7 +1,7 @@
 # SessionAtlas 剩余已知问题修复设计（历史存档）
 
-> 本文保留 2026-08-03 建立的历史修复设计。此后仓库已从退役的 C# 桌面实现迁移为
-> 纯 Rust 工作区（迁移过程与每任务验收见
+> 本文保留 2026-08-03 建立的历史修复设计。仓库当前是纯 Rust 工作区（迁移过程与
+> 每任务验收见
 > [`rust-migration-plan.md`](./rust-migration-plan.md)），且下述工作包均已通过
 > 各自的自动化回归。本文件不再作为操作手册；当前剩余风险与 R14 门禁统一以
 > [`remaining-issues.md`](./remaining-issues.md) 和

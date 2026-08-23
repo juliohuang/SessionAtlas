@@ -1,7 +1,7 @@
 //! OpenCode scanner: read-only SQLite open, alternate candidate paths, and a
 //! schema or query mismatch that must never masquerade as an empty success.
 //!
-//! Mirrors `Core/Scanner/OpenCodeScanner.cs`. Only the session id, the
+//! Only the session id, the
 //! directory / project worktree and the two unix timestamps are read from the
 //! `session` and `project` tables; session bodies are never read.
 
@@ -29,8 +29,7 @@ impl OpenCodeScanner {
         Self::with_availability(|| command_available("opencode"))
     }
 
-    /// Availability override, mirroring the C# `OpenCodeScanner(Func<bool>?)`
-    /// constructor so tests can pin the outcome deterministically.
+    /// Availability override so tests can pin the outcome deterministically.
     pub fn with_availability(availability: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_available: Box::new(availability),
@@ -105,7 +104,7 @@ impl OpenCodeScanner {
     }
 }
 
-/// Candidate database paths in C# order: `~/.local/share/opencode`,
+/// Candidate database paths in probe order: `~/.local/share/opencode`,
 /// `~/.opencode`, and (only when `SESSIONATLAS_HOME` is blank) the XDG data
 /// home.
 fn candidate_database_paths() -> Vec<PathBuf> {
@@ -130,8 +129,7 @@ fn candidate_database_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Whether an environment variable holds a non-blank value, mirroring the C#
-/// `string.IsNullOrWhiteSpace` guard.
+/// Whether an environment variable holds a non-blank value.
 fn env_var_non_blank(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
 }
@@ -238,16 +236,15 @@ fn try_read_database(
     true
 }
 
-/// Session `time_updated`, then project `time_updated` — the C# fallback
-/// chain. Returns `None` only when neither stored timestamp is usable.
+/// Session `time_updated`, then project `time_updated`. Returns `None` only
+/// when neither stored timestamp is usable.
 fn session_timestamp(row: &OpenCodeRow) -> Option<DateTime<Utc>> {
     row.session_time_updated
         .and_then(try_read_unix_timestamp)
         .or_else(|| row.project_time_updated.and_then(try_read_unix_timestamp))
 }
 
-/// Reads the file modification time as a UTC timestamp, mirroring the C#
-/// `File.GetLastWriteTimeUtc` fallback. Returns `None` only when the metadata
+/// Reads the file modification time as a UTC timestamp. Returns `None` only when the metadata
 /// is unavailable despite a successful read moments earlier.
 fn file_last_write_utc(path: &Path) -> Option<DateTime<Utc>> {
     let metadata = std::fs::metadata(path).ok()?;
@@ -255,8 +252,7 @@ fn file_last_write_utc(path: &Path) -> Option<DateTime<Utc>> {
     Some(modified.into())
 }
 
-/// Whether a command executable is reachable on `PATH`. Mirrors the C#
-/// `ScannerRegistry.CommandExists` without launching anything.
+/// Whether a command executable is reachable on `PATH` without launching it.
 fn command_available(command: &str) -> bool {
     let Some(path_value) = std::env::var_os("PATH") else {
         return false;

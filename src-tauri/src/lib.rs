@@ -1,10 +1,12 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use sessionatlas_core::config as core_config;
 use sessionatlas_core::content_index::content_match_snippet;
 use sessionatlas_core::indexer::{build_index, IndexedToolScan};
-use sessionatlas_core::model::project_path_missing;
+use sessionatlas_core::path as core_path;
 use sessionatlas_core::scanner::aider::AiderScanner;
 use sessionatlas_core::scanner::claude::ClaudeScanner;
 use sessionatlas_core::scanner::codex::CodexScanner;
@@ -28,6 +30,8 @@ use tauri_plugin_notification::NotificationExt;
 mod process;
 mod pty;
 mod security;
+mod session_cleanup;
+mod tui_tools;
 
 use process::{git_read_spec, ProcessOutput, ProcessRunner, SystemProcessRunner};
 use pty::{normalize_pty_size, take_once, validate_pty_input, SessionStore, Utf8StreamDecoder};
@@ -37,6 +41,7 @@ use security::{
     validate_display_label, validate_external_url, validate_session_id, validate_ssh_host,
     validate_ssh_user, validate_tool_key,
 };
+use tui_tools::{TuiCapability, TuiMachineCapabilities, TUI_CATALOG};
 
 const HOME_OVERRIDE_ENV: &str = "SESSIONATLAS_HOME";
 const DATA_DIRECTORY: &str = ".sessionatlas";
@@ -75,6 +80,10 @@ fn data_path_for_home(home: &Path, file_name: &str) -> PathBuf {
 /// Locate the shared SQLite index created by the `sessionatlas` CLI.
 fn db_path() -> PathBuf {
     data_path_for_home(&app_home_directory(), "index.db")
+}
+
+fn local_index_exists_at(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn cli_config_path() -> PathBuf {
@@ -172,8 +181,8 @@ pub struct Project {
     id: String,
     path: String,
     name: String,
-    #[serde(rename = "pathMissing")]
-    path_missing: bool,
+    #[serde(rename = "osFamily")]
+    os_family: String,
     #[serde(rename = "lastAccessedAt")]
     last_accessed_at: String,
     #[serde(rename = "gitBranch")]
@@ -211,11 +220,31 @@ pub struct RemoteServer {
     scan_roots: String,
     #[serde(rename = "createdAt")]
     created_at: String,
+    #[serde(rename = "lastScannedAt")]
+    last_scanned_at: Option<String>,
+    #[serde(rename = "osFamily")]
+    os_family: String,
+}
+
+/// A user-managed directory-tree exclusion. Local rules use server_id 0;
+/// remote rules are scoped to one SSH server so equal POSIX paths on two
+/// machines remain independent.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProjectIgnore {
+    id: i64,
+    source: String,
+    #[serde(rename = "remoteServerId")]
+    remote_server_id: Option<i64>,
+    path: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct RemoteConnectionProbe {
     home: String,
+    #[serde(rename = "osFamily")]
+    os_family: String,
     #[serde(rename = "tmuxAvailable")]
     tmux_available: bool,
     #[serde(rename = "tmuxVersion")]
@@ -411,6 +440,45 @@ fn prefs_db_path() -> PathBuf {
     data_path_for_home(&app_home_directory(), "prefs.db")
 }
 
+fn ensure_remote_server_metadata(connection: &Connection) -> Result<(), String> {
+    let (has_last_scanned_at, has_os_family) = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(remote_servers)")
+            .map_err(|error| error.to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?;
+        let mut has_last_scanned_at = false;
+        let mut has_os_family = false;
+        for column in columns {
+            match column.map_err(|error| error.to_string())?.as_str() {
+                "last_scanned_at" => has_last_scanned_at = true,
+                "os_family" => has_os_family = true,
+                _ => {}
+            }
+        }
+        (has_last_scanned_at, has_os_family)
+    };
+    if !has_last_scanned_at {
+        connection
+            .execute(
+                "ALTER TABLE remote_servers ADD COLUMN last_scanned_at TEXT",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if !has_os_family {
+        connection
+            .execute(
+                "ALTER TABLE remote_servers
+                 ADD COLUMN os_family TEXT NOT NULL DEFAULT 'unknown'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn open_prefs_db() -> Result<Connection, String> {
     let path = prefs_db_path();
     if let Some(parent) = path.parent() {
@@ -456,12 +524,26 @@ fn open_prefs_db() -> Result<Connection, String> {
          -- manual iff >=1 of its members has a row here; projects with no
          -- row sort to the end (Infinity fallback) so newly scanned entries
          -- in a manual group auto-append with no rescan-sync step.
-         CREATE TABLE IF NOT EXISTS project_sort (
+          CREATE TABLE IF NOT EXISTS project_sort (
              project_id  TEXT    PRIMARY KEY,
              group_key   TEXT    NOT NULL,
              sort_order  INTEGER NOT NULL
           );
           CREATE INDEX IF NOT EXISTS idx_project_sort_group ON project_sort(group_key, sort_order);
+
+          -- User-managed directory trees hidden from the desktop project
+          -- ledger. The scanner-owned index remains intact, so removing a
+          -- rule restores matching projects without requiring a rescan.
+          CREATE TABLE IF NOT EXISTS project_ignores (
+              id          INTEGER PRIMARY KEY AUTOINCREMENT,
+              source      TEXT    NOT NULL CHECK (source IN ('local','remote')),
+              server_id   INTEGER NOT NULL DEFAULT 0,
+              path        TEXT    NOT NULL,
+              created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+              UNIQUE(source, server_id, path)
+          );
+          CREATE INDEX IF NOT EXISTS idx_project_ignores_scope
+              ON project_ignores(source, server_id);
 
           CREATE TABLE IF NOT EXISTS prefs_revisions (
               scope     TEXT PRIMARY KEY,
@@ -484,7 +566,9 @@ fn open_prefs_db() -> Result<Connection, String> {
              port            INTEGER NOT NULL DEFAULT 22,
              identity_file   TEXT,
              scan_roots      TEXT    NOT NULL DEFAULT '~ ~/projects ~/code',
-             created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+             created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+             last_scanned_at TEXT,
+             os_family       TEXT    NOT NULL DEFAULT 'unknown'
          );
 
          -- One row per git project discovered on a remote server. We
@@ -517,8 +601,20 @@ fn open_prefs_db() -> Result<Connection, String> {
              last_session_id TEXT,
              PRIMARY KEY (server_id, project_id, tool_key),
              FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
+         );
+
+         -- Per-machine AI TUI switches. server_id 0 is the local machine;
+         -- positive ids refer to remote_servers. Installation state is
+         -- intentionally probed live and never trusted from this table.
+         CREATE TABLE IF NOT EXISTS machine_tui_preferences (
+             server_id  INTEGER NOT NULL DEFAULT 0,
+             tool_key   TEXT    NOT NULL,
+             enabled    INTEGER NOT NULL DEFAULT 1,
+             updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+             PRIMARY KEY (server_id, tool_key)
          );"
     ).map_err(|e| e.to_string())?;
+    ensure_remote_server_metadata(&c)?;
     Ok(c)
 }
 
@@ -593,7 +689,7 @@ fn row_to_project(
         id: id.to_string(),
         path: path.to_string(),
         name,
-        path_missing: project_path_missing(path),
+        os_family: normalize_os_family(std::env::consts::OS).to_string(),
         last_accessed_at: last.to_string(),
         git_branch: branch,
         tool_usages: usages,
@@ -686,27 +782,188 @@ fn projects_from_rows(c: &Connection, rows: Vec<ProjectRow>) -> Result<Vec<Proje
         .collect())
 }
 
-/// AI-CLI home subdirectories whose contents are tool internals (session
-/// stores, configs, caches) rather than real projects. Projects living under
-/// any of these are excluded from the listing so they don't clutter the
-/// ledger. Component-based prefix match via `Path::starts_with` is safe
-/// across path separators and won't false-match `.claudefoo`-style names.
-fn is_excluded_project_path(path: &str) -> bool {
-    let home = app_home_directory();
-    let p = std::path::Path::new(path);
-    [".claude", ".codex", ".kimi", ".opencode", ".aider", ".pi"]
-        .iter()
-        .any(|sub| p.starts_with(home.join(sub)))
+fn has_hidden_directory_component(flavor: core_path::PathFlavor, path: &str) -> bool {
+    let Some(normalized) = core_path::normalize(flavor, path) else {
+        return false;
+    };
+    normalized
+        .split(flavor.separator())
+        .any(|component| component.len() > 1 && component.starts_with('.'))
 }
 
-fn collect_visible_project_rows<I>(rows: I, limit: usize) -> Result<Vec<ProjectRow>, String>
+fn project_ignore_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectIgnore> {
+    let source: String = row.get(1)?;
+    let server_id: i64 = row.get(2)?;
+    Ok(ProjectIgnore {
+        id: row.get(0)?,
+        remote_server_id: (source == "remote").then_some(server_id),
+        source,
+        path: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+fn list_project_ignores_from_connection(
+    connection: &Connection,
+) -> Result<Vec<ProjectIgnore>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, source, server_id, path, created_at
+             FROM project_ignores ORDER BY id DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = collect_query_rows(
+        statement
+            .query_map([], project_ignore_from_row)
+            .map_err(|error| error.to_string())?,
+        "list_project_ignores",
+    )?;
+    Ok(rows)
+}
+
+fn project_ignore_matches(
+    rule: &ProjectIgnore,
+    source: &str,
+    remote_server_id: Option<i64>,
+    path: &str,
+) -> bool {
+    if rule.source != source || rule.remote_server_id != remote_server_id {
+        return false;
+    }
+    let flavor = if source == "remote" {
+        core_path::PathFlavor::Unix
+    } else {
+        core_path::PathFlavor::native()
+    };
+    let Some(candidate) = core_path::normalize(flavor, path) else {
+        return false;
+    };
+    core_path::is_same_or_child(flavor, &candidate, &rule.path)
+}
+
+fn project_path_is_excluded(
+    source: &str,
+    remote_server_id: Option<i64>,
+    path: &str,
+    ignore_rules: &[ProjectIgnore],
+) -> bool {
+    let flavor = if source == "remote" {
+        core_path::PathFlavor::Unix
+    } else {
+        core_path::PathFlavor::native()
+    };
+    has_hidden_directory_component(flavor, path)
+        || ignore_rules
+            .iter()
+            .any(|rule| project_ignore_matches(rule, source, remote_server_id, path))
+}
+
+fn normalize_project_ignore_input(
+    source: &str,
+    remote_server_id: Option<i64>,
+    path: &str,
+) -> Result<(String, i64, String), String> {
+    let source = source.trim().to_ascii_lowercase();
+    let value = path.trim();
+    if value.len() > 4096 || value.chars().any(char::is_control) {
+        return Err("ignored path is invalid or too long".to_string());
+    }
+    let (server_id, flavor) = match source.as_str() {
+        "local" => {
+            if remote_server_id.is_some_and(|id| id != 0) {
+                return Err("local ignore rules cannot target a remote server".to_string());
+            }
+            (0, core_path::PathFlavor::native())
+        }
+        "remote" => {
+            let server_id = remote_server_id
+                .filter(|id| *id > 0)
+                .ok_or_else(|| "remote ignore rules require a server".to_string())?;
+            (server_id, core_path::PathFlavor::Unix)
+        }
+        _ => return Err("ignore source must be local or remote".to_string()),
+    };
+    let normalized = core_path::normalize(flavor, value)
+        .ok_or_else(|| "ignored path must be an absolute directory path".to_string())?;
+    if normalized == "/" || (cfg!(windows) && source == "local" && normalized.ends_with(":\\")) {
+        return Err("the filesystem root cannot be added to the ignore list".to_string());
+    }
+    Ok((source, server_id, normalized))
+}
+
+#[tauri::command]
+fn list_project_ignores() -> Result<Vec<ProjectIgnore>, String> {
+    with_prefs(list_project_ignores_from_connection)
+}
+
+#[tauri::command]
+fn add_project_ignore(
+    source: String,
+    remote_server_id: Option<i64>,
+    path: String,
+) -> Result<ProjectIgnore, String> {
+    let (source, server_id, path) =
+        normalize_project_ignore_input(&source, remote_server_id, &path)?;
+    with_prefs(|connection| {
+        if source == "remote" {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM remote_servers WHERE id = ?1)",
+                    params![server_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if !exists {
+                return Err(format!("remote server {server_id} not found"));
+            }
+        }
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO project_ignores (source, server_id, path)
+                 VALUES (?1, ?2, ?3)",
+                params![source, server_id, path],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT id, source, server_id, path, created_at
+                 FROM project_ignores
+                 WHERE source = ?1 AND server_id = ?2 AND path = ?3",
+                params![source, server_id, path],
+                project_ignore_from_row,
+            )
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+fn delete_project_ignore(ignore_id: i64) -> Result<(), String> {
+    with_prefs(|connection| {
+        let changed = connection
+            .execute(
+                "DELETE FROM project_ignores WHERE id = ?1",
+                params![ignore_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err(format!("ignore rule {ignore_id} not found"));
+        }
+        Ok(())
+    })
+}
+
+fn collect_visible_project_rows<I>(
+    rows: I,
+    limit: usize,
+    ignore_rules: &[ProjectIgnore],
+) -> Result<Vec<ProjectRow>, String>
 where
     I: IntoIterator<Item = rusqlite::Result<ProjectRow>>,
 {
     let mut visible = Vec::with_capacity(limit);
     for row in rows {
         let row = row.map_err(|error| format!("list_projects: {error}"))?;
-        if is_excluded_project_path(&row.1) {
+        if project_path_is_excluded("local", None, &row.1, ignore_rules) {
             continue;
         }
         visible.push(row);
@@ -720,6 +977,7 @@ where
 #[tauri::command]
 fn list_projects(limit: Option<i64>) -> Result<Vec<Project>, String> {
     let limit = validate_project_limit(limit)?;
+    let ignore_rules = with_prefs(list_project_ignores_from_connection)?;
     with_index(|c| {
         // No SQL LIMIT: we filter excluded paths in Rust first, then cap,
         // so excluded projects don't shrink the visible window.
@@ -730,6 +988,7 @@ fn list_projects(limit: Option<i64>) -> Result<Vec<Project>, String> {
             stmt.query_map([], row_to_project_fields)
                 .map_err(|e| e.to_string())?,
             limit,
+            &ignore_rules,
         )?;
         projects_from_rows(c, rows)
     })
@@ -745,12 +1004,14 @@ fn validate_project_limit(limit: Option<i64>) -> Result<usize, String> {
 
 #[tauri::command]
 fn search_projects(query: String) -> Result<Vec<Project>, String> {
-    with_index(|connection| search_projects_in_connection(connection, &query))
+    let ignore_rules = with_prefs(list_project_ignores_from_connection)?;
+    with_index(|connection| search_projects_in_connection(connection, &query, &ignore_rules))
 }
 
 fn search_projects_in_connection(
     connection: &Connection,
     query: &str,
+    ignore_rules: &[ProjectIgnore],
 ) -> Result<Vec<Project>, String> {
     let Some(pattern) = build_fts_prefix_query(query) else {
         return Ok(Vec::new());
@@ -832,7 +1093,7 @@ fn search_projects_in_connection(
     let rows: Vec<ProjectRow> = ordered_ids
         .iter()
         .filter_map(|id| row_map.remove(id))
-        .filter(|row| !is_excluded_project_path(&row.1))
+        .filter(|row| !project_path_is_excluded("local", None, &row.1, ignore_rules))
         .take(200)
         .collect();
     let mut projects = projects_from_rows(connection, rows)?;
@@ -958,12 +1219,21 @@ fn list_tools() -> Result<Vec<Tool>, String> {
     })
 }
 
+/// Reports whether a readable index file can be attempted without opening it.
+/// The frontend uses this once during boot to distinguish a true first run
+/// from an existing (including intentionally empty) index. Existing indexes
+/// are never rescanned automatically.
+#[tauri::command]
+fn local_index_exists() -> bool {
+    local_index_exists_at(&db_path())
+}
+
 /// Builds the canonical scanner set for the config file at `config_path`: the
-/// six built-in scanners (Claude, Kimi, Codex, OpenCode, Aider, Pi), then each
-/// enabled custom tool whose key does not collide
+/// six built-in scanners in canonical registration order (Claude, Kimi, Codex,
+/// OpenCode, Aider, Pi), then each enabled custom tool whose key does not collide
 /// with a built-in (case-insensitive). When the config cannot be read or
 /// parsed, built-ins remain available and a `config_read_failed` warning is
-/// returned, mirroring `ScannerRegistry` and `commands::scan::build_default_scanners`.
+/// returned, matching `commands::scan::build_default_scanners`.
 fn build_scan_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec<ScanDiagnostic>) {
     let mut scanners: Vec<Box<dyn Scanner>> = vec![
         Box::new(ClaudeScanner::new()),
@@ -1117,8 +1387,9 @@ async fn scan_projects() -> Result<i64, String> {
 }
 
 /// Launch an AI CLI in the project directory via an external terminal.
-/// When `session_id` is given, appends the selected tool's native resume
-/// arguments so the CLI reopens the recorded session.
+/// When `session_id` is given, appends the tool-specific resume arguments so
+/// the CLI reopens the recorded session (`codex resume <id>` for Codex and
+/// `pi --session <id>` for Pi Coding Agent).
 #[tauri::command]
 fn launch_project(
     path: String,
@@ -1128,6 +1399,7 @@ fn launch_project(
     if !std::path::Path::new(&path).is_dir() {
         return Err(format!("directory not found: {path}"));
     }
+    ensure_tui_preference_allows(None, &tool_key)?;
     let tool_args = resolve_configured_tool_launch_argv(&tool_key, session_id.as_deref())?;
     #[cfg(target_os = "windows")]
     {
@@ -1935,6 +2207,11 @@ fn pty_spawn(
         let identity_file = normalize_identity_file(r.identity_file.as_deref())?;
         let (requested_tool, launch_argv) =
             resolve_remote_tool_launch(r.tool_key.as_deref(), r.session_id.as_deref())?;
+        if let Some(tool_key) = requested_tool.as_deref() {
+            if !tool_key.eq_ignore_ascii_case("shell") {
+                ensure_tui_preference_allows(Some(r.server_id), tool_key)?;
+            }
+        }
         let shell_cmd =
             build_remote_tmux_command(&path, requested_tool.as_deref(), launch_argv.as_deref())?;
         let mut ssh = CommandBuilder::new("ssh");
@@ -2004,9 +2281,12 @@ fn pty_attach(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     let initial_input = match tool_key.as_deref() {
-        Some(tool_key) => Some(build_argv_launch_input(
-            &resolve_configured_tool_launch_argv(tool_key, session_id.as_deref())?,
-        )?),
+        Some(tool_key) => {
+            ensure_tui_preference_allows(None, tool_key)?;
+            Some(build_argv_launch_input(
+                &resolve_configured_tool_launch_argv(tool_key, session_id.as_deref())?,
+            )?)
+        }
         None if session_id
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()) =>
@@ -2143,6 +2423,7 @@ fn pty_remote_switch(
         .get(id)?
         .ok_or_else(|| "session not found".to_string())?;
     ensure_remote_server_matches(session.remote_server_id, server_id)?;
+    ensure_tui_preference_allows(Some(server_id), &tool_key)?;
 
     let (requested_tool, launch_argv) =
         resolve_remote_tool_launch(Some(&tool_key), session_id.as_deref())?;
@@ -2861,6 +3142,8 @@ struct RemoteServerRow {
     identity_file: Option<String>,
     scan_roots: String,
     created_at: String,
+    last_scanned_at: Option<String>,
+    os_family: String,
 }
 
 fn row_to_remote_server(r: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteServerRow> {
@@ -2873,6 +3156,8 @@ fn row_to_remote_server(r: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteServerR
         identity_file: r.get(5)?,
         scan_roots: r.get(6)?,
         created_at: r.get(7)?,
+        last_scanned_at: r.get(8)?,
+        os_family: r.get(9)?,
     })
 }
 
@@ -2888,6 +3173,8 @@ fn remote_server_to_json(row: RemoteServerRow) -> RemoteServer {
         identity_file: row.identity_file,
         scan_roots: row.scan_roots,
         created_at: row.created_at,
+        last_scanned_at: row.last_scanned_at,
+        os_family: row.os_family,
     }
 }
 
@@ -2896,7 +3183,8 @@ fn list_remote_servers() -> Result<Vec<RemoteServer>, String> {
     with_prefs(|c| {
         let mut stmt = c
             .prepare(
-                "SELECT id, label, user, host, port, identity_file, scan_roots, created_at
+                "SELECT id, label, user, host, port, identity_file, scan_roots, created_at,
+                        last_scanned_at, os_family
                  FROM remote_servers ORDER BY id ASC",
             )
             .map_err(|e| e.to_string())?;
@@ -2949,6 +3237,7 @@ fn add_remote_server(
     port: Option<u16>,
     identity_file: Option<String>,
     scan_roots: Option<String>,
+    os_family: Option<String>,
 ) -> Result<RemoteServer, String> {
     let label = validate_display_label(&label)?;
     let user = validate_ssh_user(&user)?;
@@ -2964,17 +3253,28 @@ fn add_remote_server(
         _ => DEFAULT_REMOTE_SCAN_ROOTS.to_string(),
     };
     shell_quote_roots(&scan_roots)?;
+    let os_family = normalize_os_family(os_family.as_deref().unwrap_or("unknown"));
     with_prefs(|c| {
         c.execute(
-            "INSERT INTO remote_servers (label, user, host, port, identity_file, scan_roots)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![label, user, host, port, identity_file, scan_roots],
+            "INSERT INTO remote_servers
+               (label, user, host, port, identity_file, scan_roots, os_family)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                label,
+                user,
+                host,
+                port,
+                identity_file,
+                scan_roots,
+                os_family
+            ],
         )
         .map_err(|e| e.to_string())?;
         let id = c.last_insert_rowid();
         let mut stmt = c
             .prepare(
-                "SELECT id, label, user, host, port, identity_file, scan_roots, created_at
+                "SELECT id, label, user, host, port, identity_file, scan_roots, created_at,
+                        last_scanned_at, os_family
                  FROM remote_servers WHERE id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -2985,11 +3285,65 @@ fn add_remote_server(
     })
 }
 
+fn rename_remote_server_row(
+    connection: &Connection,
+    server_id: i64,
+    label: &str,
+) -> Result<(), String> {
+    let changed = connection
+        .execute(
+            "UPDATE remote_servers SET label = ?1 WHERE id = ?2",
+            params![label, server_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("remote server {server_id} not found"));
+    }
+    Ok(())
+}
+
+fn update_remote_server_scan_metadata(
+    connection: &Connection,
+    server_id: i64,
+    scanned_at: &str,
+    os_family: &str,
+) -> Result<(), String> {
+    let changed = connection
+        .execute(
+            "UPDATE remote_servers
+             SET last_scanned_at = ?1, os_family = ?2
+             WHERE id = ?3",
+            params![scanned_at, normalize_os_family(os_family), server_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("remote server {server_id} not found"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn rename_remote_server(server_id: i64, label: String) -> Result<(), String> {
+    let label = validate_display_label(&label)?;
+    with_prefs(|connection| rename_remote_server_row(connection, server_id, label))
+}
+
 #[tauri::command]
 fn delete_remote_server(server_id: i64) -> Result<(), String> {
-    with_prefs(|c| {
+    with_prefs_transaction(|c| {
         // ON DELETE CASCADE on remote_projects / remote_tool_usages
-        // handles the children.
+        // handles the children. Ignore rules use an explicit server scope,
+        // so clean those in the same transaction as the server row.
+        c.execute(
+            "DELETE FROM project_ignores WHERE source = 'remote' AND server_id = ?1",
+            params![server_id],
+        )
+        .map_err(|e| e.to_string())?;
+        c.execute(
+            "DELETE FROM machine_tui_preferences WHERE server_id = ?1",
+            params![server_id],
+        )
+        .map_err(|e| e.to_string())?;
         let n = c
             .execute(
                 "DELETE FROM remote_servers WHERE id = ?1",
@@ -3003,27 +3357,319 @@ fn delete_remote_server(server_id: i64) -> Result<(), String> {
     })
 }
 
-fn parse_remote_connection_probe(stdout: &str) -> RemoteConnectionProbe {
-    let mut home = String::new();
-    let mut tmux_available = false;
-    let mut tmux_version = None;
-    for line in stdout.lines() {
-        if let Some(index) = line.find("SESSIONATLAS_SSH_OK:") {
-            let value = &line[index + "SESSIONATLAS_SSH_OK:".len()..];
-            home = value.trim().to_string();
-        } else if let Some(index) = line.find("SESSIONATLAS_TMUX_OK:") {
-            let value = &line[index + "SESSIONATLAS_TMUX_OK:".len()..];
-            tmux_available = true;
-            let value = value.trim();
-            if !value.is_empty() {
-                tmux_version = Some(value.to_string());
+fn tui_preference(server_id: Option<i64>, tool_key: &str) -> Result<Option<bool>, String> {
+    let scope_id = server_id.unwrap_or(0);
+    with_prefs(|connection| {
+        connection
+            .query_row(
+                "SELECT enabled FROM machine_tui_preferences
+                 WHERE server_id = ?1 AND tool_key = ?2",
+                params![scope_id, tool_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.map(|enabled| enabled != 0))
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn write_tui_preference(
+    server_id: Option<i64>,
+    tool_key: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let scope_id = server_id.unwrap_or(0);
+    with_prefs(|connection| {
+        connection
+            .execute(
+                "INSERT INTO machine_tui_preferences (server_id, tool_key, enabled, updated_at)
+                 VALUES (?1, ?2, ?3, datetime('now'))
+                 ON CONFLICT(server_id, tool_key) DO UPDATE SET
+                   enabled = excluded.enabled,
+                   updated_at = excluded.updated_at",
+                params![scope_id, tool_key, i64::from(enabled)],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn load_remote_server(server_id: i64) -> Result<RemoteServerRow, String> {
+    if server_id <= 0 {
+        return Err("remote server id must be positive".to_string());
+    }
+    with_prefs(|connection| {
+        connection
+            .query_row(
+                "SELECT id, label, user, host, port, identity_file, scan_roots, created_at,
+                        last_scanned_at, os_family
+                 FROM remote_servers WHERE id = ?1",
+                params![server_id],
+                row_to_remote_server,
+            )
+            .map_err(|error| format!("remote server {server_id} not found: {error}"))
+    })
+}
+
+fn safe_process_detail(output: &ProcessOutput) -> String {
+    let bytes = if output.stderr.is_empty() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let detail: String = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("process exited with an error")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(300)
+        .collect();
+    detail.trim().to_string()
+}
+
+fn make_tui_capability(
+    server_id: Option<i64>,
+    definition: &tui_tools::TuiDefinition,
+    detected: tui_tools::DetectedTui,
+    install_available: bool,
+) -> Result<TuiCapability, String> {
+    let enabled = detected.installed && tui_preference(server_id, definition.key)?.unwrap_or(true);
+    Ok(TuiCapability {
+        tool_key: definition.key.to_string(),
+        tool_name: definition.name.to_string(),
+        installed: detected.installed,
+        version: detected.version,
+        enabled,
+        install_available,
+        install_manager: definition.manager.to_string(),
+    })
+}
+
+fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, String> {
+    match server_id {
+        None => {
+            let runner = SystemProcessRunner;
+            let tools = TUI_CATALOG
+                .iter()
+                .map(|definition| {
+                    let detected = tui_tools::detect_local(definition, &runner);
+                    make_tui_capability(
+                        None,
+                        definition,
+                        detected,
+                        tui_tools::local_manager_path(definition).is_some(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(TuiMachineCapabilities {
+                source: "local".to_string(),
+                server_id: None,
+                label: "Local".to_string(),
+                tools,
+            })
+        }
+        Some(server_id) => {
+            let server = load_remote_server(server_id)?;
+            let command = build_ssh_command(
+                &server.user,
+                &server.host,
+                u16::try_from(server.port).map_err(|_| "invalid SSH port".to_string())?,
+                server.identity_file.as_deref(),
+                tui_tools::remote_probe_script(),
+            )?;
+            let output = SystemProcessRunner
+                .output(&command)
+                .map_err(|error| format!("could not start SSH capability probe: {error}"))?;
+            if !output.success {
+                return Err(classify_ssh_failure(
+                    &server.user,
+                    &server.host,
+                    u16::try_from(server.port).unwrap_or(22),
+                    &String::from_utf8_lossy(&output.stderr),
+                ));
             }
+            let (detected, managers) =
+                tui_tools::parse_remote_probe(&String::from_utf8_lossy(&output.stdout));
+            let tools = TUI_CATALOG
+                .iter()
+                .map(|definition| {
+                    make_tui_capability(
+                        Some(server_id),
+                        definition,
+                        detected
+                            .get(definition.key)
+                            .cloned()
+                            .unwrap_or(tui_tools::DetectedTui {
+                                installed: false,
+                                version: None,
+                            }),
+                        managers.get(definition.manager).copied().unwrap_or(false),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(TuiMachineCapabilities {
+                source: "remote".to_string(),
+                server_id: Some(server_id),
+                label: server.label,
+                tools,
+            })
         }
     }
+}
+
+#[tauri::command]
+async fn probe_tui_capabilities(server_id: Option<i64>) -> Result<TuiMachineCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || probe_tui_machine(server_id))
+        .await
+        .map_err(|error| format!("TUI capability worker panicked: {error}"))?
+}
+
+#[tauri::command]
+async fn set_tui_enabled(
+    server_id: Option<i64>,
+    tool_key: String,
+    enabled: bool,
+) -> Result<TuiMachineCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let definition = tui_tools::definition(&tool_key)?;
+        let capabilities = probe_tui_machine(server_id)?;
+        let installed = capabilities
+            .tools
+            .iter()
+            .find(|tool| tool.tool_key == definition.key)
+            .is_some_and(|tool| tool.installed);
+        if enabled && !installed {
+            return Err(format!(
+                "{} is not installed on this machine and cannot be enabled",
+                definition.name
+            ));
+        }
+        write_tui_preference(server_id, definition.key, enabled)?;
+        probe_tui_machine(server_id)
+    })
+    .await
+    .map_err(|error| format!("TUI preference worker panicked: {error}"))?
+}
+
+#[tauri::command]
+async fn install_tui(
+    server_id: Option<i64>,
+    tool_key: String,
+) -> Result<TuiMachineCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let definition = tui_tools::definition(&tool_key)?;
+        match server_id {
+            None => tui_tools::run_local_install(definition, &SystemProcessRunner)?,
+            Some(server_id) => {
+                let server = load_remote_server(server_id)?;
+                let remote_command = tui_tools::remote_install_script(definition)?;
+                let command = build_ssh_command(
+                    &server.user,
+                    &server.host,
+                    u16::try_from(server.port).map_err(|_| "invalid SSH port".to_string())?,
+                    server.identity_file.as_deref(),
+                    &remote_command,
+                )?;
+                let output = SystemProcessRunner.output(&command)?;
+                if !output.success {
+                    return Err(format!(
+                        "could not install {} on {}: {}",
+                        definition.name,
+                        server.label,
+                        safe_process_detail(&output)
+                    ));
+                }
+            }
+        }
+        let capabilities = probe_tui_machine(server_id)?;
+        let installed = capabilities
+            .tools
+            .iter()
+            .find(|tool| tool.tool_key == definition.key)
+            .is_some_and(|tool| tool.installed);
+        if !installed {
+            return Err(format!(
+                "{} installer finished, but the command is still not available on PATH",
+                definition.name
+            ));
+        }
+        write_tui_preference(server_id, definition.key, true)?;
+        probe_tui_machine(server_id)
+    })
+    .await
+    .map_err(|error| format!("TUI install worker panicked: {error}"))?
+}
+
+fn ensure_tui_preference_allows(server_id: Option<i64>, tool_key: &str) -> Result<(), String> {
+    let Some(definition) = TUI_CATALOG
+        .iter()
+        .find(|definition| definition.key.eq_ignore_ascii_case(tool_key))
+    else {
+        return Ok(());
+    };
+    if tui_preference(server_id, definition.key)? == Some(false) {
+        return Err(format!("{} is disabled for this machine", definition.name));
+    }
+    if server_id.is_none() && !tui_tools::detect_local(definition, &SystemProcessRunner).installed {
+        return Err(format!(
+            "{} is not installed on this machine",
+            definition.name
+        ));
+    }
+    Ok(())
+}
+
+fn parse_remote_connection_probe(stdout: &str) -> RemoteConnectionProbe {
+    let home = remote_probe_marker_value(stdout, "SESSIONATLAS_SSH_OK:").unwrap_or_default();
+    let os_family = normalize_os_family(
+        &remote_probe_marker_value(stdout, "SESSIONATLAS_OS:").unwrap_or_default(),
+    )
+    .to_string();
+    let tmux_version = remote_probe_marker_value(stdout, "SESSIONATLAS_TMUX_OK:")
+        .filter(|value| !value.is_empty());
+    let tmux_available = tmux_version.is_some();
     RemoteConnectionProbe {
         home,
+        os_family,
         tmux_available,
         tmux_version,
+    }
+}
+
+fn remote_probe_marker_value(stdout: &str, marker: &str) -> Option<String> {
+    let start = stdout.find(marker)? + marker.len();
+    let tail = &stdout[start..];
+    let end = [tail.find('\r'), tail.find('\n'), tail.find("SESSIONATLAS_")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(tail.len());
+    Some(tail[..end].trim().to_string())
+}
+
+fn normalize_os_family(value: &str) -> &'static str {
+    let value = value.trim().to_ascii_lowercase();
+    if value.contains("windows")
+        || value.starts_with("mingw")
+        || value.starts_with("msys")
+        || value.starts_with("cygwin")
+    {
+        "windows"
+    } else if value.contains("darwin") || value.contains("macos") || value.contains("mac os") {
+        "macos"
+    } else if value.contains("linux") {
+        "linux"
+    } else if value.contains("bsd")
+        || value.contains("sunos")
+        || value.contains("solaris")
+        || value.contains("aix")
+        || value.contains("unix")
+    {
+        "unix"
+    } else {
+        "unknown"
     }
 }
 
@@ -3035,8 +3681,7 @@ fn parse_remote_connection_probe(stdout: &str) -> RemoteConnectionProbe {
 /// be reached / lacks passwordless auth never lands in the prefs DB as a
 /// zombie record. A missing tmux does not block project indexing; the returned
 /// capability lets the frontend warn before the first terminal is opened.
-#[tauri::command]
-fn test_remote_connection(
+fn run_remote_connection_probe(
     user: String,
     host: String,
     port: Option<u16>,
@@ -3053,6 +3698,11 @@ fn test_remote_connection(
     // Keep the command successful when tmux is absent: SSH and indexing still
     // work, while the structured result tells the UI to show an install hint.
     let probe = "printf 'SESSIONATLAS_SSH_OK:%s\\n' \"$HOME\"; \
+                 printf 'SESSIONATLAS_OS:'; \
+                 if [ -r /proc/sys/kernel/ostype ]; then tr -d '\\r\\n' < /proc/sys/kernel/ostype; \
+                 elif command -v uname >/dev/null 2>&1; then uname -s 2>/dev/null; \
+                 elif [ -d /System/Library/CoreServices ]; then printf 'Darwin'; \
+                 else printf 'unknown'; fi; printf '\\n'; \
                  if command -v tmux >/dev/null 2>&1; then \
                  printf 'SESSIONATLAS_TMUX_OK:'; tmux -V 2>/dev/null; \
                  else printf 'SESSIONATLAS_TMUX_MISSING\\n'; fi";
@@ -3082,20 +3732,28 @@ fn test_remote_connection(
     Ok(parse_remote_connection_probe(&stdout))
 }
 
-/// Mirror of the local `is_excluded_project_path` (which lives below).
-/// Same home dirs, applied to the remote side so we don't surface
-/// `~/.claude` / `~/.codex` etc. as project entries on the remote.
-fn is_remote_path_excluded(path: &str, remote_home: &str) -> bool {
-    let normalized = path.trim_end_matches('/');
-    for suffix in [".claude", ".codex", ".kimi", ".opencode", ".aider", ".pi"] {
-        // match "<home>/.claude" or "<home>/.claude/..." (any depth).
-        let exact = format!("{remote_home}/{suffix}");
-        let nested = format!("{exact}/");
-        if normalized == exact || normalized.starts_with(&nested) {
-            return true;
-        }
-    }
-    false
+/// SSH probing performs a real process wait, so keep it off Tauri's async
+/// executor. The frontend still awaits the result before persisting a server,
+/// but the window and unrelated commands remain responsive during the probe.
+#[tauri::command]
+async fn test_remote_connection(
+    user: String,
+    host: String,
+    port: Option<u16>,
+    identity_file: Option<String>,
+) -> Result<RemoteConnectionProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_remote_connection_probe(user, host, port, identity_file)
+    })
+    .await
+    .map_err(|error| format!("remote connection worker panicked: {error}"))?
+}
+
+/// Remote scan output is POSIX even when the desktop runs on Windows. Any
+/// dot-prefixed directory component hides that directory tree, regardless of
+/// where it appears below the configured scan roots.
+fn is_remote_path_excluded(path: &str, _remote_home: &str) -> bool {
+    has_hidden_directory_component(core_path::PathFlavor::Unix, path)
 }
 
 /// Build the ssh command for either a remote project scan or a remote
@@ -3476,13 +4134,13 @@ fn migrate_legacy_remote_tool_usages(
 /// on the remote; instead we shell out to `ssh` and run a small POSIX
 /// pipeline that walks the configured scan roots and emits the canonical
 /// working-tree root, current branch, and latest commit timestamp.
-#[tauri::command]
-fn scan_remote_server(server_id: i64) -> Result<i64, String> {
+fn run_remote_server_scan(server_id: i64) -> Result<i64, String> {
     // Fetch server config.
     let server = with_prefs(|c| {
         let mut stmt = c
             .prepare(
-                "SELECT id, label, user, host, port, identity_file, scan_roots, created_at
+                "SELECT id, label, user, host, port, identity_file, scan_roots, created_at,
+                        last_scanned_at, os_family
                  FROM remote_servers WHERE id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -3500,14 +4158,20 @@ fn scan_remote_server(server_id: i64) -> Result<i64, String> {
     //      exclusion list against the user's actual home directory.
     //   2. run the find pipeline and emit NUL-delimited
     //      `<path><branch><latest-commit-epoch>` records.
-    let home_cmd = "printf '%s' \"$HOME\"".to_string();
-    let home = {
+    let identity_cmd = "printf 'SESSIONATLAS_SSH_OK:%s\\n' \"$HOME\"; \
+                        printf 'SESSIONATLAS_OS:'; \
+                        if [ -r /proc/sys/kernel/ostype ]; then tr -d '\\r\\n' < /proc/sys/kernel/ostype; \
+                        elif command -v uname >/dev/null 2>&1; then uname -s 2>/dev/null; \
+                        elif [ -d /System/Library/CoreServices ]; then printf 'Darwin'; \
+                        else printf 'unknown'; fi; printf '\\n'"
+        .to_string();
+    let identity = {
         let cmd = build_ssh_command(
             &server.user,
             &server.host,
             port,
             idfile.as_deref(),
-            &home_cmd,
+            &identity_cmd,
         )?;
         let out = SystemProcessRunner.output(&cmd).map_err(|e| {
             format!(
@@ -3526,8 +4190,9 @@ fn scan_remote_server(server_id: i64) -> Result<i64, String> {
                 &stderr,
             ));
         }
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        parse_remote_connection_probe(&String::from_utf8_lossy(&out.stdout))
     };
+    let home = identity.home;
     if home.is_empty() {
         return Err("could not resolve remote $HOME".to_string());
     }
@@ -3567,6 +4232,11 @@ fn scan_remote_server(server_id: i64) -> Result<i64, String> {
     // scan is a snapshot, deletions happen because the dir is gone).
     with_prefs(|c| {
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        // Manual ignore rules hide rows at presentation time rather than
+        // deleting scanner-owned data. Keep inserting every discovered row so
+        // removing a rule restores it immediately, but report only the rows a
+        // user can actually see after this scan.
+        let ignore_rules = list_project_ignores_from_connection(&tx)?;
         let previous_access: HashMap<String, String> = {
             let mut stmt = tx
                 .prepare(
@@ -3645,19 +4315,31 @@ fn scan_remote_server(server_id: i64) -> Result<i64, String> {
                 ],
             )
             .map_err(|e| e.to_string())?;
-            total += 1;
+            if !project_path_is_excluded("remote", Some(server_id), path, &ignore_rules) {
+                total += 1;
+            }
         }
+        update_remote_server_scan_metadata(&tx, server_id, &now, &identity.os_family)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(total)
     })
+}
+
+/// Remote discovery can wait on two SSH processes and perform SQLite work.
+/// Run the synchronous pipeline on a blocking worker so it never stalls the
+/// Tauri event loop. The frontend may choose whether to await this command.
+#[tauri::command]
+async fn scan_remote_server(server_id: i64) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || run_remote_server_scan(server_id))
+        .await
+        .map_err(|error| format!("remote scan worker panicked: {error}"))?
 }
 
 /// Scan every registered remote server and return per-server outcomes. A
 /// failed server keeps its previous snapshot while successful servers commit
 /// independently; callers must inspect `partial` instead of treating a count
 /// as proof that every server succeeded.
-#[tauri::command]
-fn scan_all_remote_servers() -> Result<RemoteScanBatchResult, String> {
+fn run_all_remote_server_scans() -> Result<RemoteScanBatchResult, String> {
     let ids = with_prefs(|c| -> Result<Vec<i64>, String> {
         let mut stmt = c
             .prepare("SELECT id FROM remote_servers ORDER BY id ASC")
@@ -3671,9 +4353,16 @@ fn scan_all_remote_servers() -> Result<RemoteScanBatchResult, String> {
     })?;
     let outcomes = ids
         .into_iter()
-        .map(|id| (id, scan_remote_server(id)))
+        .map(|id| (id, run_remote_server_scan(id)))
         .collect();
     Ok(summarize_remote_scan_outcomes(outcomes))
+}
+
+#[tauri::command]
+async fn scan_all_remote_servers() -> Result<RemoteScanBatchResult, String> {
+    tauri::async_runtime::spawn_blocking(run_all_remote_server_scans)
+        .await
+        .map_err(|error| format!("remote scan worker panicked: {error}"))?
 }
 
 /// Cheap ISO-8601 `now()` for `last_accessed_at` stamps. Avoids pulling in
@@ -3825,6 +4514,7 @@ fn fetch_remote_usages_by_project(
 #[tauri::command]
 fn list_remote_projects() -> Result<Vec<RemoteProject>, String> {
     with_prefs(|c| {
+        let ignore_rules = list_project_ignores_from_connection(c)?;
         let mut stmt = c
             .prepare(
                 "SELECT project_id, server_id, path, name, last_accessed_at, git_branch
@@ -3847,6 +4537,7 @@ fn list_remote_projects() -> Result<Vec<RemoteProject>, String> {
                 .map_err(|e| e.to_string())?,
                 "list_remote_projects",
             )?;
+        rows.retain(|row| !project_path_is_excluded("remote", Some(row.1), &row.2, &ignore_rules));
 
         // Bulk-fetch usages (avoids N+1).
         let ids: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
@@ -3882,29 +4573,32 @@ fn search_remote_projects(query: String) -> Result<Vec<RemoteProject>, String> {
     }
     let needle = format!("%{}%", trimmed);
     with_prefs(|c| {
+        let ignore_rules = list_project_ignores_from_connection(c)?;
         let mut stmt = c
             .prepare(
                 "SELECT project_id, server_id, path, name, last_accessed_at, git_branch
                  FROM remote_projects
                  WHERE name LIKE ?1 OR path LIKE ?1
-                 ORDER BY last_accessed_at DESC
-                 LIMIT 200",
+                 ORDER BY last_accessed_at DESC",
             )
             .map_err(|e| e.to_string())?;
-        let rows: Vec<(String, i64, String, String, String, Option<String>)> = collect_query_rows(
-            stmt.query_map(params![needle], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?,
-            "search_remote_projects",
-        )?;
+        let mut rows: Vec<(String, i64, String, String, String, Option<String>)> =
+            collect_query_rows(
+                stmt.query_map(params![needle], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?,
+                "search_remote_projects",
+            )?;
+        rows.retain(|row| !project_path_is_excluded("remote", Some(row.1), &row.2, &ignore_rules));
+        rows.truncate(200);
         let ids: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
         let usages = fetch_remote_usages_by_project(c, &ids)?;
         let mut out = Vec::with_capacity(rows.len());
@@ -4218,6 +4912,16 @@ pub struct GitInfo {
     head_summary: Option<String>,
     #[serde(rename = "dirty")]
     dirty: bool,
+    #[serde(rename = "upstream")]
+    upstream: Option<String>,
+    #[serde(rename = "ahead")]
+    ahead: u32,
+    #[serde(rename = "behind")]
+    behind: u32,
+    #[serde(rename = "remoteChecked")]
+    remote_checked: bool,
+    #[serde(rename = "fetchError")]
+    fetch_error: Option<String>,
     #[serde(rename = "error")]
     error: Option<String>,
 }
@@ -4245,6 +4949,14 @@ fn run_git_with(runner: &dyn ProcessRunner, path: &str, args: &[&str]) -> Option
 
 #[tauri::command]
 fn get_git_info(path: String) -> Result<GitInfo, String> {
+    get_git_info_inner(path, false, None)
+}
+
+fn get_git_info_inner(
+    path: String,
+    remote_checked: bool,
+    fetch_error: Option<String>,
+) -> Result<GitInfo, String> {
     if !std::path::Path::new(&path).is_dir() {
         return Err(format!("directory not found: {path}"));
     }
@@ -4260,6 +4972,11 @@ fn get_git_info(path: String) -> Result<GitInfo, String> {
             head_short: None,
             head_summary: None,
             dirty: false,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            remote_checked,
+            fetch_error,
             error: Some("not a git repository".into()),
         });
     }
@@ -4269,6 +4986,17 @@ fn get_git_info(path: String) -> Result<GitInfo, String> {
     let dirty = run_git(&path, &["status", "--porcelain"])
         .map(|s| !s.is_empty())
         .unwrap_or(false);
+    let upstream = run_git(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
+    let (ahead, behind) = upstream
+        .as_ref()
+        .and_then(|_| {
+            run_git(
+                &path,
+                &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            )
+        })
+        .and_then(|value| parse_ahead_behind(&value))
+        .unwrap_or((0, 0));
     // Local branches via for-each-ref. Format: `* main` (current) or
     // `  feature` (non-current) — leading char is the HEAD marker.
     let mut local_branches: Vec<BranchInfo> = Vec::new();
@@ -4326,8 +5054,226 @@ fn get_git_info(path: String) -> Result<GitInfo, String> {
         head_short,
         head_summary,
         dirty,
+        upstream,
+        ahead,
+        behind,
+        remote_checked,
+        fetch_error,
         error: None,
     })
+}
+
+fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
+    let mut counts = value.split_whitespace();
+    Some((counts.next()?.parse().ok()?, counts.next()?.parse().ok()?))
+}
+
+#[cfg(test)]
+mod git_sync_tests {
+    use super::{parse_ahead_behind, parse_remote_git_info};
+
+    #[test]
+    fn parses_ahead_and_behind_counts_in_git_order() {
+        assert_eq!(parse_ahead_behind("2\t3"), Some((2, 3)));
+        assert_eq!(parse_ahead_behind("invalid"), None);
+    }
+
+    #[test]
+    fn parses_remote_git_snapshot_without_trusting_shell_text() {
+        let info = parse_remote_git_info(
+            "REPO\t1\nBRANCH_CURRENT\tmain\nUPSTREAM\torigin/main\nCOUNTS\t2\t3\nDIRTY\t1\nLOCAL_BRANCH\t*\tmain\nREMOTE\torigin\thttps://example.test/repo.git\n",
+        )
+        .unwrap();
+        assert!(info.is_repo);
+        assert_eq!(info.ahead, 2);
+        assert_eq!(info.behind, 3);
+        assert!(info.dirty);
+        assert_eq!(info.remotes.len(), 1);
+        assert!(info.local_branches[0].is_current);
+    }
+}
+
+#[tauri::command]
+async fn refresh_git_info(path: String) -> Result<GitInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !Path::new(&path).is_dir() {
+            return Err(format!("directory not found: {path}"));
+        }
+        let upstream = run_git(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
+        let fetch_error = if upstream.is_some() {
+            let output = Command::new("git")
+                .arg("-c")
+                .arg("credential.interactive=never")
+                .arg("-C")
+                .arg(&path)
+                .args(["fetch", "--quiet", "--no-tags"])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .map_err(|error| format!("failed to run git fetch: {error}"))?;
+            if output.status.success() {
+                None
+            } else {
+                let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Some(if message.is_empty() {
+                    "git fetch failed".to_string()
+                } else {
+                    message.chars().take(300).collect()
+                })
+            }
+        } else {
+            None
+        };
+        get_git_info_inner(path, true, fetch_error)
+    })
+    .await
+    .map_err(|error| format!("git refresh worker failed: {error}"))?
+}
+
+fn run_remote_git_info(server_id: i64, path: &str) -> Result<GitInfo, String> {
+    let server = load_remote_server(server_id)?;
+    let port = u16::try_from(server.port).map_err(|_| "stored SSH port is invalid".to_string())?;
+    let safe_path = quote_remote_path(path)?;
+    let remote_command = format!(
+        "cd -- {safe_path} 2>/dev/null || exit 20; \
+         if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then printf 'REPO\\t0\\n'; exit 0; fi; \
+         printf 'REPO\\t1\\n'; \
+         printf 'BRANCH_CURRENT\\t'; git branch --show-current 2>/dev/null || true; \
+         printf 'HEAD_SHORT\\t'; git rev-parse --short HEAD 2>/dev/null || true; \
+         printf 'HEAD_SUMMARY\\t'; git log -1 --pretty=%s 2>/dev/null || true; \
+         if test -n \"$(git status --porcelain 2>/dev/null)\"; then printf 'DIRTY\\t1\\n'; else printf 'DIRTY\\t0\\n'; fi; \
+         upstream=$(git rev-parse --abbrev-ref '@{{upstream}}' 2>/dev/null || true); \
+         printf 'UPSTREAM\\t%s\\n' \"$upstream\"; \
+         fetch_error=0; \
+         if test -n \"$upstream\"; then GIT_TERMINAL_PROMPT=0 git -c credential.interactive=never fetch --quiet --no-tags >/dev/null 2>&1 || fetch_error=1; fi; \
+         printf 'FETCH_ERROR\\t%s\\n' \"$fetch_error\"; \
+         if test -n \"$upstream\"; then set -- $(git rev-list --left-right --count 'HEAD...@{{upstream}}' 2>/dev/null); printf 'COUNTS\\t%s\\t%s\\n' \"${{1:-0}}\" \"${{2:-0}}\"; fi; \
+         git for-each-ref --format='LOCAL_BRANCH\\t%(HEAD)\\t%(refname:short)' refs/heads/ 2>/dev/null; \
+         git remote -v 2>/dev/null | awk '$3 == \"(fetch)\" {{ printf \"REMOTE\\t%s\\t%s\\n\", $1, $2 }}'"
+    );
+    let spec = build_ssh_command(
+        &server.user,
+        &server.host,
+        port,
+        server.identity_file.as_deref(),
+        &remote_command,
+    )?;
+    let output = SystemProcessRunner
+        .output(&spec)
+        .map_err(|error| format!("could not start ssh: {error}"))?;
+    if !output.success {
+        return Err(classify_ssh_failure(
+            &server.user,
+            &server.host,
+            port,
+            &String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    parse_remote_git_info(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_remote_git_info(output: &str) -> Result<GitInfo, String> {
+    let mut info = GitInfo {
+        is_repo: false,
+        branch: None,
+        remotes: Vec::new(),
+        local_branches: Vec::new(),
+        head_short: None,
+        head_summary: None,
+        dirty: false,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        remote_checked: true,
+        fetch_error: None,
+        error: None,
+    };
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["REPO", "1"] => info.is_repo = true,
+            ["REPO", "0"] => info.error = Some("not a git repository".to_string()),
+            ["BRANCH_CURRENT", value] if !value.is_empty() => {
+                info.branch = Some((*value).to_string())
+            }
+            ["HEAD_SHORT", value] if !value.is_empty() => {
+                info.head_short = Some((*value).to_string())
+            }
+            ["HEAD_SUMMARY", value] if !value.is_empty() => {
+                info.head_summary = Some((*value).to_string())
+            }
+            ["DIRTY", "1"] => info.dirty = true,
+            ["UPSTREAM", value] if !value.is_empty() => info.upstream = Some((*value).to_string()),
+            ["FETCH_ERROR", "1"] => info.fetch_error = Some("git fetch failed".to_string()),
+            ["COUNTS", ahead, behind] => {
+                info.ahead = ahead.parse().unwrap_or(0);
+                info.behind = behind.parse().unwrap_or(0);
+            }
+            ["LOCAL_BRANCH", marker, name] if !name.is_empty() => {
+                info.local_branches.push(BranchInfo {
+                    name: (*name).to_string(),
+                    is_current: *marker == "*",
+                });
+            }
+            ["REMOTE", name, url]
+                if !name.is_empty()
+                    && !url.is_empty()
+                    && !info.remotes.iter().any(|remote| remote.name == *name) =>
+            {
+                info.remotes.push(GitRemote {
+                    name: (*name).to_string(),
+                    url: (*url).to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    if !info.is_repo && info.error.is_none() {
+        return Err("remote Git check returned an incomplete response".to_string());
+    }
+    Ok(info)
+}
+
+#[tauri::command]
+async fn refresh_remote_git_info(server_id: i64, path: String) -> Result<GitInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || run_remote_git_info(server_id, &path))
+        .await
+        .map_err(|error| format!("remote Git worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn analyze_session_cleanup() -> Result<session_cleanup::SessionCleanupAnalysis, String> {
+    let home = app_home_directory();
+    tauri::async_runtime::spawn_blocking(move || session_cleanup::analyze_sessions(&home))
+        .await
+        .map_err(|error| format!("session analysis worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn quarantine_session_candidates(
+    keys: Vec<String>,
+) -> Result<session_cleanup::SessionTrashBatch, String> {
+    let home = app_home_directory();
+    tauri::async_runtime::spawn_blocking(move || session_cleanup::quarantine_sessions(&home, &keys))
+        .await
+        .map_err(|error| format!("session cleanup worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn list_session_trash() -> Result<Vec<session_cleanup::SessionTrashBatch>, String> {
+    let home = app_home_directory();
+    tauri::async_runtime::spawn_blocking(move || session_cleanup::list_session_trash(&home))
+        .await
+        .map_err(|error| format!("recovery list worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn restore_session_trash(batch_id: String) -> Result<usize, String> {
+    let home = app_home_directory();
+    tauri::async_runtime::spawn_blocking(move || {
+        session_cleanup::restore_session_trash(&home, &batch_id)
+    })
+    .await
+    .map_err(|error| format!("session restore worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -4792,7 +5738,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_projects,
             search_projects,
+            list_project_ignores,
+            add_project_ignore,
+            delete_project_ignore,
             list_tools,
+            local_index_exists,
             scan_projects,
             launch_project,
             pty_spawn,
@@ -4823,13 +5773,23 @@ pub fn run() {
             read_text_file,
             list_dir,
             get_git_info,
+            refresh_git_info,
+            refresh_remote_git_info,
+            analyze_session_cleanup,
+            quarantine_session_candidates,
+            list_session_trash,
+            restore_session_trash,
             add_git_remote,
             checkout_branch,
             open_external_url,
             update_tray_projects,
             set_tray_language,
             list_remote_servers,
+            probe_tui_capabilities,
+            set_tui_enabled,
+            install_tui,
             add_remote_server,
+            rename_remote_server,
             delete_remote_server,
             test_remote_connection,
             scan_remote_server,
@@ -4907,6 +5867,32 @@ mod baseline_tests {
             data_path_for_home(&home, "prefs.db"),
             data_directory.join("prefs.db")
         );
+    }
+
+    #[test]
+    fn first_run_detection_requires_an_index_file() {
+        let root = std::env::temp_dir().join(format!(
+            "sessionatlas-first-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("index.db");
+
+        assert!(!local_index_exists_at(&path));
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            !local_index_exists_at(&path),
+            "a directory at the index path must not suppress first-run recovery"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"fixture").unwrap();
+        assert!(local_index_exists_at(&path));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5002,7 +5988,7 @@ mod baseline_tests {
         );
         let rows = vec![Ok(valid), Err(rusqlite::Error::InvalidQuery)];
 
-        let result = collect_visible_project_rows(rows, 1).unwrap();
+        let result = collect_visible_project_rows(rows, 1, &[]).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "visible");
@@ -5526,10 +6512,11 @@ mod baseline_tests {
     fn remote_connection_probe_reports_tmux_capability() {
         assert_eq!(
             parse_remote_connection_probe(
-                "banner:SESSIONATLAS_SSH_OK:/home/demo\nSESSIONATLAS_TMUX_OK:tmux 3.4\n"
+                "banner:SESSIONATLAS_SSH_OK:/home/demoSESSIONATLAS_OS:LinuxSESSIONATLAS_TMUX_OK:tmux 3.4\n"
             ),
             RemoteConnectionProbe {
                 home: "/home/demo".to_string(),
+                os_family: "linux".to_string(),
                 tmux_available: true,
                 tmux_version: Some("tmux 3.4".to_string()),
             }
@@ -5540,10 +6527,102 @@ mod baseline_tests {
             ),
             RemoteConnectionProbe {
                 home: "/home/demo".to_string(),
+                os_family: "unknown".to_string(),
                 tmux_available: false,
                 tmux_version: None,
             }
         );
+    }
+
+    #[test]
+    fn remote_server_display_name_can_be_renamed_without_changing_ssh_identity() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE remote_servers (
+                    id INTEGER PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    user TEXT NOT NULL,
+                    host TEXT NOT NULL
+                 );
+                 INSERT INTO remote_servers (id, label, user, host)
+                 VALUES (7, 'old name', 'demo', 'example.test');",
+            )
+            .unwrap();
+
+        rename_remote_server_row(&connection, 7, "build machine").unwrap();
+        let renamed: (String, String, String) = connection
+            .query_row(
+                "SELECT label, user, host FROM remote_servers WHERE id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            renamed,
+            (
+                "build machine".to_string(),
+                "demo".to_string(),
+                "example.test".to_string()
+            )
+        );
+        assert!(rename_remote_server_row(&connection, 99, "missing").is_err());
+    }
+
+    #[test]
+    fn remote_server_metadata_migrates_and_updates_only_existing_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE remote_servers (
+                    id INTEGER PRIMARY KEY,
+                    label TEXT NOT NULL
+                 );
+                 INSERT INTO remote_servers (id, label) VALUES (7, 'build machine');",
+            )
+            .unwrap();
+
+        ensure_remote_server_metadata(&connection).unwrap();
+        ensure_remote_server_metadata(&connection).unwrap();
+        let initial: (Option<String>, String) = connection
+            .query_row(
+                "SELECT last_scanned_at, os_family FROM remote_servers WHERE id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(initial, (None, "unknown".to_string()));
+
+        update_remote_server_scan_metadata(&connection, 7, "2026-08-16T12:34:56Z", "Darwin")
+            .unwrap();
+        let updated: (String, String) = connection
+            .query_row(
+                "SELECT last_scanned_at, os_family FROM remote_servers WHERE id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            updated,
+            ("2026-08-16T12:34:56Z".to_string(), "macos".to_string())
+        );
+        assert!(update_remote_server_scan_metadata(
+            &connection,
+            99,
+            "2026-08-16T12:34:56Z",
+            "Linux",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn operating_system_names_are_normalized_for_icons() {
+        assert_eq!(normalize_os_family("Windows_NT"), "windows");
+        assert_eq!(normalize_os_family("MINGW64_NT-10.0"), "windows");
+        assert_eq!(normalize_os_family("Darwin"), "macos");
+        assert_eq!(normalize_os_family("Linux"), "linux");
+        assert_eq!(normalize_os_family("FreeBSD"), "unix");
+        assert_eq!(normalize_os_family("Plan 9"), "unknown");
     }
 
     #[test]
@@ -5594,6 +6673,20 @@ mod baseline_tests {
         assert!(command.contains("SessionAtlas requires tmux"));
         assert!(command.contains("/srv/team'\"'\"'s project"));
         assert_eq!(command.matches("claude --resume session-123").count(), 1);
+
+        let (codex_tool, codex_argv) =
+            resolve_remote_tool_launch(Some("codex"), Some("codex-session")).unwrap();
+        let codex_command = build_remote_tmux_command(
+            "/srv/codex-project",
+            codex_tool.as_deref(),
+            codex_argv.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_command.matches("codex resume codex-session").count(),
+            1
+        );
+        assert!(!codex_command.contains("codex --resume"));
 
         let shell_command =
             build_remote_tmux_command("~/projects/demo", Some("shell"), None).unwrap();
@@ -5706,19 +6799,75 @@ mod baseline_tests {
     }
 
     #[test]
-    fn remote_path_filter_excludes_only_tool_internal_directories() {
+    fn hidden_directory_filter_applies_to_every_dot_prefixed_component() {
         assert!(is_remote_path_excluded(
             "/home/demo/.codex/sessions",
             "/home/demo"
         ));
         assert!(is_remote_path_excluded(
-            "/home/demo/.pi/agent/sessions",
-            "/home/demo"
-        ));
-        assert!(!is_remote_path_excluded(
             "/home/demo/projects/.codex-example",
             "/home/demo"
         ));
+        assert!(has_hidden_directory_component(
+            core_path::PathFlavor::Unix,
+            "/srv/team/.cache/nested/project"
+        ));
+        assert!(!has_hidden_directory_component(
+            core_path::PathFlavor::Unix,
+            "/srv/team/project.with.dots"
+        ));
+        assert!(has_hidden_directory_component(
+            core_path::PathFlavor::Windows,
+            r"C:\work\.private\nested\project"
+        ));
+        assert!(!has_hidden_directory_component(
+            core_path::PathFlavor::Windows,
+            r"C:\work\project.with.dots"
+        ));
+    }
+
+    #[test]
+    fn project_ignore_rules_cover_descendants_but_keep_sources_and_servers_separate() {
+        let remote_rule = ProjectIgnore {
+            id: 1,
+            source: "remote".to_string(),
+            remote_server_id: Some(7),
+            path: "/srv/archive".to_string(),
+            created_at: "2026-08-17T00:00:00Z".to_string(),
+        };
+        assert!(project_ignore_matches(
+            &remote_rule,
+            "remote",
+            Some(7),
+            "/srv/archive/nested/project"
+        ));
+        assert!(!project_ignore_matches(
+            &remote_rule,
+            "remote",
+            Some(8),
+            "/srv/archive/nested/project"
+        ));
+        assert!(!project_ignore_matches(
+            &remote_rule,
+            "local",
+            None,
+            "/srv/archive/nested/project"
+        ));
+        assert!(!project_ignore_matches(
+            &remote_rule,
+            "remote",
+            Some(7),
+            "/srv/archive-copy/project"
+        ));
+
+        let (source, server_id, path) =
+            normalize_project_ignore_input("remote", Some(7), "/srv/archive/../archive").unwrap();
+        assert_eq!(
+            (source.as_str(), server_id, path.as_str()),
+            ("remote", 7, "/srv/archive")
+        );
+        assert!(normalize_project_ignore_input("remote", None, "/srv/archive").is_err());
+        assert!(normalize_project_ignore_input("local", None, "/").is_err());
     }
 
     #[test]
@@ -5994,7 +7143,15 @@ mod baseline_tests {
             &CliConfigFile::default(),
         )
         .unwrap();
-        assert_eq!(args, vec!["codex", "--resume", "session-123"]);
+        assert_eq!(args, vec!["codex", "resume", "session-123"]);
+
+        let pi_args = resolve_tool_launch_argv_from_config(
+            "PI",
+            Some("pi-session"),
+            &CliConfigFile::default(),
+        )
+        .unwrap();
+        assert_eq!(pi_args, vec!["pi", "--session", "pi-session"]);
     }
 
     #[test]
@@ -6079,7 +7236,8 @@ mod baseline_tests {
         let connection =
             Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
 
-        let results = search_projects_in_connection(&connection, "distinctive_content").unwrap();
+        let results =
+            search_projects_in_connection(&connection, "distinctive_content", &[]).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "content-fixture");

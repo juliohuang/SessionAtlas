@@ -1,7 +1,7 @@
 //! Custom-tool scanner: `metadata.json` `project_path`/`cwd`/session `id`,
 //! `~` expansion, bad-JSON degradation.
 //!
-//! Mirrors `Core/Scanner/CustomToolScanner.cs`. A configured data directory's
+//! A configured data directory's
 //! direct children are projects or carry a `metadata.json` pointing at the real
 //! project. Availability probes the configured CLI executable and is separate
 //! from historical-data discovery, which reads only path, timestamp and
@@ -19,7 +19,7 @@ use crate::scanner::{
 };
 
 /// Whether `executable` resolves on PATH (`where` on Windows, `which`
-/// elsewhere), matching the C# `ScannerRegistry.CommandExists`.
+/// elsewhere).
 pub(crate) fn executable_on_path(executable: &str) -> bool {
     if executable.trim().is_empty() {
         return false;
@@ -202,7 +202,7 @@ impl CustomToolScanner {
     }
 }
 
-/// Direct child directories of `root`, sorted by path (C# `OrderBy(Ordinal)`).
+/// Direct child directories of `root`, sorted by ordinal path order.
 fn read_direct_child_directories(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut directories = Vec::new();
     for entry in std::fs::read_dir(root)? {
@@ -215,8 +215,7 @@ fn read_direct_child_directories(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(directories)
 }
 
-/// The `project_path` value when present and usable, falling back to `cwd`,
-/// in the C# field order.
+/// The `project_path` value when present and usable, falling back to `cwd`.
 fn first_usable_path(root: &serde_json::Value) -> Option<String> {
     ["project_path", "cwd"]
         .into_iter()

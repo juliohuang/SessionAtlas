@@ -21,8 +21,9 @@ data can cause an external process to start.
   sessions; it never sends a ready-made command or tmux target.
 - Tool keys are bounded identifiers and cannot begin with `-` or contain
   whitespace, control characters, or shell punctuation.
-- Session IDs are bounded identifiers. `--resume` and the value are appended
-  by trusted backend code.
+- Session IDs are bounded identifiers. The tool-specific resume selector and
+  value are appended by trusted backend code (`codex resume <id>` for Codex,
+  `pi --session <id>` for Pi Coding Agent).
 - The shared `crates/sessionatlas-core` `security.rs` and the Tauri
   `src-tauri/src/security.rs` apply the same rules before recording a session
   or launching a CLI.
@@ -33,6 +34,11 @@ data can cause an external process to start.
 
 ## SSH and remote paths
 
+- The SSH settings field accepts a command-like convenience syntax, but the
+  frontend only parses an optional leading `ssh`, one `user@host` destination,
+  and optional `-p` / `-i` values. It rejects extra remote-command text and
+  sends structured fields to Tauri; the supplied text is never executed as a
+  shell command.
 - SSH user and host fields are bounded and reject leading options, whitespace,
   control characters, destinations containing `@`, and shell syntax.
 - Ports must be in `1..=65535`. `--` is placed before the destination so a
@@ -41,6 +47,10 @@ data can cause an external process to start.
   regular file. SessionAtlas checks metadata and canonicalizes the path; it never
   reads or logs key contents.
 - All connections enforce `BatchMode=yes`.
+- Connection probes and remote scans wait for SSH only on blocking workers;
+  saving a server starts its initial project scan in the background. The UI
+  prevents duplicate scans for the same server and disables deletion until the
+  active scan completes.
 - Remote terminal commands first verify `command -v tmux`. Session names are
   backend-generated from a validated tool key plus a deterministic path hash;
   callers cannot supply a tmux target or shell fragment. Existing sessions are
@@ -61,6 +71,30 @@ data can cause an external process to start.
   optional, while any `find` failure for an existing built-in root and every
   failure in a custom root list remains fail-closed and preserves the previous
   remote snapshot.
+
+## Per-machine TUI capabilities and installation
+
+- The desktop probes the six built-in TUI commands separately on the local
+  machine and on each configured SSH server. A tool can be enabled only after
+  the backend has detected its executable; explicit disable preferences are
+  enforced again by local attach, external launch, remote spawn, and remote
+  tmux-switch commands.
+- Capability and installation work runs on blocking workers. Remote probes use
+  one fixed script that emits bounded, prefixed records; no frontend-provided
+  shell text is inserted into it.
+- The frontend sends only a built-in `toolKey` plus an optional server ID to
+  `install_tui`. The backend maps that enum-like key to one fixed npm package
+  package (including Pi's fixed official package) or the fixed Aider uv package.
+  Unknown keys are rejected before any process
+  starts.
+- Local installers are represented as `ProcessSpec` program/argument arrays.
+  Remote installers are selected from fixed backend strings and travel through
+  the same validated SSH command builder. Installer output included in an error
+  is reduced to one bounded, control-character-free line.
+- Installation requires an explicit UI confirmation, never supplies service
+  credentials, and re-probes the machine before auto-enabling the tool. A
+  missing npm or uv prerequisite is reported instead of falling back to an
+  arbitrary shell bootstrapper.
 
 ## URLs and openers
 
@@ -85,7 +119,7 @@ data can cause an external process to start.
   `quick-xml >=0.41.0`, and `portable-pty >=0.9.0`; these remove the actionable
   soundness, XML denial-of-service, and abandoned `serial` dependency findings
   present in the previous lockfile.
-- On 2026-08-15, `cargo audit 0.22.2` scanned all 526 locked Rust crates and
+- On 2026-08-16, `cargo audit 0.22.2` scanned all 542 locked Rust crates and
   reported zero vulnerabilities. It emitted 17 allowed upstream warnings:
   ten GTK3 maintenance notices, five `rust-unic` maintenance notices, one
   `proc-macro-error` maintenance notice, and the Linux-only

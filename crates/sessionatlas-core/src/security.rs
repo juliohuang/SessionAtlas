@@ -2,8 +2,8 @@
 //! validation, executable resolution, shell-meta / control-character
 //! rejection.
 //!
-//! Mirrors `Core/Process/CommandSecurity.cs` and the execution-security
-//! contract in `docs/execution-security-contract.md`. Everything here is pure:
+//! Implements the execution-security contract in
+//! `docs/execution-security-contract.md`. Everything here is pure:
 //! validators and quoting never touch the filesystem, never read the
 //! environment, and never start a process, so they are testable on every host
 //! and reusable by both the CLI and the Tauri console.
@@ -104,7 +104,8 @@ pub fn validate_tool_key(value: &str) -> Result<String, SecurityError> {
 /// Validates a session ID, mirroring `CommandSecurity.ValidateSessionId`:
 /// trimmed, `1..=512` ASCII-safe characters chosen from alphanumerics and
 /// `.` `_` `:` `+` `-`. A leading `-` is rejected so an ID can never be
-/// mistaken for an option when the trusted backend appends `--resume <id>`.
+/// mistaken for an option when the trusted backend appends tool-specific
+/// resume arguments.
 /// Returns the trimmed ID on success.
 pub fn validate_session_id(value: &str) -> Result<String, SecurityError> {
     let trimmed = value.trim();

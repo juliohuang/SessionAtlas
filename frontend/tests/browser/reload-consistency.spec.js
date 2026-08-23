@@ -7,6 +7,7 @@ test("remote failure preserves last-known-good while successful empty clears it"
       source,
       path: `${source}:${id}`,
       name: id,
+      osFamily: source === "remote" ? null : "windows",
       lastAccessedAt: "2026-08-03T00:00:00Z",
       gitBranch: "main",
       remoteServerId: source === "remote" ? 4 : null,
@@ -28,7 +29,7 @@ test("remote failure preserves last-known-good while successful empty clears it"
             return window.__remoteProjects;
           }
           if (command === "list_remote_servers") {
-            return [{ id: 4, label: "Remote", user: "u", host: "h", port: 22 }];
+            return [{ id: 4, label: "Remote", user: "u", host: "h", port: 22, osFamily: "linux" }];
           }
           if (command === "list_tools" || command === "list_groups"
               || command === "list_sort_orders" || command === "list_opener_prefs") return [];
@@ -45,6 +46,19 @@ test("remote failure preserves last-known-good while successful empty clears it"
 
   await page.goto("/index.html");
   await expect(page.locator('article.entry[data-id="remote-one"]')).toBeVisible();
+  await expect(page.locator('article.entry[data-id="local-one"] [data-project-source="local"]'))
+    .toHaveText("LOCAL");
+  await expect(page.locator('article.entry[data-id="remote-one"] [data-project-source="remote"]'))
+    .toHaveText("REMOTE · Remote");
+  await page.locator('article.entry[data-id="remote-one"]').click();
+  await expect(page.locator('article.entry[data-id="local-one"] [data-project-source="local"]'))
+    .toHaveAttribute("data-os-family", "windows");
+  await expect(page.locator('article.entry[data-id="remote-one"] [data-project-source="remote"]'))
+    .toHaveAttribute("data-os-family", "linux");
+  await expect(page.locator('article.entry[data-id="local-one"] .project-source__device svg')).toBeVisible();
+  await expect(page.locator('article.entry[data-id="remote-one"] .project-source__os svg')).toBeVisible();
+  await expect(page.locator('.overview__source[data-project-source="remote"]'))
+    .toHaveText("REMOTE · Remote");
 
   await page.evaluate(() => { window.__remoteFailure = true; });
   await page.locator("#scanBtn").click();

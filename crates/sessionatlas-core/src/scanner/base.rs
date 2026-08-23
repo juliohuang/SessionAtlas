@@ -1,8 +1,7 @@
 //! Scanner framework primitives: `Scanner` trait, `ScanOutcome`, `ScanStatus`,
 //! `ScanDiagnostic`, `ScannedProject`, source probing and base outcome rules.
 //!
-//! Mirrors `Core/Scanner/IProjectScanner.cs` and
-//! `Core/Scanner/ProjectScannerBase.cs`. Availability (`is_available`) is
+//! Availability (`is_available`) is
 //! intentionally separate from data discoverability: historical data stays
 //! scannable even when the CLI executable is gone, and an installed executable
 //! alone never erases the distinction between a successful inspection and an

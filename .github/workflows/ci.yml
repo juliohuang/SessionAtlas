@@ -106,7 +106,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
         working-directory: frontend
-      - name: Stage frontend assets
+      - name: Stage frontend assets for Rust checks
         run: npm run build:static
         working-directory: frontend
       - name: Install Tauri CLI
