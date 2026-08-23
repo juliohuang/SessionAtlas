@@ -16,10 +16,10 @@ use crate::config::AppConfig;
 use crate::process::{ProcessError, ProcessRunner, ProcessSpec, ProgramResolver};
 use crate::security;
 
-/// The five built-in tool keys, in the C# registration order. A custom tool
+/// The six built-in tool keys. A custom tool
 /// whose key collides with one of these (case-insensitive) is never allowed to
 /// override a built-in identity.
-pub const BUILT_IN_TOOL_KEYS: [&str; 5] = ["claude", "kimi", "codex", "opencode", "aider"];
+pub const BUILT_IN_TOOL_KEYS: [&str; 6] = ["claude", "kimi", "codex", "opencode", "aider", "pi"];
 
 /// Linux terminals probed in order, mirroring the C# launcher.
 const LINUX_TERMINALS: [&str; 6] = [
@@ -101,7 +101,7 @@ pub struct ToolCommands {
 }
 
 impl ToolCommands {
-    /// The five built-in tools, each invoking its own binary.
+    /// The six built-in tools, each invoking its own binary.
     pub fn built_in() -> Self {
         let mut commands = HashMap::new();
         for key in BUILT_IN_TOOL_KEYS {
@@ -171,7 +171,11 @@ impl ToolCommands {
         if let Some(id) = session_id.filter(|id| !id.trim().is_empty()) {
             let validated_id = security::validate_session_id(id)
                 .map_err(|_| LauncherError::InvalidSessionId(id.to_string()))?;
-            arguments.push("--resume".to_string());
+            arguments.push(if validated_key.eq_ignore_ascii_case("pi") {
+                "--session".to_string()
+            } else {
+                "--resume".to_string()
+            });
             arguments.push(validated_id);
         }
         Ok(arguments)

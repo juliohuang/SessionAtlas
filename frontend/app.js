@@ -26,6 +26,7 @@ import {
   projectCatalogFingerprint,
   projectMatchesFilters,
   sortProjects,
+  sortProjectsForView,
   terminalSessionKey,
 } from "./core.js";
 
@@ -40,6 +41,7 @@ const HAS_TERM = typeof window.Terminal === "function"
 /* ── sample dataset (browser-only fallback) ─────────────── */
 const SAMPLE = [
   { id:"1", path:"C:\\Demo\\atlas-notes", name:"atlas-notes", lastAccessedAt: isoMin(35), gitBranch:"main",
+    demoContent:"bounded full text search architecture", demoContentPath:"README.md",
     toolUsages:[{toolKey:"claude",toolName:"Claude Code",lastUsedAt:isoMin(35),sessionCount:12,lastSessionId:"a1b2c3d4"}] },
   { id:"2", path:"C:\\Demo\\terminal-lab", name:"terminal-lab", lastAccessedAt: isoHr(2), gitBranch:"feature/demo",
     toolUsages:[{toolKey:"claude",toolName:"Claude Code",lastUsedAt:isoHr(2),sessionCount:8,lastSessionId:"9e8f7a6b"},{toolKey:"codex",toolName:"Codex CLI",lastUsedAt:isoHr(20),sessionCount:3,lastSessionId:"c0d3cafe"}] },
@@ -52,13 +54,24 @@ const SAMPLE = [
   { id:"6", path:"C:\\Demo\\cli-playground", name:"cli-playground", lastAccessedAt: isoDay(2), gitBranch:null,
     toolUsages:[{toolKey:"opencode",toolName:"OpenCode",lastUsedAt:isoDay(2),sessionCount:4}] },
   { id:"7", path:"C:\\Demo\\migration-sandbox", name:"migration-sandbox", lastAccessedAt: isoDay(3), gitBranch:"main",
-    toolUsages:[{toolKey:"codex",toolName:"Codex CLI",lastUsedAt:isoDay(3),sessionCount:9},{toolKey:"kimi",toolName:"Kimi CLI",lastUsedAt:isoDay(3),sessionCount:7}] },
+    toolUsages:[{toolKey:"codex",toolName:"Codex CLI",lastUsedAt:isoDay(3),sessionCount:9},{toolKey:"kimi",toolName:"Kimi CLI",lastUsedAt:isoDay(3),sessionCount:7},{toolKey:"pi",toolName:"Pi Coding Agent",lastUsedAt:isoDay(4),sessionCount:2}] },
 ];
 function isoMin(n){return new Date(Date.now()-n*60000).toISOString()}
 function isoHr(n){return new Date(Date.now()-n*3600000).toISOString()}
 function isoDay(n){return new Date(Date.now()-n*86400000).toISOString()}
 
-const LIST_LIMIT = 2000;
+const LIST_LIMIT = 10000;
+const PROJECT_ORDER_KEY = "sessionatlas.projectOrder";
+const PROJECT_ORDER_MODES = new Set(["priority", "recent", "name", "grouped"]);
+
+function loadProjectOrder() {
+  try {
+    const stored = localStorage.getItem(PROJECT_ORDER_KEY);
+    return PROJECT_ORDER_MODES.has(stored) ? stored : "priority";
+  } catch {
+    return "priority";
+  }
+}
 
 // Dropdown to assign a project to a group (or "未分组"). Rendered in
 // both the popover and the right-pane launch panel.
@@ -82,7 +95,8 @@ function groupPickerHtml(projectId) {
 const state = {
   catalog: [], searchResults: null,
   all: [], filtered: [], tools: [],
-  tool: "all", recency: "all", query: "",
+  tool: "all", projectOrder: loadProjectOrder(), query: "",
+  matchingCount: 0,
   selectedId: null, cursor: -1,
   autoTimer: null, searchTimer: null,
   tabs: [],            // {ptyId, title, term, fit, pane, project, usage, dead}
@@ -115,21 +129,13 @@ const entryTreeGate = createLatestRequestGate();
 const docModalGate = createLatestRequestGate();
 const leftTreeGate = createLatestRequestGate();
 
-// Map of recency-filter key → max age in milliseconds. `null` means no filter.
-const RECENCY_CUTOFFS = {
-  "24h": 24 * 3600 * 1000,
-  "7d":  7  * 86400 * 1000,
-  "30d": 30 * 86400 * 1000,
-  "all": null,
-};
-
 /* ── tool visuals ───────────────────────────────────────── */
-const TOOL_DOT = { claude:"dot--claude", codex:"dot--codex", kimi:"dot--kimi", opencode:"dot--opencode", aider:"dot--aider" };
-const TOOL_COLOR = { claude:"#d97757", codex:"#10a37f", kimi:"#6c8aff", opencode:"#e8b339", aider:"#c6f24e" };
+const TOOL_DOT = { claude:"dot--claude", codex:"dot--codex", kimi:"dot--kimi", opencode:"dot--opencode", aider:"dot--aider", pi:"dot--pi" };
+const TOOL_COLOR = { claude:"#d97757", codex:"#10a37f", kimi:"#6c8aff", opencode:"#e8b339", aider:"#c6f24e", pi:"#a78bfa" };
 // Two-letter monograms used in the .tool-icon tile. Short, all-caps, and
 // distinct so each tool is recognisable in a 16×16 chip. Plain shell
 // gets "SH" so the generic strip is also branded.
-const TOOL_LABEL = { claude:"CL", codex:"CX", kimi:"KM", opencode:"OC", aider:"AI", shell:"SH" };
+const TOOL_LABEL = { claude:"CL", codex:"CX", kimi:"KM", opencode:"OC", aider:"AI", pi:"PI", shell:"SH" };
 // Small monogram tile used in the right-side commands strip title and
 // the session tab pills. Tools with a collected brand logo (claude/codex/
 // kimi) render as a single-color brand-glyph SVG tinted with the tool's
@@ -161,7 +167,17 @@ async function fetchProjects(query) {
   }
   const q = (query || "").trim().toLowerCase();
   if (!q) return SAMPLE;
-  return SAMPLE.filter(p => p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q));
+  return SAMPLE.flatMap(p => {
+    if (p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q)) return [p];
+    if (!p.demoContent?.toLowerCase().includes(q)) return [];
+    return [{
+      ...p,
+      contentMatch: {
+        relativePath: p.demoContentPath,
+        snippet: p.demoContent,
+      },
+    }];
+  });
 }
 
 // Pull remote projects + remote servers from the backend. Failures
@@ -379,18 +395,16 @@ function replaceTextMarker(root, marker, value) {
 
 function renderCount() {
   const n = state.all.length;
-  const shown = state.filtered.length;
+  const shown = state.matchingCount;
   const searching = state.query.trim().length > 0;
-  const recencyOn = state.recency !== "all";
   if (searching) {
     // Keep the translation's trusted <strong> markup, but replace the
     // untrusted query only after parsing, as a text node.
     const marker = "__SESSIONATLAS_QUERY__";
     ledgerCount.innerHTML = tr("ledger.count.matches", { count: shown, query: marker });
     replaceTextMarker(ledgerCount, marker, state.query);
-  } else if (recencyOn) {
-    const label = state.recency;
-    ledgerCount.innerHTML = tr("ledger.count.recency", { shown, total: n, label });
+  } else if (state.tool !== "all") {
+    ledgerCount.innerHTML = tr("ledger.count.visible", { shown, total: n });
   } else if (n >= LIST_LIMIT) {
     ledgerCount.innerHTML = tr("ledger.count.capped", { limit: LIST_LIMIT });
   } else {
@@ -431,18 +445,56 @@ function groupHeaderHtml(name, count, key) {
           </div>`;
 }
 
-function renderLedger() {
-  const cutoff = RECENCY_CUTOFFS[state.recency];
-  const now = Date.now();
-  // `visible` = projects matching tool + recency, IGNORING group collapse.
-  // We need the collapse-inclusive set here so a collapsed group still
-  // renders its header (with count). Otherwise, when every matching project
-  // sits in a collapsed group, the ledger would fall through to the
-  // "Archive empty" card and the user would have no header to click to
-  // re-expand — the list would look empty even though data is present.
-  // `state.filtered` (the nav set) excludes collapsed; this set does not.
-  const visible = state.all.filter(p => matchesFilters(p, cutoff, now));
-  if (!visible.length) {
+function activeTabsByProject() {
+  const result = new Map();
+  for (const tab of state.tabs) {
+    if (tab.kind !== "pty" || tab.dead || !tab.project?.id) continue;
+    if (!result.has(tab.project.id)) result.set(tab.project.id, []);
+    result.get(tab.project.id).push(tab);
+  }
+  return result;
+}
+
+function buildLedgerModel() {
+  const matching = state.all.filter(matchesFilters);
+  const activeTabs = activeTabsByProject();
+  if (state.projectOrder !== "grouped") {
+    const ordered = sortProjectsForView(
+      [...matching],
+      state.projectOrder,
+      state.sortOrders,
+      new Set(activeTabs.keys()),
+    );
+    return { matching, ordered, sections: [{ key: null, items: ordered }], activeTabs };
+  }
+
+  const buckets = new Map();
+  for (const project of matching) {
+    const key = groupKeyOf(project);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(project);
+  }
+  const sections = [];
+  for (const group of state.groups) {
+    const key = String(group.id);
+    const items = buckets.get(key);
+    if (items?.length) sections.push({ key, name: group.name, items: sortBucket(items) });
+  }
+  const ungrouped = buckets.get("ungrouped");
+  if (ungrouped?.length) {
+    sections.push({ key: "ungrouped", name: tr("group.ungrouped"), items: sortBucket(ungrouped) });
+  }
+  const ordered = sections.flatMap(section =>
+    isGroupCollapsed(section.key) ? [] : section.items,
+  );
+  return { matching, ordered, sections, activeTabs };
+}
+
+function renderLedger(model = buildLedgerModel()) {
+  state.filtered = model.ordered;
+  state.matchingCount = model.matching.length;
+  if (!model.matching.length) {
+    ledger.classList.remove("is-large");
     const marker = "__SESSIONATLAS_EMPTY_QUERY__";
     ledger.innerHTML = `
       <div class="ledger__empty">
@@ -455,58 +507,32 @@ function renderLedger() {
     if (state.query) replaceTextMarker(ledger, marker, state.query);
     return;
   }
-  // Bucket visible projects by group, preserving the existing order
-  // (already sorted by lastAccessedAt DESC from the server).
-  const buckets = new Map();   // groupId|null -> [project, ...]
-  for (const p of visible) {
-    const gid = state.assignments[p.id] ?? null;
-    if (!buckets.has(gid)) buckets.set(gid, []);
-    buckets.get(gid).push(p);
-  }
-  // Render: real groups in their defined order, then "未分组" last.
-  // Collapsed groups render only their header (projects hidden) — but
-  // they DO render a header, so collapsing a group never makes it vanish.
+  const renderContext = { activeTabs: model.activeTabs };
   const parts = [];
-  for (const g of state.groups) {
-    const items = buckets.get(g.id);
-    if (items && items.length) {
-      sortBucket(items);
-      parts.push(groupHeaderHtml(g.name, items.length, g.id));
-      if (!isGroupCollapsed(g.id)) parts.push(items.map(p => entryHtml(p)).join(""));
+  for (const section of model.sections) {
+    if (section.key != null) {
+      parts.push(groupHeaderHtml(section.name, section.items.length, section.key));
+      if (isGroupCollapsed(section.key)) continue;
     }
+    parts.push(section.items.map(project => entryHtml(project, renderContext)).join(""));
   }
-  const ungrouped = buckets.get(null);
-  if (ungrouped && ungrouped.length) {
-    sortBucket(ungrouped);
-    parts.push(groupHeaderHtml(tr("group.ungrouped"), ungrouped.length, "ungrouped"));
-    if (!isGroupCollapsed("ungrouped")) parts.push(ungrouped.map(p => entryHtml(p)).join(""));
-  }
+  ledger.classList.toggle("is-large", model.ordered.length > 200);
   ledger.innerHTML = parts.join("");
-  [...ledger.querySelectorAll(".entry")].forEach(el => {
-    el.addEventListener("click", () => select(el.dataset.id));
-    el.addEventListener("dblclick", (e) => {
-      // Skip when the dblclick lands on a sub-control (e.g. the `⋯`
-      // menu button) so the menu's click handler keeps its normal flow.
-      if (e.target.closest("[data-menu-toggle]")) return;
-      const p = state.all.find(x => x.id === el.dataset.id);
-      if (p) openProjectDefault(p);
-    });
-  });
-  // Group header click/Enter → toggle collapse.
-  [...ledger.querySelectorAll("[data-group-toggle]")].forEach(el => {
-    el.addEventListener("click", () => toggleGroupCollapse(el.dataset.groupKey));
-    el.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        toggleGroupCollapse(el.dataset.groupKey);
-      }
-    });
-  });
-  wireLaunchPills(ledger);
 }
 
-function entryHtml(p) {
+function entryHtml(p, renderContext) {
   const t = relTime(p.lastAccessedAt);
+  const contentMatch = p.contentMatch
+    ? `<div class="entry__content-match" title="${escapeHtml(p.contentMatch.relativePath)}">
+         <span class="entry__content-path">${escapeHtml(p.contentMatch.relativePath)}</span>
+         ${p.contentMatch.snippet
+           ? `<span class="entry__content-snippet">${escapeHtml(p.contentMatch.snippet)}</span>`
+           : ""}
+       </div>`
+    : "";
+  const missingBadge = p.pathMissing
+    ? `<span class="entry__missing-badge" title="${escapeHtml(tr("entry.pathMissing"))}" aria-label="${escapeHtml(tr("entry.pathMissing"))}">${escapeHtml(tr("entry.pathMissingBadge"))}</span>`
+    : "";
   // The server already returns toolUsages ordered by lastUsedAt DESC, so
   // the first element is the most-recently-used tool for the dot indicator.
   const topUsage = (p.toolUsages || [])[0];
@@ -519,9 +545,7 @@ function entryHtml(p) {
   // File-tree tabs (kind="file") aren't terminal sessions — only PTY tabs
   // count, so opening a markdown file in the right pane doesn't turn the
   // project name green.
-  const openTabs = state.tabs.filter(
-    t => t.kind === "pty" && !t.dead && t.project.id === p.id,
-  );
+  const openTabs = renderContext.activeTabs.get(p.id) || [];
   const hasSession = openTabs.length > 0;
   const sessionTools = hasSession
     ? Array.from(new Set(openTabs.map(t => t.usage?.toolKey || "shell"))).join(", ")
@@ -531,10 +555,36 @@ function entryHtml(p) {
     : "";
   const isMenuOpen = state.menuOpenId === p.id;
   const isExpanded = state.expandedId === p.id;
-  // Per-tool session panel — one card per recorded tool usage. The Resume
-  // pill passes the specific toolKey (and session id, embedded in the
-  // data-sid attribute) through to openTerminalTab so the auto-launch
-  // command becomes `<toolKey> --resume <sid>`.
+  const expandedPanel = isExpanded ? entryExpandedPanelHtml(p) : "";
+  const expandLabel = isExpanded ? tr("entry.collapseSessions") : tr("entry.expandSessions");
+  const draggable = state.projectOrder === "grouped";
+  return `
+    <article class="entry ${state.selectedId===p.id?"is-selected":""} ${isMenuOpen?"is-menu-open":""} ${hasSession?"has-session":""} ${isExpanded?"is-expanded":""} ${p.pathMissing?"is-missing":""}" data-id="${p.id}" draggable="${draggable}">
+      <div class="entry__body">
+        <button class="entry__expand" data-expand-toggle draggable="false" aria-label="${escapeHtml(expandLabel)}" title="${escapeHtml(expandLabel)}">${isExpanded?"▾":"▸"}</button>
+        <span class="entry__folder" aria-hidden="true">${folderIconSvg()}</span>
+        <div class="entry__identity">
+          <div class="entry__name">${escapeHtml(p.name)}</div>
+          ${contentMatch}
+        </div>
+        ${missingBadge}
+      </div>
+      <div class="entry__meta-col">
+        ${sessionMarker}
+        ${dot}
+        ${p.source === "remote" ? `<span class="entry__remote-dot" title="${escapeHtml(tr("entry.remoteTooltip", { label: state.remoteServerById[p.remoteServerId]?.label || p.path }))}">●</span>` : ""}
+        <div class="entry__time">${t}</div>
+        <button class="entry__tree-btn" data-tree-btn draggable="false" aria-label="${escapeHtml(tr("entry.showFileTree"))}" title="${escapeHtml(tr("entry.showFileTree"))}">${ICON_FILES}</button>
+        <button class="entry__menu-btn" data-menu-toggle draggable="false" aria-label="${escapeHtml(tr("entry.more"))}" title="${escapeHtml(tr("entry.more"))}">⋯</button>
+      </div>
+      ${expandedPanel}
+    </article>`;
+}
+
+// The expanded panel is intentionally built only for the single open row.
+// Large catalogs no longer pay to construct hidden session cards, queue
+// controls, and launch buttons for every project on each ledger repaint.
+function entryExpandedPanelHtml(p) {
   const sessionCards = (p.toolUsages || []).map(u => {
     const sid = u.lastSessionId || "";
     const shortSid = sid ? sid.slice(0, 8) : "";
@@ -587,8 +637,8 @@ function entryHtml(p) {
         </div>
         ${existingQueueTab ? `<div class="entry__expanded__queue-status">${escapeHtml(tr("queue.queueOpen", { idx: existingQueueTab.queueIdx + 1, total: existingQueueTab.queueTotal }))}</div>` : ""}
       </div>` : "";
-  const expandedPanel = `
-    <div class="entry__expanded" ${isExpanded ? "" : "hidden"}>
+  return `
+    <div class="entry__expanded">
       <div class="entry__expanded__label">${escapeHtml(tr("entry.label.openSession"))}</div>
       ${sessionCards || `<div class="entry__expanded__empty">${escapeHtml(tr("entry.noInstrumentsHint"))}</div>`}
       ${newToolPills ? `<div class="entry__expanded__new">
@@ -600,24 +650,6 @@ function entryHtml(p) {
       </div>
       ${queuePanel}
     </div>`;
-  const expandLabel = isExpanded ? tr("entry.collapseSessions") : tr("entry.expandSessions");
-  return `
-    <article class="entry ${state.selectedId===p.id?"is-selected":""} ${isMenuOpen?"is-menu-open":""} ${hasSession?"has-session":""} ${isExpanded?"is-expanded":""}" data-id="${p.id}" draggable="true">
-      <div class="entry__body">
-        <button class="entry__expand" data-expand-toggle draggable="false" aria-label="${escapeHtml(expandLabel)}" title="${escapeHtml(expandLabel)}">${isExpanded?"▾":"▸"}</button>
-        <span class="entry__folder" aria-hidden="true">${folderIconSvg()}</span>
-        <div class="entry__name">${escapeHtml(p.name)}</div>
-      </div>
-      <div class="entry__meta-col">
-        ${sessionMarker}
-        ${dot}
-        ${p.source === "remote" ? `<span class="entry__remote-dot" title="${escapeHtml(tr("entry.remoteTooltip", { label: state.remoteServerById[p.remoteServerId]?.label || p.path }))}">●</span>` : ""}
-        <div class="entry__time">${t}</div>
-        <button class="entry__tree-btn" data-tree-btn draggable="false" aria-label="${escapeHtml(tr("entry.showFileTree"))}" title="${escapeHtml(tr("entry.showFileTree"))}">${ICON_FILES}</button>
-        <button class="entry__menu-btn" data-menu-toggle draggable="false" aria-label="${escapeHtml(tr("entry.more"))}" title="${escapeHtml(tr("entry.more"))}">⋯</button>
-      </div>
-      ${expandedPanel}
-    </article>`;
 }
 
 function entryMenuHtml(p, isOpen) {
@@ -682,7 +714,7 @@ function entryMenuHtml(p, isOpen) {
 
 /* ── right-side quick commands strip ────────────────────── */
 // Per-tool preset list. The sidebar shows commands tailored to the active
-// tab's tool: claude/codex/kimi/opencode/aider each get their own workflow
+// tab's tool: claude/codex/kimi/opencode/aider/pi each get their own workflow
 // shortcuts, plain-shell tabs get a shell-flavored set, and `null` (no tab)
 // shows universal navigation. Hint = short uppercase category label.
 //
@@ -766,6 +798,17 @@ const COMMON_COMMANDS_BY_TOOL = {
       { cmd: "/model",               hint: "model"   },
       { cmd: "/commit",              hint: "git"     },
       { cmd: "/undo",                hint: "undo"    },
+      { cmd: "/exit",                hint: "exit"    },
+    ],
+  },
+  pi: {
+    title: "PI",
+    items: [
+      { cmd: "/help",                hint: "help"    },
+      { cmd: "/settings",            hint: "config"  },
+      { cmd: "/session",             hint: "session" },
+      { cmd: "/tree",                hint: "tree"    },
+      { cmd: "/model",               hint: "model"   },
       { cmd: "/exit",                hint: "exit"    },
     ],
   },
@@ -1732,10 +1775,8 @@ function isSafeUrl(url) {
 // Current rendered order (matching + non-collapsed) of a group, sorted.
 // Used to compute the new ordered id list on a positional drop.
 function renderedGroupOrder(groupKey) {
-  const cutoff = RECENCY_CUTOFFS[state.recency];
-  const now = Date.now();
   const items = state.all.filter(p =>
-    matchesFilters(p, cutoff, now) && groupKeyOf(p) === groupKey);
+    matchesFilters(p) && groupKeyOf(p) === groupKey);
   sortBucket(items);
   return items.map(p => p.id);
 }
@@ -1836,6 +1877,10 @@ function clearDropIndicators() {
 // insertion point from the pointer Y relative to the hovered row's midpoint.
 function wireDrag() {
   ledger.addEventListener("dragstart", (e) => {
+    if (state.projectOrder !== "grouped") {
+      e.preventDefault();
+      return;
+    }
     const entry = e.target.closest(".entry");
     if (!entry) return;
     state._dragId = entry.dataset.id;
@@ -2938,6 +2983,11 @@ function closeEntryMenu() {
 }
 function wireEntryMenuDelegation() {
   ledger.addEventListener("click", (e) => {
+    const groupToggle = e.target.closest("[data-group-toggle]");
+    if (groupToggle) {
+      toggleGroupCollapse(groupToggle.dataset.groupKey);
+      return;
+    }
     const toggle = e.target.closest("[data-menu-toggle]");
     if (toggle) {
       e.stopPropagation();
@@ -2951,6 +3001,8 @@ function wireEntryMenuDelegation() {
     // what refreshLeftPaneTree wants when we enter files mode.
     const treeBtn = e.target.closest("[data-tree-btn]");
     if (treeBtn) {
+      const projectId = treeBtn.closest(".entry")?.dataset.id;
+      if (projectId) select(projectId);
       setViewMode("files");
       return;
     }
@@ -3010,7 +3062,23 @@ function wireEntryMenuDelegation() {
       }
       // Clear the textarea after submission.
       if (ta) ta.value = "";
+      return;
     }
+    const entry = e.target.closest(".entry");
+    if (entry) select(entry.dataset.id);
+  });
+  ledger.addEventListener("dblclick", (e) => {
+    if (e.target.closest("button, textarea, select, [data-group-toggle]")) return;
+    const entry = e.target.closest(".entry");
+    if (!entry) return;
+    const project = state.all.find(item => item.id === entry.dataset.id);
+    if (project) openProjectDefault(project);
+  });
+  ledger.addEventListener("keydown", (e) => {
+    const groupToggle = e.target.closest("[data-group-toggle]");
+    if (!groupToggle || (e.key !== "Enter" && e.key !== " ")) return;
+    e.preventDefault();
+    toggleGroupCollapse(groupToggle.dataset.groupKey);
   });
   // Backdrop / close button.
   entryModal.addEventListener("click", (e) => {
@@ -3573,15 +3641,12 @@ function wireDrawerForms() {
   });
 }
 
-/* ── filtering ──────────────────────────────────────────── */
-// Tool + recency predicate only — does NOT consider group collapse.
-// Shared by `applyFilters` (which additionally hides collapsed groups so
-// keyboard nav skips them) and `renderLedger` (which does NOT hide
-// collapsed groups, so their headers still render with a count). Keeping
-// this in one place ensures nav and rendering agree on what "matches the
-// active filters" means.
-function matchesFilters(p, cutoff, now) {
-  return projectMatchesFilters(p, state.tool, cutoff, now);
+/* ── filtering + ordering ───────────────────────────────── */
+// Tool selection still narrows the catalog intentionally. Time is no longer
+// a filter: every project remains available and the order control decides
+// which work appears first.
+function matchesFilters(p) {
+  return projectMatchesFilters(p, state.tool, null, Date.now());
 }
 // Collapse key for a project: its group id, or "ungrouped". Always a string
 // so it matches collapse keys and backend group_key ("ungrouped" | str(gid)).
@@ -3599,29 +3664,13 @@ function sortBucket(items) {
 }
 
 function applyFilters() {
-  const cutoff = RECENCY_CUTOFFS[state.recency];
-  const now = Date.now();
-  const matching = state.all.filter(p => matchesFilters(p, cutoff, now));
-  // Build `filtered` in render order: real groups in their defined order,
-  // then 未分组; within each group apply sortBucket; skip collapsed groups
-  // (the cursor must skip them). This keeps ↑↓ nav aligned with what's
-  // visually top-to-bottom in the ledger, including under manual order.
-  const ordered = [];
-  for (const g of state.groups) {
-    const key = String(g.id);
-    if (isGroupCollapsed(key)) continue;
-    const items = matching.filter(p => groupKeyOf(p) === key);
-    if (items.length) ordered.push(...sortBucket(items));
-  }
-  if (!isGroupCollapsed("ungrouped")) {
-    const items = matching.filter(p => groupKeyOf(p) === "ungrouped");
-    if (items.length) ordered.push(...sortBucket(items));
-  }
-  state.filtered = ordered;
+  const model = buildLedgerModel();
+  state.filtered = model.ordered;
+  state.matchingCount = model.matching.length;
   const idx = state.filtered.findIndex(p => p.id === state.selectedId);
   state.cursor = state.filtered.length ? (idx >= 0 ? idx : 0) : -1;
   renderCount();
-  renderLedger();
+  renderLedger(model);
 }
 
 async function reload() {
@@ -4250,6 +4299,7 @@ function applyLocalizedUI() {
   // rebuilt by renderDrawerBody, which runs below, so this mostly covers
   // the case where a sub-page is open).
   renderTools();
+  renderProjectOrder();
   if (state.all && state.all.length) renderMeta(state.all);
   applyFilters();                       // → renderCount + renderLedger
   renderCommonCommands();
@@ -4296,7 +4346,7 @@ searchInput.addEventListener("input", e => {
 
 // Wire a chip-strip nav: clicking a chip updates `state[key]` from
 // `chip.dataset[key]`, re-renders the strip's active class, and re-applies
-// the filters. Used by the tool filter and the recency filter.
+// the current project view.
 function wireChipGroup(navId, key, render) {
   document.getElementById(navId).addEventListener("click", e => {
     const chip = e.target.closest(".chip"); if (!chip) return;
@@ -4305,13 +4355,20 @@ function wireChipGroup(navId, key, render) {
     applyFilters();
   });
 }
-function renderRecency() {
-  document.querySelectorAll("#recencyFilters .chip").forEach(c => {
-    c.classList.toggle("is-active", c.dataset.recency === state.recency);
+function renderProjectOrder() {
+  document.querySelectorAll("#projectOrderFilters .chip").forEach(c => {
+    c.classList.toggle("is-active", c.dataset.projectOrder === state.projectOrder);
   });
 }
 wireChipGroup("filters", "tool", renderTools);
-wireChipGroup("recencyFilters", "recency", renderRecency);
+document.getElementById("projectOrderFilters").addEventListener("click", e => {
+  const chip = e.target.closest(".chip");
+  if (!chip || !PROJECT_ORDER_MODES.has(chip.dataset.projectOrder)) return;
+  state.projectOrder = chip.dataset.projectOrder;
+  try { localStorage.setItem(PROJECT_ORDER_KEY, state.projectOrder); } catch {}
+  renderProjectOrder();
+  applyFilters();
+});
 
 const scanBtn = document.getElementById("scanBtn");
 scanBtn.addEventListener("click", async () => {
@@ -4371,6 +4428,7 @@ document.addEventListener("keydown", e => {
   setupThemeToggle();
   setupViewToggle();
   localizeStaticHtml();        // localize chrome text + placeholders from <html lang>
+  renderProjectOrder();
   await trackMaximizedState();
   try {
     await wirePtyEvents();

@@ -6,7 +6,7 @@
 
 ## 一、定位与核心模型
 
-**一句话定位**：扫描本机多个 AI CLI（Claude Code、Codex、Kimi、OpenCode、Aider）
+**一句话定位**：扫描本机多个 AI CLI（Claude Code、Codex、Kimi、OpenCode、Aider、Pi）
 留下的工作目录，按规范化路径去重，建立统一 SQLite 索引，并在桌面控制台里一键续接
 AI 会话。
 
@@ -43,18 +43,24 @@ Cargo workspace
 ```text
 各 AI 工具数据目录 → scanner/（每工具一个 Scanner + custom）→ ScanOutcome
 → indexer（规范化路径去重/合并，读 .git/HEAD 取分支）
-→ store（单 SQLite 事务快照替换 + FTS5 重建）
+→ store（单 SQLite 事务快照替换 + 项目 FTS5 重建）
+→ content_index（限额遍历 + mtime/size 增量判定 + 内容 FTS5/压缩摘要）
 ```
 
 - `ScanOutcome` 区分可信的空快照（`Succeeded`）、不可用（`Unavailable`）与失败
   （`Failed`）；只有 `Succeeded` 可以替换对应工具快照，其余保留旧数据。
 - 路径语义在 `path.rs`：Windows 大小写不敏感、Unix 字节敏感；根路径不归一化为空。
+- `Project.path_missing` 不写入数据库，而是在索引构建和每次读取时根据目录现状计算；
+  因此扫描后目录被删除也会立即显示缺失，权限或瞬时 I/O 错误不会被误报为缺失。
 - 快照替换、孤儿项目清理、活动时间重算与 FTS 重建在同一事务内原子完成。
 - `prefs.db` 由 Tauri 管理，本地扫描不改其中的分组/排序/打开器/远程项目数据。
 
 ## 四、SQLite 存储
 
-`index.db` 表：`projects`、`tool_usages`、`sessions`，以及 FTS5 `projects_fts`。
+`index.db` 表：`projects`、`tool_usages`、`sessions`、`project_content_files`、
+`project_content_status`，以及 FTS5 `projects_fts`、contentless
+`project_content_fts`。正文原文不写入普通表；FTS 只保留词项，结果字幕来自
+LZ4 压缩的 32 KiB 预览。
 schema 幂等创建/迁移；`store.rs` 同时负责旧数据去重迁移与只读异常行检查。
 Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任何连接都不创建或
 修改 WAL/SHM/journal 文件。
@@ -71,7 +77,8 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 - `security.rs`（core 与 src-tauri 各自一份）校验/引用工具 key、session ID、
   SSH 用户/主机/身份文件/远端路径、URL 与打开器模板；所有输入先过对应的
   validator/quoting 再插入命令。
-- `launcher.rs` 构造 `<tool>{sessionId}` 命令行（`--resume <id>` 由可信后端追加）
+- `launcher.rs` 构造 `<tool>{sessionId}` 命令行（Pi 使用 `--session <id>`，其他内置
+  工具沿用 `--resume <id>`，参数均由可信后端追加）
   并打开平台终端。
 - 远程 SSH：`BatchMode=yes` 全量强制，纯免密；连接探测同时报告 tmux 能力。
   每个「远程项目 + 工具」映射到确定性的 tmux 会话，首次打开创建并启动工具，
@@ -119,8 +126,9 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 ## 九、安全模型要点
 
 - 本地优先：索引/偏好/配置只保存在 `~/.sessionatlas/`，无遥测或云同步。
-- 扫描器只取路径、时间、session ID 与必要 Git 元数据；不持久化提示词、消息、
-  密钥或认证内容。
+- 工具记录扫描器只取路径、时间、session ID 与必要 Git 元数据；项目内容索引器
+  在本机限额读取源码/文档，排除敏感形态文件并按行脱敏，只持久化 FTS 词项和
+  LZ4 压缩摘要，不持久化完整正文、提示词、消息、密钥或认证内容。
 - 所有外部进程为参数数组；shell 元字符、控制字符、选项形 tool key 一律拒绝。
 - 搜索词与用户字符串按文本节点渲染，绝不进入 `innerHTML` 执行标记。
 - xterm/高亮/字体全部本地加载，不依赖 CDN。

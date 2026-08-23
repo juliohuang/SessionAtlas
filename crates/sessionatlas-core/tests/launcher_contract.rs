@@ -1,6 +1,6 @@
 //! Contract tests for `sessionatlas_core::launcher`: tool identity resolution
 //! (built-ins, enabled non-overriding custom tools), argv construction with
-//! independent `--resume` arguments, cross-platform terminal shapes, and the
+//! independent native resume arguments, cross-platform terminal shapes, and the
 //! injectable launch boundary. Recording runners and fake resolvers are used
 //! throughout so no test starts a real terminal, AI CLI, `where`, or `which`.
 
@@ -34,10 +34,10 @@ fn no_wt(_: &Path) -> bool {
     false
 }
 
-fn built_ins_are_the_five_supported_identities() {
+fn built_ins_are_the_six_supported_identities() {
     let mut keys: Vec<&str> = BUILT_IN_TOOL_KEYS.to_vec();
     keys.sort_unstable();
-    assert_eq!(keys, ["aider", "claude", "codex", "kimi", "opencode"]);
+    assert_eq!(keys, ["aider", "claude", "codex", "kimi", "opencode", "pi"]);
     for key in BUILT_IN_TOOL_KEYS {
         assert!(is_reserved_tool_key(key), "{key} must be reserved");
         assert!(
@@ -51,7 +51,7 @@ fn built_ins_are_the_five_supported_identities() {
 
 #[test]
 fn launcher_contract_built_in_commands_map_to_themselves() {
-    built_ins_are_the_five_supported_identities();
+    built_ins_are_the_six_supported_identities();
     let commands = ToolCommands::built_in();
     for key in BUILT_IN_TOOL_KEYS {
         assert!(commands.known_key(key), "{key} must be a known key");
@@ -148,6 +148,11 @@ fn launcher_contract_build_arguments_appends_resume_as_independent_arguments() {
             .build_arguments("codex", Some("s:1.2_3+4-5"))
             .unwrap(),
         vec!["codex", "--resume", "s:1.2_3+4-5"]
+    );
+    assert_eq!(
+        commands.build_arguments("pi", Some("pi-session")).unwrap(),
+        vec!["pi", "--session", "pi-session"],
+        "Pi uses its native --session flag"
     );
 }
 

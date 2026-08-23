@@ -82,7 +82,7 @@ pub struct SearchArgs {
 pub struct OpenArgs {
     /// 项目路径（支持模糊匹配，留空进入交互选择）
     pub project_path: Option<String>,
-    /// 指定工具: claude, codex, kimi, opencode, aider
+    /// 指定工具: claude, codex, kimi, opencode, aider, pi
     #[arg(short = 't', long)]
     pub tool: Option<String>,
     /// 交互式选择工具

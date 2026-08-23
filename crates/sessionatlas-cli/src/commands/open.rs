@@ -206,7 +206,7 @@ pub fn run_open(
     ));
     if let Some(id) = &resume_session_id {
         io.out(&format!(
-            "尝试恢复会话 {}（若工具不支持 --resume 将忽略）\n",
+            "尝试恢复会话 {}（使用对应工具的原生会话参数）\n",
             sanitize(id)
         ));
     }

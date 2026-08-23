@@ -580,7 +580,7 @@ fn scan_unreadable_config_keeps_builtins_and_reports_config_read_failed() {
     std::fs::create_dir_all(dir.config().parent().unwrap()).unwrap();
     std::fs::write(dir.config(), "{ not valid json").unwrap();
     let (scanners, diagnostics) = build_default_scanners(&dir.config());
-    assert_eq!(scanners.len(), 5, "built-ins remain available");
+    assert_eq!(scanners.len(), 6, "built-ins remain available");
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].code, "config_read_failed");
     assert_eq!(diagnostics[0].severity, ScanDiagnosticSeverity::Warning);
@@ -591,14 +591,14 @@ fn scan_unreadable_config_keeps_builtins_and_reports_config_read_failed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_scanner_set_instantiates_the_five_built_ins_in_csharp_order() {
+fn default_scanner_set_instantiates_the_six_built_ins() {
     let dir = TestDir::new();
     let (scanners, diagnostics) = build_default_scanners(&dir.config());
     let keys: Vec<&str> = scanners.iter().map(|scanner| scanner.tool_key()).collect();
     assert_eq!(
         keys,
-        ["claude", "kimi", "codex", "opencode", "aider"],
-        "built-ins must be instantiated in C# registration order"
+        ["claude", "kimi", "codex", "opencode", "aider", "pi"],
+        "all built-ins must be instantiated"
     );
     assert!(diagnostics.is_empty());
 }
@@ -634,7 +634,7 @@ fn default_scanner_set_loads_enabled_non_conflicting_custom_tools_only() {
         .filter(|key| key.eq_ignore_ascii_case("codex"))
         .count();
     assert_eq!(codex_count, 1, "conflicting custom tool skipped: {keys:?}");
-    assert_eq!(scanners.len(), 6, "5 built-ins + my-agent");
+    assert_eq!(scanners.len(), 7, "6 built-ins + my-agent");
 }
 
 // ---------------------------------------------------------------------------

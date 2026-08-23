@@ -67,13 +67,15 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 | Kimi CLI | `~/.kimi-code/sessions/**/state.json` | `kimi` |
 | OpenCode | `~/.local/share/opencode/opencode.db` | `opencode` |
 | Aider | 常用开发目录中的 `.aider.chat.history` | `aider` |
+| Pi Coding Agent | `~/.pi/agent/sessions/**/*.jsonl`（支持官方目录覆盖） | `pi` |
 
 还可以通过 `sessionatlas config add-tool` 添加符合安全约束的自定义工具。
 
 ## 主要能力
 
-- 统一扫描、路径去重、SQLite FTS5 全文搜索；
-- 按工具和最近访问时间筛选，自定义分组与拖拽排序；
+- 统一扫描、路径去重、SQLite FTS5 高速全文搜索；源码/文档按文件增量索引，只保存词项与 LZ4 压缩摘要；
+- 会话仍有记录但项目目录已不存在时显示“目录缺失”标记；
+- 项目默认全部可见，支持重要优先、最近、名称和分组/手动排序；
 - 多标签真实 PTY 终端与最近会话继续入口；
 - 可配置 VS Code、资源管理器、终端等外部打开器；
 - 免密密钥/agent 模式的远程 SSH 索引，以及持久化 tmux TUI 会话；同一服务器的项目共用一个 SSH 终端并直接切换 tmux 会话；
@@ -83,7 +85,7 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 ## 隐私与安全
 
 - **本地优先**：索引、偏好和配置只保存在 `~/.sessionatlas/`，项目不包含遥测或云端同步。
-- **读取边界**：扫描器会读取受支持工具留在本机的数据目录，以提取项目路径、时间和会话元数据；不会把这些内容上传给 SessionAtlas 服务。
+- **读取边界**：扫描器会读取受支持工具留在本机的数据目录以提取项目元数据，并在本机限额读取项目源码/文档以建立内容索引；敏感形态文件、依赖和构建目录被排除，正文不写入普通表，也不会上传给 SessionAtlas 服务。
 - **执行边界**：SessionAtlas 会按用户操作启动本机 AI CLI、终端、Git 或 SSH。第三方工具自己的网络访问和数据策略仍由它们负责。
 - **正常权限策略**：批量 Claude 任务不会加入跳过权限检查的参数；需要批准的操作可能停下来等待用户。
 - **本地资源**：xterm.js、语法高亮和字体不依赖 CDN。第三方声明见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。

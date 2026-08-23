@@ -196,6 +196,7 @@ export function projectCatalogFingerprint(projects) {
     source: project.source,
     path: project.path,
     name: project.name,
+    pathMissing: project.pathMissing === true,
     lastAccessedAt: project.lastAccessedAt,
     gitBranch: project.gitBranch,
     remoteServerId: project.remoteServerId,
@@ -274,6 +275,67 @@ export function sortProjects(projects, sortOrders) {
     projects.sort(compareRecentFirst);
   }
   return projects;
+}
+
+// Order modes used by the project ledger. All modes keep the complete
+// matching catalog visible; they only change which projects appear first.
+// "priority" favors work that needs attention now: live sessions, paths
+// that still exist, recent activity tiers, and then repeat usage.
+export function sortProjectsForView(projects, mode, sortOrders, activeProjectIds = new Set()) {
+  if (mode === "grouped") return sortProjects(projects, sortOrders);
+  if (mode === "name") {
+    return projects.sort((left, right) => {
+      const byName = String(left.name || "").localeCompare(String(right.name || ""), undefined, {
+        sensitivity: "base",
+        numeric: true,
+      });
+      return byName || compareRecentFirst(left, right);
+    });
+  }
+  if (mode === "recent") return projects.sort(compareRecentFirst);
+
+  return projects.sort((left, right) => {
+    const active = Number(activeProjectIds.has(right.id)) - Number(activeProjectIds.has(left.id));
+    if (active) return active;
+
+    const available = Number(Boolean(left.pathMissing)) - Number(Boolean(right.pathMissing));
+    if (available) return available;
+
+    const leftTimestamp = projectTimestamp(left);
+    const rightTimestamp = projectTimestamp(right);
+    const activityTier = recencyTier(rightTimestamp) - recencyTier(leftTimestamp);
+    if (activityTier) return activityTier;
+
+    const sessions = projectSessionCount(right) - projectSessionCount(left);
+    if (sessions) return sessions;
+
+    const recent = rightTimestamp - leftTimestamp;
+    if (recent) return recent;
+    return String(left.name || "").localeCompare(String(right.name || ""), undefined, {
+      sensitivity: "base",
+      numeric: true,
+    });
+  });
+}
+
+function projectTimestamp(project) {
+  const value = Date.parse(project.lastAccessedAt || "");
+  return Number.isFinite(value) ? value : 0;
+}
+
+function recencyTier(timestamp, now = Date.now()) {
+  const age = Math.max(0, now - timestamp);
+  if (age <= 24 * 60 * 60 * 1000) return 3;
+  if (age <= 7 * 24 * 60 * 60 * 1000) return 2;
+  if (age <= 30 * 24 * 60 * 60 * 1000) return 1;
+  return 0;
+}
+
+function projectSessionCount(project) {
+  return (project.toolUsages || []).reduce(
+    (total, usage) => total + (Number(usage.sessionCount) || 0),
+    0,
+  );
 }
 
 function compareRecentFirst(left, right) {

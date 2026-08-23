@@ -39,6 +39,7 @@ content was not copied.
 | Kimi Code | `~/.kimi-code/sessions/<worktree-key>/<session-id>/state.json` |
 | OpenCode | SQLite `project` and `session` tables in `opencode.db` |
 | Aider | project-local `.aider.chat.history` marker |
+| Pi Coding Agent | nested JSONL whose `session` header contains `id`, `cwd`, and `timestamp` |
 
 Fixtures deliberately describe the current formats even when a production
 scanner does not support that format yet. Parser behavior for those fixtures
@@ -131,6 +132,26 @@ before `npm test`, and both `ci.yml` (windows-desktop) and `release.yml` build
 `target/release/sessionatlas.exe` to the acceptance script instead of relying on
 `cargo tauri build` to produce the CLI implicitly.
 
+## Current local regression (2026-08-16, Windows x64)
+
+This rerun covers the six-tool scanner, missing-directory marker, project-order
+UI, large-catalog query/render changes, and the bounded incremental project
+content index on the current working tree. It does not claim a new installer
+build or hosted workflow result.
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | passed (exit 0) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | passed (exit 0) |
+| `cargo test --workspace` | 421 passed, 0 failed/ignored (exit 0) |
+| `npm --prefix frontend run check` | passed (exit 0) |
+| frontend unit tests | 22 passed, 0 failed (exit 0) |
+| Playwright browser tests | 32 passed, 0 failed (exit 0) |
+| 2,000-project browser contract | all rows rendered; collapsed row controls were not prebuilt; order switching retained all 2,000 rows |
+| content-index contract | incremental reuse and stale deletion passed; raw source is not selectable from contentless FTS; compressed/redacted subtitle and walk/file/byte/query limits passed |
+| in-app browser inspection | priority/grouped/priority showed 7/7/7 rows; content query `full text search` returned only `atlas-notes` with `README.md` and a one-line subtitle |
+| `git diff --check` | passed (only Windows LF→CRLF notices) |
+
 ### Contracts protected now
 
 - `ProjectIndexer` merges tool observations, counts distinct native session
@@ -149,7 +170,11 @@ before `npm test`, and both `ci.yml` (windows-desktop) and `release.yml` build
 - SQLite snapshot tests cover stable project identity, exact usage
   replacement, partial and successful-empty scans, orphan/FTS cleanup,
   migration of duplicate legacy usages, and transaction rollback.
-- Current Claude, Codex, Kimi Code, OpenCode, and Aider formats are parsed from
+- Project-content tests cover deterministic walk/file/byte limits, unchanged
+  file reuse, changed/deleted term replacement, dependency/secret/binary
+  exclusions, private-key block redaction, contentless FTS storage, compressed
+  subtitles, and bounded content queries.
+- Current Claude, Codex, Kimi Code, OpenCode, Aider, and Pi formats are parsed from
   sanitized temporary sources. Missing, malformed, unreadable-shape, and
   successful-empty sources exercise distinct scanner outcomes.
 - Configuration tests verify that malformed custom-tool configuration emits a
@@ -173,7 +198,7 @@ These are **not** claimed to have passed by local automation. They remain
 release gates and must be executed before release:
 
 - Real-user read-only scan of actually installed Claude/Codex/Kimi/OpenCode/
-  Aider data directories with project/session counts checked against the tool.
+  Aider/Pi data directories with project/session counts checked against the tool.
 - Cross-platform real terminal launch of `sessionatlas open` (Windows
   Terminal/cmd, macOS Terminal, and at least one Linux terminal).
 - Native Tauri interaction matrix T1–T9 (rapid A/B switching, docs/files close

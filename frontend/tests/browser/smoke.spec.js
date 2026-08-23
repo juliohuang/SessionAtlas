@@ -17,8 +17,43 @@ test("browser demo loads the real static application", async ({ page }) => {
   await expect(page.locator("#searchInput")).toBeVisible();
   await expect(page.locator("article.entry")).toHaveCount(7);
   await expect(page.locator("#ledgerCount")).toContainText("7");
+  await expect(page.locator('#filters [data-tool="pi"]')).toContainText("Pi Coding Agent");
   expect(errors).toEqual([]);
   expect(externalRequests).toEqual([]);
+});
+
+test("order modes keep every project visible while changing what appears first", async ({ page }) => {
+  await page.goto("/index.html");
+  const rows = page.locator("article.entry");
+  const firstName = () => rows.first().locator(".entry__name").textContent();
+
+  await expect(rows).toHaveCount(7);
+  await expect(page.locator('[data-project-order="priority"]')).toHaveClass(/is-active/);
+  await expect.poll(firstName).toBe("docs-garden");
+
+  await page.locator('[data-project-order="recent"]').click();
+  await expect(rows).toHaveCount(7);
+  await expect.poll(firstName).toBe("atlas-notes");
+
+  await page.locator('[data-project-order="name"]').click();
+  await expect(rows).toHaveCount(7);
+  await expect.poll(firstName).toBe("api-workbench");
+
+  await page.locator('[data-project-order="grouped"]').click();
+  await expect(rows).toHaveCount(7);
+  await expect(page.locator(".ledger__group")).toHaveCount(1);
+  await expect(rows.first()).toHaveAttribute("draggable", "true");
+});
+
+test("browser demo can find a project by indexed content", async ({ page }) => {
+  await page.goto("/index.html");
+
+  await page.locator("#searchInput").fill("full text search");
+
+  await expect(page.locator("article.entry")).toHaveCount(1);
+  await expect(page.locator(".entry__name")).toHaveText("atlas-notes");
+  await expect(page.locator(".entry__content-path")).toHaveText("README.md");
+  await expect(page.locator(".entry__content-snippet")).toContainText("full text search");
 });
 
 test("workspace redesign exposes project overview and terminal regions", async ({ page }) => {
@@ -28,9 +63,9 @@ test("workspace redesign exposes project overview and terminal regions", async (
   await expect(page).toHaveTitle("SessionAtlas");
   await expect(page.locator(".brand__name")).toHaveText("SessionAtlas");
   await expect(page.locator(".stage__overview")).toBeVisible();
-  await expect(page.locator("#termsSelectedLaunch")).toContainText("atlas-notes");
+  await expect(page.locator("#termsSelectedLaunch")).toContainText("docs-garden");
   await expect(page.locator(".overview__activity-row")).toHaveCount(1);
-  await expect(page.locator(".overview__session-row")).toHaveCount(1);
+  await expect(page.locator(".overview__session-row")).toHaveCount(0);
   await expect(page.locator(".workspace__head")).toBeVisible();
   await expect(page.locator("#termsEmpty")).toBeVisible();
   await expect(page.locator(".foot > .foot__row")).toHaveCount(1);
@@ -60,6 +95,7 @@ test("mocked Tauri mode publishes backend projects", async ({ page }) => {
       id: "mock-project",
       path: "C:\\workspace\\mock-project",
       name: "mock-project",
+      pathMissing: true,
       lastAccessedAt: "2026-08-03T00:00:00Z",
       gitBranch: "main",
       toolUsages: [{
@@ -96,11 +132,113 @@ test("mocked Tauri mode publishes backend projects", async ({ page }) => {
   await page.goto("/index.html");
 
   await expect(page.locator('article.entry[data-id="mock-project"]')).toBeVisible();
+  await expect(page.locator('article.entry[data-id="mock-project"]')).toHaveClass(/is-missing/);
+  await expect(page.locator('article.entry[data-id="mock-project"] .entry__missing-badge')).toHaveText("MISSING");
   await expect(page.locator("#ledgerCount")).toContainText("1");
   const calls = await page.evaluate(() => window.__invokeCalls.map(call => call.command));
   expect(calls).toContain("list_projects");
   expect(calls).toContain("list_groups");
+  const listPayload = await page.evaluate(() =>
+    window.__invokeCalls.find(call => call.command === "list_projects")?.payload,
+  );
+  expect(listPayload).toEqual({ limit: 10000 });
   expect(errors).toEqual([]);
+});
+
+test("large catalogs render compact rows without hidden expanded controls", async ({ page }) => {
+  await page.addInitScript(() => {
+    const projects = Array.from({ length: 2_000 }, (_, index) => ({
+      id: `project-${index}`,
+      path: `C:\\workspace\\project-${index}`,
+      name: `project-${index}`,
+      lastAccessedAt: new Date(Date.now() - index * 60_000).toISOString(),
+      gitBranch: "main",
+      toolUsages: [{
+        toolKey: "codex",
+        toolName: "Codex CLI",
+        lastUsedAt: new Date(Date.now() - index * 60_000).toISOString(),
+        sessionCount: index % 20,
+        lastSessionId: `session-${index}`,
+      }],
+    }));
+    window.__TAURI__ = {
+      core: {
+        invoke: async command => {
+          if (command === "list_projects") return projects;
+          if (command === "list_tools") return [{ toolKey: "codex", toolName: "Codex CLI" }];
+          if (command === "get_group_revision") return 0;
+          if (command === "get_git_info") return { isRepo: false, remotes: [] };
+          if (command === "list_group_assignments") return {};
+          if (command === "list_groups" || command === "list_sort_orders"
+              || command === "list_remote_projects" || command === "list_remote_servers"
+              || command === "list_opener_prefs" || command === "search_remote_projects") return [];
+          return null;
+        },
+      },
+      event: { listen: async () => () => {} },
+      window: { getCurrentWindow: () => ({ isMaximized: async () => false }) },
+    };
+  });
+
+  await page.goto("/index.html");
+
+  await expect(page.locator("article.entry")).toHaveCount(2_000);
+  await expect(page.locator(".entry__expanded")).toHaveCount(0);
+  await expect(page.locator("#ledger")).toHaveClass(/is-large/);
+  await page.locator('[data-project-order="name"]').click();
+  await expect(page.locator("article.entry")).toHaveCount(2_000);
+});
+
+test("content search shows the matching file and a text-only subtitle", async ({ page }) => {
+  await page.addInitScript(() => {
+    const base = {
+      id: "content-project",
+      path: "C:\\workspace\\content-project",
+      name: "content-project",
+      lastAccessedAt: "2026-08-16T00:00:00Z",
+      gitBranch: "main",
+      toolUsages: [{
+        toolKey: "codex",
+        toolName: "Codex CLI",
+        lastUsedAt: "2026-08-16T00:00:00Z",
+        sessionCount: 1,
+        lastSessionId: null,
+      }],
+    };
+    window.__TAURI__ = {
+      core: {
+        invoke: async (command, payload) => {
+          if (command === "list_projects") return [base];
+          if (command === "search_projects") {
+            return [{
+              ...base,
+              contentMatch: {
+                relativePath: "src/search.rs",
+                snippet: `fn ${payload.query}_symbol() { <unsafe-tag> }`,
+              },
+            }];
+          }
+          if (command === "list_tools") return [{ toolKey: "codex", toolName: "Codex CLI" }];
+          if (command === "get_group_revision") return 0;
+          if (command === "get_git_info") return { isRepo: false, remotes: [] };
+          if (command === "list_group_assignments") return {};
+          if (command === "list_groups" || command === "list_sort_orders"
+              || command === "list_remote_projects" || command === "list_remote_servers"
+              || command === "list_opener_prefs" || command === "search_remote_projects") return [];
+          return null;
+        },
+      },
+      event: { listen: async () => () => {} },
+      window: { getCurrentWindow: () => ({ isMaximized: async () => false }) },
+    };
+  });
+
+  await page.goto("/index.html");
+  await page.locator("#searchInput").fill("distinctive_content");
+
+  await expect(page.locator(".entry__content-path")).toHaveText("src/search.rs");
+  await expect(page.locator(".entry__content-snippet")).toContainText("distinctive_content_symbol");
+  await expect(page.locator("unsafe-tag")).toHaveCount(0);
 });
 
 test("primary reload failure clears the previous search count", async ({ page }) => {
@@ -202,6 +340,7 @@ test("search-view reorder submits the complete catalog including hidden members"
 
   await page.goto("/index.html");
   await expect(page.locator("article.entry")).toHaveCount(3);
+  await page.locator('[data-project-order="grouped"]').click();
   await page.locator("#searchInput").fill("match");
   await expect(page.locator("article.entry")).toHaveCount(2);
 

@@ -20,6 +20,7 @@
 //! | opencode | R05B     |
 //! | aider    | R05C     |
 //! | custom   | R05C     |
+//! | pi       | current  |
 
 pub mod aider;
 pub mod base;
@@ -29,6 +30,7 @@ pub mod custom;
 pub mod kimi;
 pub mod opencode;
 pub mod parsing;
+pub mod pi;
 
 pub use base::{
     complete_session_files, missing_source, probe_directory, probe_file, source_read_failure,

@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
+use sessionatlas_core::indexer::{build_index, IndexedToolScan};
 use sessionatlas_core::path;
 use sessionatlas_core::scanner::kimi::KimiScanner;
 use sessionatlas_core::scanner::opencode::OpenCodeScanner;
@@ -588,6 +589,67 @@ fn insert_opencode_row(
             rusqlite::params![session_id, project_id, directory, session_updated],
         )
         .unwrap();
+}
+
+#[test]
+fn kimi_and_opencode_keep_missing_configured_projects_for_index_marking() {
+    let dir = tempfile::tempdir().unwrap();
+    with_home(dir.path(), || {
+        let kimi_path = home_join(dir.path(), "gone/kimi-project");
+        let opencode_path = home_join(dir.path(), "gone/opencode-project");
+        assert!(!Path::new(&kimi_path).exists());
+        assert!(!Path::new(&opencode_path).exists());
+
+        let kimi_source = kimi_sessions(dir.path());
+        write_kimi_state(
+            &kimi_source,
+            "missing-worktree",
+            "kimi-missing",
+            kimi_state(Some(&kimi_path), Some("2026-08-16T03:00:00Z")),
+        );
+
+        let database_path = opencode_home_db(dir.path());
+        let connection = create_opencode_db(&database_path);
+        let updated = unix_millis("2026-08-16T04:00:00Z");
+        insert_opencode_row(
+            &connection,
+            "opencode-missing",
+            "project-missing",
+            &opencode_path,
+            &opencode_path,
+            updated,
+            updated,
+        );
+        drop(connection);
+
+        let kimi = KimiScanner::with_availability(|| false).scan();
+        let opencode = OpenCodeScanner::with_availability(|| false).scan();
+        assert_eq!(kimi.status(), ScanStatus::Succeeded);
+        assert_eq!(opencode.status(), ScanStatus::Succeeded);
+
+        let indexed = build_index(&[
+            IndexedToolScan {
+                tool_key: "kimi".to_string(),
+                tool_name: "Kimi Code".to_string(),
+                projects: kimi.into_projects(),
+            },
+            IndexedToolScan {
+                tool_key: "opencode".to_string(),
+                tool_name: "OpenCode".to_string(),
+                projects: opencode.into_projects(),
+            },
+        ]);
+        assert_eq!(indexed.len(), 2);
+        assert!(indexed.iter().all(|project| project.path_missing));
+        assert!(indexed.iter().any(|project| {
+            project.path == path::normalize_native(&kimi_path).unwrap()
+                && project.tool_usages[0].tool_key == "kimi"
+        }));
+        assert!(indexed.iter().any(|project| {
+            project.path == path::normalize_native(&opencode_path).unwrap()
+                && project.tool_usages[0].tool_key == "opencode"
+        }));
+    });
 }
 
 #[test]

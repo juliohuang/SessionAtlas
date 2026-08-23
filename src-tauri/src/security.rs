@@ -57,7 +57,11 @@ pub(crate) fn tool_launch_argv(
 ) -> Result<Vec<String>, String> {
     let mut args = vec![validate_tool_key(tool_key)?.to_string()];
     if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
-        args.push("--resume".to_string());
+        args.push(if tool_key.eq_ignore_ascii_case("pi") {
+            "--session".to_string()
+        } else {
+            "--resume".to_string()
+        });
         args.push(validate_session_id(session_id)?.to_string());
     }
     Ok(args)
@@ -311,6 +315,10 @@ mod tests {
         assert_eq!(
             build_tool_launch_input(Some("codex"), Some("session-123")).unwrap(),
             Some("codex --resume session-123\r".to_string())
+        );
+        assert_eq!(
+            build_tool_launch_input(Some("pi"), Some("session-123")).unwrap(),
+            Some("pi --session session-123\r".to_string())
         );
         assert!(build_tool_launch_input(Some("codex & calc"), None).is_err());
         assert!(build_tool_launch_input(Some("codex"), Some("ok\rwhoami")).is_err());

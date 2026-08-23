@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
+use sessionatlas_core::indexer::{build_index, IndexedToolScan};
 use sessionatlas_core::model::ToolSource;
 use sessionatlas_core::path;
 use sessionatlas_core::scanner::aider::AiderScanner;
@@ -92,6 +93,14 @@ fn aider_discovers_history_marker_from_metadata_only() {
         assert_eq!(outcome.projects()[0].last_accessed_at, modified);
         assert_eq!(outcome.projects()[0].session_id, None);
         assert!(outcome.diagnostics().is_empty());
+
+        let indexed = build_index(&[IndexedToolScan {
+            tool_key: "aider".to_string(),
+            tool_name: "Aider".to_string(),
+            projects: outcome.into_projects(),
+        }]);
+        assert_eq!(indexed.len(), 1);
+        assert!(!indexed[0].path_missing);
     });
 }
 

@@ -2,18 +2,21 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sessionatlas_core::config as core_config;
+use sessionatlas_core::content_index::content_match_snippet;
 use sessionatlas_core::indexer::{build_index, IndexedToolScan};
+use sessionatlas_core::model::project_path_missing;
 use sessionatlas_core::scanner::aider::AiderScanner;
 use sessionatlas_core::scanner::claude::ClaudeScanner;
 use sessionatlas_core::scanner::codex::CodexScanner;
 use sessionatlas_core::scanner::custom::CustomToolScanner;
 use sessionatlas_core::scanner::kimi::KimiScanner;
 use sessionatlas_core::scanner::opencode::OpenCodeScanner;
+use sessionatlas_core::scanner::pi::PiScanner;
 use sessionatlas_core::scanner::{
     ScanDiagnostic, ScanDiagnosticSeverity, Scanner, CONFIG_READ_FAILED, UNEXPECTED_SCANNER_FAILURE,
 };
 use sessionatlas_core::store::SqliteStore;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -110,7 +113,7 @@ fn load_cli_config() -> Result<CliConfigFile, String> {
 }
 
 fn builtin_tool_key(tool_key: &str) -> Option<&'static str> {
-    ["claude", "codex", "kimi", "opencode", "aider"]
+    ["claude", "codex", "kimi", "opencode", "aider", "pi"]
         .into_iter()
         .find(|builtin| builtin.eq_ignore_ascii_case(tool_key))
 }
@@ -169,12 +172,23 @@ pub struct Project {
     id: String,
     path: String,
     name: String,
+    #[serde(rename = "pathMissing")]
+    path_missing: bool,
     #[serde(rename = "lastAccessedAt")]
     last_accessed_at: String,
     #[serde(rename = "gitBranch")]
     git_branch: Option<String>,
     #[serde(rename = "toolUsages")]
     tool_usages: Vec<ToolUsage>,
+    #[serde(rename = "contentMatch", skip_serializing_if = "Option::is_none")]
+    content_match: Option<ProjectContentMatch>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ProjectContentMatch {
+    #[serde(rename = "relativePath")]
+    relative_path: String,
+    snippet: Option<String>,
 }
 
 /// A user-added SSH server. Frontend gets this verbatim and renders the
@@ -294,6 +308,8 @@ pub struct RemoteProject {
     path: String,
     #[serde(rename = "name")]
     name: String,
+    #[serde(rename = "pathMissing")]
+    path_missing: bool,
     #[serde(rename = "lastAccessedAt")]
     last_accessed_at: String,
     #[serde(rename = "gitBranch")]
@@ -577,9 +593,11 @@ fn row_to_project(
         id: id.to_string(),
         path: path.to_string(),
         name,
+        path_missing: project_path_missing(path),
         last_accessed_at: last.to_string(),
         git_branch: branch,
         tool_usages: usages,
+        content_match: None,
     }
 }
 
@@ -592,35 +610,41 @@ fn fetch_usages_by_project(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT project_id, tool_name, tool_key, last_used_at, session_count, last_session_id
-         FROM tool_usages
-         WHERE project_id IN ({placeholders})
-         ORDER BY last_used_at DESC"
-    );
-    let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
-    let params_vec: Vec<&dyn rusqlite::ToSql> =
-        ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-    let rows = stmt
-        .query_map(params_vec.as_slice(), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                ToolUsage {
-                    tool_key: r.get::<_, String>(2)?,
-                    tool_name: r.get::<_, String>(1)?,
-                    last_used_at: r.get::<_, String>(3)?,
-                    session_count: r.get::<_, i64>(4)?,
-                    last_session_id: r.get::<_, Option<String>>(5)?,
-                },
-            ))
-        })
-        .map_err(|e| e.to_string())?;
     let mut map: HashMap<String, Vec<ToolUsage>> = HashMap::new();
-    for row in collect_query_rows(rows, "fetch_usages_by_project")? {
-        map.entry(row.0).or_default().push(row.1);
+    // Stay well below SQLite's variable limit. The frontend may request a
+    // catalog of 10,000 projects, so one giant IN clause is not portable.
+    for id_batch in ids.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", id_batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT project_id, tool_name, tool_key, last_used_at, session_count, last_session_id
+             FROM tool_usages
+             WHERE project_id IN ({placeholders})
+             ORDER BY last_used_at DESC"
+        );
+        let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+        let params_vec: Vec<&dyn rusqlite::ToSql> = id_batch
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(params_vec.as_slice(), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    ToolUsage {
+                        tool_key: r.get::<_, String>(2)?,
+                        tool_name: r.get::<_, String>(1)?,
+                        last_used_at: r.get::<_, String>(3)?,
+                        session_count: r.get::<_, i64>(4)?,
+                        last_session_id: r.get::<_, Option<String>>(5)?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in collect_query_rows(rows, "fetch_usages_by_project")? {
+            map.entry(row.0).or_default().push(row.1);
+        }
     }
     Ok(map)
 }
@@ -670,9 +694,27 @@ fn projects_from_rows(c: &Connection, rows: Vec<ProjectRow>) -> Result<Vec<Proje
 fn is_excluded_project_path(path: &str) -> bool {
     let home = app_home_directory();
     let p = std::path::Path::new(path);
-    [".claude", ".codex", ".kimi", ".opencode", ".aider"]
+    [".claude", ".codex", ".kimi", ".opencode", ".aider", ".pi"]
         .iter()
         .any(|sub| p.starts_with(home.join(sub)))
+}
+
+fn collect_visible_project_rows<I>(rows: I, limit: usize) -> Result<Vec<ProjectRow>, String>
+where
+    I: IntoIterator<Item = rusqlite::Result<ProjectRow>>,
+{
+    let mut visible = Vec::with_capacity(limit);
+    for row in rows {
+        let row = row.map_err(|error| format!("list_projects: {error}"))?;
+        if is_excluded_project_path(&row.1) {
+            continue;
+        }
+        visible.push(row);
+        if visible.len() == limit {
+            break;
+        }
+    }
+    Ok(visible)
 }
 
 #[tauri::command]
@@ -684,16 +726,11 @@ fn list_projects(limit: Option<i64>) -> Result<Vec<Project>, String> {
         let mut stmt = c
             .prepare("SELECT id, path, last_accessed_at, git_branch FROM projects ORDER BY last_accessed_at DESC")
             .map_err(|e| e.to_string())?;
-        let decoded_rows: Vec<ProjectRow> = collect_query_rows(
+        let rows = collect_visible_project_rows(
             stmt.query_map([], row_to_project_fields)
                 .map_err(|e| e.to_string())?,
-            "list_projects",
+            limit,
         )?;
-        let rows: Vec<ProjectRow> = decoded_rows
-            .into_iter()
-            .filter(|r| !is_excluded_project_path(&r.1))
-            .take(limit)
-            .collect();
         projects_from_rows(c, rows)
     })
 }
@@ -708,45 +745,177 @@ fn validate_project_limit(limit: Option<i64>) -> Result<usize, String> {
 
 #[tauri::command]
 fn search_projects(query: String) -> Result<Vec<Project>, String> {
-    let Some(pattern) = build_fts_prefix_query(&query) else {
+    with_index(|connection| search_projects_in_connection(connection, &query))
+}
+
+fn search_projects_in_connection(
+    connection: &Connection,
+    query: &str,
+) -> Result<Vec<Project>, String> {
+    let Some(pattern) = build_fts_prefix_query(query) else {
         return Ok(Vec::new());
     };
-    with_index(|c| {
-        let mut stmt = c
-            .prepare(
-                "SELECT p.id, p.path, p.last_accessed_at, p.git_branch
+    let mut stmt = connection
+        .prepare(
+            "SELECT p.id, p.path, p.last_accessed_at, p.git_branch
                  FROM projects p
                  WHERE p.rowid IN (SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1)
-                 ORDER BY p.last_accessed_at DESC",
-            )
-            .map_err(|e| e.to_string())?;
-        let decoded_rows: Vec<ProjectRow> = collect_query_rows(
-            stmt.query_map(params![pattern], row_to_project_fields)
+                 ORDER BY p.last_accessed_at DESC
+                 LIMIT 400",
+        )
+        .map_err(|e| e.to_string())?;
+    let direct_rows: Vec<ProjectRow> = collect_query_rows(
+        stmt.query_map(params![pattern], row_to_project_fields)
+            .map_err(|e| e.to_string())?,
+        "search_projects",
+    )?;
+    drop(stmt);
+
+    let mut ordered_ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut row_map: HashMap<String, ProjectRow> = HashMap::new();
+    for row in direct_rows {
+        if seen.insert(row.0.clone()) {
+            ordered_ids.push(row.0.clone());
+        }
+        row_map.insert(row.0.clone(), row);
+    }
+
+    let mut content_matches = HashMap::new();
+    if content_index_available(connection)? {
+        if let Some(content_pattern) = build_content_fts_prefix_query(query) {
+            let mut stmt = connection
+                .prepare(
+                    "SELECT content_file.project_id, content_file.relative_path,
+                            content_file.compressed_preview,
+                            bm25(project_content_fts, 8.0, 1.0) AS rank
+                     FROM project_content_fts
+                     JOIN project_content_files content_file
+                       ON content_file.id = project_content_fts.rowid
+                     WHERE project_content_fts MATCH ?1
+                     ORDER BY rank
+                     LIMIT 600",
+                )
+                .map_err(|e| e.to_string())?;
+            let hits = collect_query_rows(
+                stmt.query_map(params![content_pattern], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
                 .map_err(|e| e.to_string())?,
-            "search_projects",
-        )?;
-        let rows: Vec<ProjectRow> = decoded_rows
-            .into_iter()
-            .filter(|r| !is_excluded_project_path(&r.1))
-            .take(200)
+                "search_project_content",
+            )?;
+            for (project_id, relative_path, compressed_preview) in hits {
+                content_matches
+                    .entry(project_id.clone())
+                    .or_insert_with(|| ProjectContentMatch {
+                        relative_path,
+                        snippet: content_match_snippet(&compressed_preview, query, 180),
+                    });
+                if seen.insert(project_id.clone()) {
+                    ordered_ids.push(project_id);
+                }
+            }
+        }
+    }
+    ordered_ids.truncate(400);
+
+    let missing_ids: Vec<String> = ordered_ids
+        .iter()
+        .filter(|id| !row_map.contains_key(*id))
+        .cloned()
+        .collect();
+    row_map.extend(fetch_project_rows_by_ids(connection, &missing_ids)?);
+    let rows: Vec<ProjectRow> = ordered_ids
+        .iter()
+        .filter_map(|id| row_map.remove(id))
+        .filter(|row| !is_excluded_project_path(&row.1))
+        .take(200)
+        .collect();
+    let mut projects = projects_from_rows(connection, rows)?;
+    for project in &mut projects {
+        project.content_match = content_matches.remove(&project.id);
+    }
+    Ok(projects)
+}
+
+fn content_index_available(connection: &Connection) -> Result<bool, String> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type IN ('table', 'view')
+               AND name IN ('project_content_files', 'project_content_fts')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(count == 2)
+}
+
+fn fetch_project_rows_by_ids(
+    connection: &Connection,
+    ids: &[String],
+) -> Result<HashMap<String, ProjectRow>, String> {
+    let mut rows_by_id = HashMap::new();
+    for id_batch in ids.chunks(500) {
+        if id_batch.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", id_batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, path, last_accessed_at, git_branch
+             FROM projects WHERE id IN ({placeholders})"
+        );
+        let mut stmt = connection
+            .prepare(&sql)
+            .map_err(|error| error.to_string())?;
+        let parameters: Vec<&dyn rusqlite::ToSql> = id_batch
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
             .collect();
-        projects_from_rows(c, rows)
-    })
+        let rows = collect_query_rows(
+            stmt.query_map(parameters.as_slice(), row_to_project_fields)
+                .map_err(|error| error.to_string())?,
+            "fetch_project_rows_by_ids",
+        )?;
+        rows_by_id.extend(rows.into_iter().map(|row| (row.0.clone(), row)));
+    }
+    Ok(rows_by_id)
 }
 
 fn build_fts_prefix_query(query: &str) -> Option<String> {
+    build_fts_prefix_query_with_minimum(query, 1)
+}
+
+fn build_content_fts_prefix_query(query: &str) -> Option<String> {
+    build_fts_prefix_query_with_minimum(query, 2)
+}
+
+fn build_fts_prefix_query_with_minimum(query: &str, minimum_chars: usize) -> Option<String> {
     let mut terms = Vec::new();
     let mut current = String::new();
-    for character in query.chars() {
+    for character in query.chars().take(256) {
         if character.is_alphanumeric() || character == '_' {
             current.push(character);
             continue;
         }
         if !current.is_empty() {
-            terms.push(std::mem::take(&mut current));
+            if current.chars().count() >= minimum_chars {
+                terms.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+            if terms.len() == 12 {
+                break;
+            }
         }
     }
-    if !current.is_empty() {
+    if terms.len() < 12 && current.chars().count() >= minimum_chars {
         terms.push(current);
     }
     if terms.is_empty() {
@@ -790,8 +959,8 @@ fn list_tools() -> Result<Vec<Tool>, String> {
 }
 
 /// Builds the canonical scanner set for the config file at `config_path`: the
-/// five built-in scanners in C# registration order (Claude, Kimi, Codex,
-/// OpenCode, Aider), then each enabled custom tool whose key does not collide
+/// six built-in scanners (Claude, Kimi, Codex, OpenCode, Aider, Pi), then each
+/// enabled custom tool whose key does not collide
 /// with a built-in (case-insensitive). When the config cannot be read or
 /// parsed, built-ins remain available and a `config_read_failed` warning is
 /// returned, mirroring `ScannerRegistry` and `commands::scan::build_default_scanners`.
@@ -802,6 +971,7 @@ fn build_scan_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec<ScanDi
         Box::new(CodexScanner::new()),
         Box::new(OpenCodeScanner::new()),
         Box::new(AiderScanner::new()),
+        Box::new(PiScanner::new()),
     ];
     let mut diagnostics = Vec::new();
     match core_config::load(config_path) {
@@ -885,6 +1055,10 @@ fn run_scan_with_scanners(
     store
         .replace_tool_snapshots(&projects, &scanned_keys)
         .map_err(|error| format!("could not update index: {error}"))?;
+    // Content is a secondary, rebuildable cache. A content-index failure must
+    // not turn a committed project snapshot into a false scan failure; the
+    // next rescan retries while name/path search remains usable.
+    let _ = store.refresh_project_content_index();
     count_index_projects(db_path)
 }
 
@@ -943,8 +1117,8 @@ async fn scan_projects() -> Result<i64, String> {
 }
 
 /// Launch an AI CLI in the project directory via an external terminal.
-/// When `session_id` is given, appends `--resume <id>` so the CLI reopens
-/// the recorded session.
+/// When `session_id` is given, appends the selected tool's native resume
+/// arguments so the CLI reopens the recorded session.
 #[tauri::command]
 fn launch_project(
     path: String,
@@ -2913,7 +3087,7 @@ fn test_remote_connection(
 /// `~/.claude` / `~/.codex` etc. as project entries on the remote.
 fn is_remote_path_excluded(path: &str, remote_home: &str) -> bool {
     let normalized = path.trim_end_matches('/');
-    for suffix in [".claude", ".codex", ".kimi", ".opencode", ".aider"] {
+    for suffix in [".claude", ".codex", ".kimi", ".opencode", ".aider", ".pi"] {
         // match "<home>/.claude" or "<home>/.claude/..." (any depth).
         let exact = format!("{remote_home}/{suffix}");
         let nested = format!("{exact}/");
@@ -3687,6 +3861,7 @@ fn list_remote_projects() -> Result<Vec<RemoteProject>, String> {
                 remote_server_id: server_id,
                 path,
                 name,
+                path_missing: false,
                 last_accessed_at,
                 git_branch,
                 tool_usages,
@@ -3741,6 +3916,7 @@ fn search_remote_projects(query: String) -> Result<Vec<RemoteProject>, String> {
                 remote_server_id: server_id,
                 path,
                 name,
+                path_missing: false,
                 last_accessed_at,
                 git_branch,
                 tool_usages,
@@ -4817,6 +4993,53 @@ mod baseline_tests {
     }
 
     #[test]
+    fn limited_project_rows_stop_decoding_after_the_visible_window() {
+        let valid = (
+            "visible".to_string(),
+            "/definitely-visible-project".to_string(),
+            "2026-01-01".to_string(),
+            None,
+        );
+        let rows = vec![Ok(valid), Err(rusqlite::Error::InvalidQuery)];
+
+        let result = collect_visible_project_rows(rows, 1).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "visible");
+    }
+
+    #[test]
+    fn usage_fetch_chunks_catalogs_larger_than_sqlite_variable_limit() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tool_usages (
+                    project_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    tool_key TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    session_count INTEGER NOT NULL,
+                    last_session_id TEXT
+                );",
+            )
+            .unwrap();
+        let ids: Vec<String> = (0..1_200).map(|index| format!("p-{index}")).collect();
+        for id in &ids {
+            connection
+                .execute(
+                    "INSERT INTO tool_usages VALUES (?1, 'Codex CLI', 'codex', '2026-01-01', 1, NULL)",
+                    [id],
+                )
+                .unwrap();
+        }
+
+        let usages = fetch_usages_by_project(&connection, &ids).unwrap();
+
+        assert_eq!(usages.len(), ids.len());
+        assert!(ids.iter().all(|id| usages[id].len() == 1));
+    }
+
+    #[test]
     fn malformed_existing_group_is_not_treated_as_missing() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
@@ -5488,6 +5711,10 @@ mod baseline_tests {
             "/home/demo/.codex/sessions",
             "/home/demo"
         ));
+        assert!(is_remote_path_excluded(
+            "/home/demo/.pi/agent/sessions",
+            "/home/demo"
+        ));
         assert!(!is_remote_path_excluded(
             "/home/demo/projects/.codex-example",
             "/home/demo"
@@ -5778,6 +6005,15 @@ mod baseline_tests {
             "\"alpha\"* AND \"beta\"* AND \"OR\"* AND \"gamma\"*"
         );
         assert_eq!(build_fts_prefix_query("\" * -"), None);
+        assert_eq!(build_content_fts_prefix_query("a"), None);
+        assert_eq!(build_content_fts_prefix_query("ab"), Some("\"ab\"*".into()));
+        assert_eq!(
+            build_content_fts_prefix_query(&"term ".repeat(20))
+                .unwrap()
+                .matches("\"term\"*")
+                .count(),
+            12
+        );
 
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -5795,6 +6031,67 @@ mod baseline_tests {
             )
             .unwrap();
         assert_eq!(matches, 1);
+    }
+
+    #[test]
+    fn content_search_returns_project_file_and_compressed_subtitle() {
+        let root = std::env::temp_dir().join(format!(
+            "sessionatlas-content-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(project_dir.join("src")).unwrap();
+        std::fs::write(
+            project_dir.join("src/search.rs"),
+            "pub fn distinctive_content_symbol() {}\n",
+        )
+        .unwrap();
+        let db = root.join("index.db");
+        drop(SqliteStore::new(&db).unwrap());
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects
+                    (id, path, last_accessed_at, first_seen_at, git_branch, git_remote_url)
+                 VALUES ('content-fixture', ?1, '2026-08-16T00:00:00Z',
+                         '2026-08-16T00:00:00Z', 'main', NULL)",
+                params![project_dir.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tool_usages
+                    (project_id, tool_name, tool_key, last_used_at, session_count, last_session_id)
+                 VALUES ('content-fixture', 'Codex CLI', 'codex',
+                         '2026-08-16T00:00:00Z', 1, NULL)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut store = SqliteStore::new(&db).unwrap();
+        store.refresh_project_content_index().unwrap();
+        drop(store);
+        let connection =
+            Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+
+        let results = search_projects_in_connection(&connection, "distinctive_content").unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "content-fixture");
+        let content_match = results[0].content_match.as_ref().unwrap();
+        assert_eq!(content_match.relative_path, "src/search.rs");
+        assert!(content_match
+            .snippet
+            .as_deref()
+            .unwrap()
+            .contains("distinctive_content_symbol"));
+        drop(connection);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

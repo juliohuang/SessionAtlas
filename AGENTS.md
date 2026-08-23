@@ -52,10 +52,13 @@ libraries. CLI and Tauri are I/O adapters over the same core.
 
 ### `sessionatlas-core` (`crates/sessionatlas-core`)
 - **`src/model.rs`** — `Project`, `ToolUsage`, `Session`, `ToolSource`; identity and defaults.
+- **`src/content_index.rs`** — bounded/incremental source and documentation
+  discovery. Excludes dependencies, build output, AI-session data, credential
+  shapes, binary/oversized files; stores only FTS terms plus compressed previews.
 - **`src/path.rs`** — path normalization, root-path display, and same-or-child
   parent/child semantics (Windows case-insensitive, Unix byte-sensitive).
 - **`src/scanner/`** — one `Scanner` per AI tool (`claude`, `codex`, `kimi`,
-  `opencode`, `aider`) plus a runtime-configured `custom` scanner; `base.rs`
+  `opencode`, `aider`, `pi`) plus a runtime-configured `custom` scanner; `base.rs`
   holds the shared driver, `parsing.rs` the shared time/record parsers. A
   structured `ScanOutcome` keeps a trustworthy empty snapshot distinct from
   unavailable or failed input.
@@ -63,7 +66,8 @@ libraries. CLI and Tauri are I/O adapters over the same core.
   touched by multiple tools collapses into one `Project` with multiple
   `ToolUsage` entries. Reads `.git/HEAD` for `GitBranch`.
 - **`src/store.rs`** — `~/.sessionatlas/index.db`. Tables: `projects`,
-  `tool_usages`, `sessions`, plus FTS5 `projects_fts`. Snapshot replacement,
+  `tool_usages`, `sessions`, content metadata/status, plus FTS5 `projects_fts`
+  and contentless `project_content_fts`. Snapshot replacement,
   orphan cleanup, activity-time recomputation, and FTS rebuild happen in one
   SQLite transaction. Schema created/migrated idempotently.
 - **`src/config.rs`** — `~/.sessionatlas/config.json` (custom tools, per-path
@@ -84,7 +88,9 @@ in `src/commands/`; rendering and safe selection in `src/render.rs` /
 ### Tauri console (`src-tauri/src/lib.rs` + `frontend/`)
 
 **Data source**: opens the CLI's `~/.sessionatlas/index.db` read-only (see
-`db_path()`); expected tables `projects`, `tool_usages`, `projects_fts` (FTS5).
+`db_path()`); expected tables include `projects`, `tool_usages`, `projects_fts`
+and the optional content-index tables. Older indexes still support name/path
+search until the next scan creates the content index.
 `scan_projects` invokes the `sessionatlas-core` scan pipeline **in-process** on
 `spawn_blocking` — it does not spawn a sidecar or subprocess — then returns
 `COUNT(*)`. CLI and Tauri share the same `index.db`; reads are read-only and
@@ -136,7 +142,7 @@ is in `docs/execution-security-contract.md`.
 ## Conventions
 
 - Data dir for all components: `~/.sessionatlas/` (`index.db`, `config.json`, `prefs.db`). `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
-- Tool keys are lowercase short strings (`claude`, `codex`, `kimi`, `opencode`, `aider`) — keep consistent across CLI scanners, launcher templates, config, and the Tauri `TOOL_COLOR`/`TOOL_DOT` maps.
+- Tool keys are lowercase short strings (`claude`, `codex`, `kimi`, `opencode`, `aider`, `pi`) — keep consistent across CLI scanners, launcher templates, config, and the Tauri `TOOL_COLOR`/`TOOL_DOT` maps.
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` must stay green; use `#![deny(...)]`/strict clippy where the code already does.
 - Tauri frontend: keyboard is first-class (`/` search, `Esc` clear, `↑↓` nav, `Enter` launch) — don't break these. Match existing CSS tokens in `styles.css` rather than introducing new design primitives.
 - `DESIGN.md` holds the current Rust architecture/data-flow/security design; this file is the shorter engineering reference.

@@ -21,6 +21,7 @@
 //! | launcher  | R10      |
 
 pub mod config;
+pub mod content_index;
 pub mod indexer;
 pub mod launcher;
 pub mod model;

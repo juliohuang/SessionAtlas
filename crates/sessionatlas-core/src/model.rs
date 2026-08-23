@@ -79,6 +79,10 @@ pub struct Project {
     pub id: String,
     /// Absolute project path (unique identity).
     pub path: String,
+    /// The tool still references this project, but its local directory is gone.
+    /// Recomputed from the filesystem whenever a snapshot is built or read.
+    #[serde(default)]
+    pub path_missing: bool,
     #[serde(with = "rfc3339")]
     pub last_accessed_at: DateTime<Utc>,
     #[serde(with = "rfc3339")]
@@ -114,12 +118,24 @@ impl Default for Project {
         Self {
             id: generate_id(),
             path: String::new(),
+            path_missing: false,
             last_accessed_at: DateTime::<Utc>::MIN_UTC,
             first_seen_at: Utc::now(),
             git_branch: None,
             git_remote_url: None,
             tool_usages: Vec::new(),
         }
+    }
+}
+
+/// Returns `true` only when a project path is conclusively absent or is no
+/// longer a directory. Permission and transient I/O failures are not labelled
+/// as missing because the directory may still exist but be temporarily
+/// inaccessible.
+pub fn project_path_missing(path: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => !metadata.is_dir(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 

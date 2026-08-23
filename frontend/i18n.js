@@ -37,7 +37,7 @@ const STRINGS = {
     "group.deleteTitle": "delete group",
 
     // ── search / top deck ──
-    "search.placeholder": "query the archive — name, path, fragment…",
+    "search.placeholder": "search projects — name, path, source, docs…",
     "search.rescan": "Rescan all instruments",
     "search.rescanLabel": "RESCAN",
     "search.settingsTitle": "Openers & settings",
@@ -58,13 +58,15 @@ const STRINGS = {
     // ── filter chips ──
     "filter.all": "ALL",
     "filter.toolsLabel": "Tools",
-    "filter.recencyLabel": "Activity",
-    "filter.recencyAll": "all",
-    "filter.recency24h": "24h",
-    "filter.recency7d": "7d",
-    "filter.recency30d": "30d",
+    "filter.orderLabel": "Order",
+    "filter.orderPriority": "Priority",
+    "filter.orderRecent": "Recent",
+    "filter.orderName": "Name",
+    "filter.orderGrouped": "Groups",
+    "filter.orderPriorityHint": "Live, available, recently active, and frequently used projects first",
+    "filter.orderGroupedHint": "Show groups and enable drag-to-adjust manual order",
     "filter.byInstrument": "filter by instrument",
-    "filter.byRecency": "filter by recency",
+    "filter.byOrder": "order projects",
 
     // ── project overview ──
     "overview.aria": "Project overview",
@@ -125,7 +127,7 @@ const STRINGS = {
     // ── ledger ──
     "ledger.count.matches_one": `<strong>{count}</strong> match for “{query}”`,
     "ledger.count.matches_other": `<strong>{count}</strong> matches for “{query}”`,
-    "ledger.count.recency": `<strong>{shown}</strong> of {total} in last {label}`,
+    "ledger.count.visible": `<strong>{shown}</strong> of {total} projects`,
     "ledger.count.capped": `showing first <strong>{limit}</strong> of more — narrow with search`,
     "ledger.count.entries_one": `<strong>{count}</strong> entry indexed`,
     "ledger.count.entries_other": `<strong>{count}</strong> entries indexed`,
@@ -141,6 +143,8 @@ const STRINGS = {
     "entry.showFileTree": "Show file tree",
     "entry.more": "more",
     "entry.remoteTooltip": "remote: {label}",
+    "entry.pathMissing": "Project folder is missing. The project is retained because an AI tool still references it.",
+    "entry.pathMissingBadge": "MISSING",
     "entry.noInstruments": "No recorded instruments.",
     "entry.noInstrumentsHint": `No recorded instruments. Use “+ plain shell” to start a fresh terminal.`,
     "entry.label.group": "Group",
@@ -370,7 +374,7 @@ const STRINGS = {
     "group.deleteTitle": "删除分组",
 
     // ── search / top deck ──
-    "search.placeholder": "查询归档 — 名称、路径、片段…",
+    "search.placeholder": "搜索项目 — 名称、路径、源码、文档…",
     "search.rescan": "重新扫描所有工具",
     "search.rescanLabel": "重新扫描",
     "search.settingsTitle": "打开器与设置",
@@ -391,13 +395,15 @@ const STRINGS = {
     // ── filter chips ──
     "filter.all": "全部",
     "filter.toolsLabel": "工具",
-    "filter.recencyLabel": "活跃时间",
-    "filter.recencyAll": "全部",
-    "filter.recency24h": "24小时",
-    "filter.recency7d": "7天",
-    "filter.recency30d": "30天",
+    "filter.orderLabel": "排序",
+    "filter.orderPriority": "重要",
+    "filter.orderRecent": "最近",
+    "filter.orderName": "名称",
+    "filter.orderGrouped": "分组",
+    "filter.orderPriorityHint": "活动会话、目录可用、近期活跃且经常使用的项目优先",
+    "filter.orderGroupedHint": "显示分组，并可拖动调整手动顺序",
     "filter.byInstrument": "按工具筛选",
-    "filter.byRecency": "按时间筛选",
+    "filter.byOrder": "调整项目顺序",
 
     // ── 项目概览 ──
     "overview.aria": "项目概览",
@@ -456,7 +462,7 @@ const STRINGS = {
 
     // ── ledger ──
     "ledger.count.matches_other": `<strong>{count}</strong> 条匹配“{query}”`,
-    "ledger.count.recency": `最近 {label}：共 <strong>{shown}</strong> / {total} 个`,
+    "ledger.count.visible": `显示 <strong>{shown}</strong> / {total} 个项目`,
     "ledger.count.capped": `仅显示前 <strong>{limit}</strong> 个，更多请用搜索缩小范围`,
     "ledger.count.entries_other": `已索引 <strong>{count}</strong> 个条目`,
     "ledger.emptyTitle": "归档为空",
@@ -471,6 +477,8 @@ const STRINGS = {
     "entry.showFileTree": "显示文件树",
     "entry.more": "更多",
     "entry.remoteTooltip": "远程：{label}",
+    "entry.pathMissing": "项目目录不存在；由于 AI 工具仍有记录，该项目会继续保留。",
+    "entry.pathMissingBadge": "缺失",
     "entry.noInstruments": "暂无已记录的工具。",
     "entry.noInstrumentsHint": "暂无已记录的工具。点击“+ 纯 Shell”启动一个新终端。",
     "entry.label.group": "分组",

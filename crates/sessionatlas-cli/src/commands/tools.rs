@@ -1,7 +1,7 @@
 //! Built-in tool identities and input validation shared by `scan` and `config`.
 //!
 //! Task R09 owns the `scan`/`config` surface but not `sessionatlas-core`, whose
-//! `security` module is reserved for R10. The five built-in keys and the
+//! `security` module is reserved for R10. The six built-in keys and the
 //! value validators therefore live here, mirroring
 //! `Core/Process/CommandSecurity.cs` and the `reservedKeys` list in
 //! `CLI/Commands/ConfigCommand.cs` so `config add-tool` and the custom-tool
@@ -10,10 +10,10 @@
 /// Shell metacharacters that are never allowed inside a configured CLI command.
 const SHELL_METACHARACTERS: [char; 7] = ['&', '|', '<', '>', '^', '%', '!'];
 
-/// The five built-in tool keys, in the C# registration order. A custom tool
+/// The six built-in tool keys. A custom tool
 /// whose key collides with one of these (case-insensitive) is rejected by
 /// `config add-tool` and skipped by `scan`'s custom-tool loading.
-pub const BUILT_IN_TOOL_KEYS: [&str; 5] = ["claude", "kimi", "codex", "opencode", "aider"];
+pub const BUILT_IN_TOOL_KEYS: [&str; 6] = ["claude", "kimi", "codex", "opencode", "aider", "pi"];
 
 /// Whether `key` is a reserved built-in key, compared ASCII-case-insensitively.
 pub fn is_reserved_tool_key(key: &str) -> bool {
@@ -153,10 +153,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn built_in_keys_are_the_five_supported_identities() {
+    fn built_in_keys_are_the_six_supported_identities() {
         let mut keys: Vec<&str> = BUILT_IN_TOOL_KEYS.to_vec();
         keys.sort_unstable();
-        assert_eq!(keys, ["aider", "claude", "codex", "kimi", "opencode"]);
+        assert_eq!(keys, ["aider", "claude", "codex", "kimi", "opencode", "pi"]);
         for key in BUILT_IN_TOOL_KEYS {
             assert!(is_reserved_tool_key(key), "{key} must be reserved");
             assert!(

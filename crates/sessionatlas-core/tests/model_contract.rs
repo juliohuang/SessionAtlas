@@ -1,7 +1,7 @@
 //! Contract tests for `sessionatlas_core::model`.
 
 use chrono::{DateTime, Utc};
-use sessionatlas_core::model::{Project, Session, ToolSource, ToolUsage};
+use sessionatlas_core::model::{project_path_missing, Project, Session, ToolSource, ToolUsage};
 
 #[test]
 fn model_contract_tool_source_defaults_match_csharp() {
@@ -86,6 +86,7 @@ fn model_contract_project_round_trips_iso8601_timestamps() {
     let project = Project {
         id: "fixed-project-id".to_string(),
         path: "/repo".to_string(),
+        path_missing: true,
         last_accessed_at: DateTime::parse_from_rfc3339("2026-08-15T10:20:30Z")
             .unwrap()
             .into(),
@@ -108,6 +109,7 @@ fn model_contract_project_round_trips_iso8601_timestamps() {
     let json = serde_json::to_string(&project).unwrap();
     assert!(json.contains("\"last_accessed_at\":\"2026-08-15T10:20:30Z\""));
     assert!(json.contains("\"first_seen_at\":\"2026-08-15T09:00:00Z\""));
+    assert!(json.contains("\"path_missing\":true"));
 
     let decoded: Project = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded, project);
@@ -116,6 +118,30 @@ fn model_contract_project_round_trips_iso8601_timestamps() {
         decoded.tool_usages[0].last_session_id.as_deref(),
         Some("sess-1")
     );
+}
+
+#[test]
+fn model_contract_missing_path_is_live_and_legacy_json_defaults_to_present() {
+    let root = tempfile::tempdir().unwrap();
+    let present = root.path().join("present");
+    let missing = root.path().join("missing");
+    let file = root.path().join("file-project");
+    std::fs::create_dir(&present).unwrap();
+    std::fs::write(&file, b"not a directory").unwrap();
+
+    assert!(!project_path_missing(&present.to_string_lossy()));
+    assert!(project_path_missing(&missing.to_string_lossy()));
+    assert!(project_path_missing(&file.to_string_lossy()));
+
+    let legacy = r#"{
+        "id":"legacy",
+        "path":"/legacy",
+        "last_accessed_at":"2026-08-15T10:20:30Z",
+        "first_seen_at":"2026-08-15T09:00:00Z",
+        "tool_usages":[]
+    }"#;
+    let decoded: Project = serde_json::from_str(legacy).unwrap();
+    assert!(!decoded.path_missing);
 }
 
 #[test]

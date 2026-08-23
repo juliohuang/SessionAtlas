@@ -4,7 +4,7 @@
 //! Task R09 implements the scanning pipeline that R08 left as a stub. The
 //! scanner set is injected so tests drive the contract with fake scanners and
 //! never touch real tool data directories; production builds the canonical set
-//! (five built-ins plus enabled, non-colliding custom tools) from the config
+//! (six built-ins plus enabled, non-colliding custom tools) from the config
 //! file. Only `ScanStatus::Succeeded` tools feed `replace_tool_snapshots` —
 //! `Failed`/`Unavailable` outcomes and panics preserve the previous snapshot.
 
@@ -19,6 +19,7 @@ use sessionatlas_core::scanner::codex::CodexScanner;
 use sessionatlas_core::scanner::custom::CustomToolScanner;
 use sessionatlas_core::scanner::kimi::KimiScanner;
 use sessionatlas_core::scanner::opencode::OpenCodeScanner;
+use sessionatlas_core::scanner::pi::PiScanner;
 use sessionatlas_core::scanner::{
     ScanDiagnostic, ScanDiagnosticSeverity, ScanStatus, ScannedProject, Scanner,
     CONFIG_READ_FAILED, UNEXPECTED_SCANNER_FAILURE,
@@ -30,7 +31,7 @@ use crate::render::sanitize;
 use crate::Io;
 
 /// Builds the canonical scanner set for the config file at `config_path`: the
-/// five built-in scanners in C# registration order, then each enabled custom
+/// six built-in scanners, then each enabled custom
 /// tool whose key does not collide with a built-in (case-insensitive). When
 /// the config cannot be read or parsed, built-ins remain available and a
 /// `config_read_failed` diagnostic is returned, mirroring `ScannerRegistry`.
@@ -41,6 +42,7 @@ pub fn build_default_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec
         Box::new(CodexScanner::new()),
         Box::new(OpenCodeScanner::new()),
         Box::new(AiderScanner::new()),
+        Box::new(PiScanner::new()),
     ];
     let mut diagnostics = Vec::new();
     match load_config(config_path) {
@@ -164,6 +166,15 @@ pub fn run_scan(
     }
 
     io.out("索引已原子更新到本地数据库。\n");
+    match store.refresh_project_content_index() {
+        Ok(stats) => io.out(&format!(
+            "内容索引: {} 个项目，更新 {} 个文件，复用 {} 个文件，索引 {} 字节。\n",
+            stats.projects_scanned, stats.files_indexed, stats.files_reused, stats.indexed_bytes
+        )),
+        Err(error) => io.err(&format!(
+            "内容索引更新失败，项目名和路径搜索仍可用: {error}\n"
+        )),
+    }
     if !skipped.is_empty() {
         io.err(&format!("{} 个工具保留了上一份索引。\n", skipped.len()));
     }

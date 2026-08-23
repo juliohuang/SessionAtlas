@@ -170,6 +170,7 @@ pub fn render_list(projects: &[Project]) -> String {
     let header = vec![
         "#".to_string(),
         "项目".to_string(),
+        "目录".to_string(),
         "工具".to_string(),
         "路径".to_string(),
         "分支".to_string(),
@@ -182,6 +183,7 @@ pub fn render_list(projects: &[Project]) -> String {
             vec![
                 (index + 1).to_string(),
                 truncate(&sanitize(&project.display_name().unwrap_or_default()), 25),
+                project_directory_status(project).to_string(),
                 truncate(&sanitize(&project.tool_tags()), 18),
                 truncate(&sanitize(&project.path), 38),
                 truncate(&sanitize(project.git_branch.as_deref().unwrap_or("-")), 15),
@@ -198,6 +200,7 @@ pub fn render_search(projects: &[Project]) -> String {
     let header = vec![
         "#".to_string(),
         "项目".to_string(),
+        "目录".to_string(),
         "工具".to_string(),
         "路径".to_string(),
         "最后访问".to_string(),
@@ -209,6 +212,7 @@ pub fn render_search(projects: &[Project]) -> String {
             vec![
                 (index + 1).to_string(),
                 truncate(&sanitize(&project.display_name().unwrap_or_default()), 25),
+                project_directory_status(project).to_string(),
                 truncate(&sanitize(&project.tool_tags()), 18),
                 truncate(&sanitize(&project.path), 40),
                 format_absolute_time(&project.last_accessed_at.to_rfc3339()),
@@ -216,6 +220,14 @@ pub fn render_search(projects: &[Project]) -> String {
         })
         .collect();
     render_table(&header, &rows)
+}
+
+fn project_directory_status(project: &Project) -> &'static str {
+    if project.path_missing {
+        "⚠ 缺失"
+    } else {
+        "存在"
+    }
 }
 
 /// Renders the `recent` table, mirroring the C# `时间/工具/项目路径` columns.
@@ -361,5 +373,26 @@ mod tests {
         let header = vec!["a".to_string(), "bb".to_string()];
         let rows = vec![vec!["ccc".to_string(), "d".to_string()]];
         assert_eq!(render_table(&header, &rows), "a    bb\n---  --\nccc  d");
+    }
+
+    #[test]
+    fn list_and_search_render_missing_project_marker() {
+        let mut project = Project {
+            path: if cfg!(windows) {
+                r"C:\gone\missing-project".to_string()
+            } else {
+                "/gone/missing-project".to_string()
+            },
+            path_missing: true,
+            ..Project::default()
+        };
+        project.last_accessed_at = std::time::SystemTime::now().into();
+
+        let list = render_list(&[project.clone()]);
+        let search = render_search(&[project]);
+        assert!(list.contains("目录"));
+        assert!(list.contains("⚠ 缺失"));
+        assert!(search.contains("目录"));
+        assert!(search.contains("⚠ 缺失"));
     }
 }
