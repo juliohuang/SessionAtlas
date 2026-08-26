@@ -608,6 +608,34 @@ fn indexer_degrades_gracefully_when_git_metadata_is_missing() {
 }
 
 #[test]
+fn indexer_marks_only_absent_project_directories_as_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let present = make_project_dir(root.path(), "present-project");
+    let missing = root.path().join("missing-project");
+    let at = rfc3339("2026-07-30T10:00:00Z");
+
+    let result = build_index(&[tool(
+        "codex",
+        "Codex CLI",
+        vec![
+            scanned(&present.to_string_lossy(), at, Some("present"), None),
+            scanned(&missing.to_string_lossy(), at, Some("missing"), None),
+        ],
+    )]);
+
+    let present_project = result
+        .iter()
+        .find(|project| project.path == present.to_string_lossy())
+        .unwrap();
+    let missing_project = result
+        .iter()
+        .find(|project| project.path == missing.to_string_lossy())
+        .unwrap();
+    assert!(!present_project.path_missing);
+    assert!(missing_project.path_missing);
+}
+
+#[test]
 fn indexer_degrades_gracefully_on_unreadable_or_invalid_git_shape() {
     let root = tempfile::tempdir().unwrap();
 

@@ -24,6 +24,7 @@ use super::parsing::{
     try_read_utc_timestamp,
 };
 
+const AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
 const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
 
 /// Scanner for Pi Coding Agent's persisted JSONL sessions.
@@ -84,7 +85,12 @@ impl PiScanner {
         let context = self.budget.context();
         let sessions_dir = match resolve_sessions_dir_bounded(&agent_dir, &context) {
             Ok(path) => path,
-            Err(error) => return ScanOutcome::failed([context.diagnostic("pi", error)]),
+            Err(ResolveSessionsError::Budget(error)) => {
+                return ScanOutcome::failed([context.diagnostic("pi", error)]);
+            }
+            Err(ResolveSessionsError::SourceRead) => {
+                return source_read_failure("pi", "the Pi Coding Agent settings file");
+            }
         };
         match probe_directory(&sessions_dir) {
             SourceProbe::Missing => return missing_source("pi", self.is_available()),
@@ -122,15 +128,27 @@ impl PiScanner {
 }
 
 fn resolve_agent_dir() -> Option<PathBuf> {
-    Some(home_directory()?.join(".pi").join("agent"))
+    let home = home_directory()?;
+    let Some(value) = non_blank_env(AGENT_DIR_ENV) else {
+        return Some(home.join(".pi").join("agent"));
+    };
+    if let Some(expanded) = expand_tilde(&value) {
+        return Some(PathBuf::from(expanded));
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::path::absolute(path).ok()
+    }
 }
 
 /// Resolve the official override first, then the global `settings.json`
 /// `sessionDir`, then Pi's default `~/.pi/agent/sessions` location.
 #[cfg(test)]
-fn resolve_sessions_dir(agent_dir: &Path) -> PathBuf {
+fn resolve_sessions_dir(agent_dir: &Path) -> Result<PathBuf, ()> {
     if let Some(value) = non_blank_env(SESSION_DIR_ENV) {
-        return resolve_configured_path(&value, agent_dir);
+        return Ok(resolve_configured_path(&value, agent_dir));
     }
 
     let settings_path = agent_dir.join("settings.json");
@@ -144,41 +162,56 @@ fn resolve_sessions_dir(agent_dir: &Path) -> PathBuf {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                return resolve_configured_path(value, agent_dir);
+                return Ok(resolve_configured_path(value, agent_dir));
             }
         }
     }
 
-    agent_dir.join("sessions")
+    Ok(agent_dir.join("sessions"))
+}
+
+enum ResolveSessionsError {
+    Budget(BudgetError),
+    SourceRead,
 }
 
 fn resolve_sessions_dir_bounded(
     agent_dir: &Path,
     context: &ScanContext,
-) -> Result<PathBuf, BudgetError> {
+) -> Result<PathBuf, ResolveSessionsError> {
     if let Some(value) = non_blank_env(SESSION_DIR_ENV) {
         return Ok(resolve_configured_path(&value, agent_dir));
     }
     let settings_path = agent_dir.join("settings.json");
-    if no_follow_metadata(&settings_path).is_ok_and(|metadata| metadata.is_file()) {
-        let content = match read_bounded_file_detailed(&settings_path, context) {
-            Ok(content) => content,
-            Err(BoundedFileError::Budget(error)) => return Err(error),
-            Err(BoundedFileError::Io) => return Ok(agent_dir.join("sessions")),
-        };
-        if let Ok(settings) = serde_json::from_slice::<Value>(
-            content
-                .strip_prefix(&[0xef, 0xbb, 0xbf])
-                .unwrap_or(&content),
-        ) {
-            if let Some(value) = settings
-                .get("sessionDir")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                return Ok(resolve_configured_path(value, agent_dir));
-            }
+    match no_follow_metadata(&settings_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(ResolveSessionsError::SourceRead),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(agent_dir.join("sessions"));
+        }
+        Err(_) => return Err(ResolveSessionsError::SourceRead),
+    }
+    let content = match read_bounded_file_detailed(&settings_path, context) {
+        Ok(content) => content,
+        Err(BoundedFileError::Budget(error)) => return Err(ResolveSessionsError::Budget(error)),
+        Err(BoundedFileError::Io) => return Err(ResolveSessionsError::SourceRead),
+    };
+    let settings = serde_json::from_slice::<Value>(
+        content
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .unwrap_or(&content),
+    )
+    .map_err(|_| ResolveSessionsError::SourceRead)?;
+    let settings = settings
+        .as_object()
+        .ok_or(ResolveSessionsError::SourceRead)?;
+    if let Some(value) = settings.get("sessionDir") {
+        let value = value
+            .as_str()
+            .ok_or(ResolveSessionsError::SourceRead)?
+            .trim();
+        if !value.is_empty() {
+            return Ok(resolve_configured_path(value, agent_dir));
         }
     }
     Ok(agent_dir.join("sessions"))
@@ -419,10 +452,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let previous_home = std::env::var_os("SESSIONATLAS_HOME");
+        let previous_agent = std::env::var_os(AGENT_DIR_ENV);
         let previous_sessions = std::env::var_os(SESSION_DIR_ENV);
         std::env::set_var("SESSIONATLAS_HOME", path);
+        std::env::remove_var(AGENT_DIR_ENV);
         std::env::remove_var(SESSION_DIR_ENV);
-        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        struct Restore(
+            Option<std::ffi::OsString>,
+            Option<std::ffi::OsString>,
+            Option<std::ffi::OsString>,
+        );
         impl Drop for Restore {
             fn drop(&mut self) {
                 match &self.0 {
@@ -430,12 +469,16 @@ mod tests {
                     None => std::env::remove_var("SESSIONATLAS_HOME"),
                 }
                 match &self.1 {
+                    Some(value) => std::env::set_var(AGENT_DIR_ENV, value),
+                    None => std::env::remove_var(AGENT_DIR_ENV),
+                }
+                match &self.2 {
                     Some(value) => std::env::set_var(SESSION_DIR_ENV, value),
                     None => std::env::remove_var(SESSION_DIR_ENV),
                 }
             }
         }
-        let _restore = Restore(previous_home, previous_sessions);
+        let _restore = Restore(previous_home, previous_agent, previous_sessions);
         body()
     }
 
@@ -500,7 +543,10 @@ mod tests {
         let custom = home.path().join("custom-sessions");
         with_home(home.path(), || {
             std::env::set_var(SESSION_DIR_ENV, &custom);
-            assert_eq!(resolve_sessions_dir(&resolve_agent_dir().unwrap()), custom);
+            assert_eq!(
+                resolve_sessions_dir(&resolve_agent_dir().unwrap()).unwrap(),
+                custom
+            );
         });
     }
 }

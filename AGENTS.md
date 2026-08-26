@@ -55,6 +55,9 @@ libraries. CLI and Tauri are I/O adapters over the same core.
   manifests, immutable local-version registry, active-version selection, and
   safe new/resume argv construction. See `docs/tui-adapter-contract.md`.
 - **`src/model.rs`** — `Project`, `ToolUsage`, `Session`, `ToolSource`; identity and defaults.
+- **`src/content_index.rs`** — bounded/incremental source and documentation
+  discovery. Excludes dependencies, build output, AI-session data, credential
+  shapes, binary/oversized files; stores only FTS terms plus compressed previews.
 - **`src/path.rs`** — path normalization, root-path display, and same-or-child
   parent/child semantics (Windows case-insensitive, Unix byte-sensitive).
 - **`src/scanner/`** — adapter-selected scanners: official `builtin.<id>`
@@ -67,7 +70,8 @@ libraries. CLI and Tauri are I/O adapters over the same core.
   touched by multiple tools collapses into one `Project` with multiple
   `ToolUsage` entries. Reads `.git/HEAD` for `GitBranch`.
 - **`src/store.rs`** — `~/.sessionatlas/index.db`. Tables: `projects`,
-  `tool_usages`, `sessions`, plus FTS5 `projects_fts`. Snapshot replacement,
+  `tool_usages`, `sessions`, content metadata/status, plus FTS5 `projects_fts`
+  and contentless `project_content_fts`. Snapshot replacement,
   orphan cleanup, activity-time recomputation, and FTS rebuild happen in one
   SQLite transaction. Schema created/migrated idempotently.
 - **`src/config.rs`** — `~/.sessionatlas/config.json` (adapter selections and
@@ -88,7 +92,9 @@ in `src/commands/`; rendering and safe selection in `src/render.rs` /
 ### Tauri console (`src-tauri/src/lib.rs` + `frontend/`)
 
 **Data source**: opens the CLI's `~/.sessionatlas/index.db` read-only (see
-`db_path()`); expected tables `projects`, `tool_usages`, `projects_fts` (FTS5).
+`db_path()`); expected tables include `projects`, `tool_usages`, `projects_fts`
+and the optional content-index tables. Older indexes still support name/path
+search until the next scan creates the content index.
 `scan_projects` invokes the `sessionatlas-core` scan pipeline **in-process** on
 `spawn_blocking` — it does not spawn a sidecar or subprocess — then returns
 `COUNT(*)`. CLI and Tauri share the same `index.db`; reads are read-only and

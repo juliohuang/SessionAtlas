@@ -169,6 +169,11 @@ fn launcher_contract_build_arguments_appends_resume_as_independent_arguments() {
             .unwrap(),
         vec!["opencode", "--session", "ses_feff4ba8"]
     );
+    assert_eq!(
+        commands.build_arguments("pi", Some("pi-session")).unwrap(),
+        vec!["pi", "--session", "pi-session"],
+        "Pi uses its native --session flag"
+    );
 }
 
 #[test]

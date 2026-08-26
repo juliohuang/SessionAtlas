@@ -13,7 +13,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use crate::model::{Project, ToolUsage};
+use crate::model::{project_path_missing, Project, ToolUsage};
 use crate::scanner::ScannedProject;
 
 /// A scanned tool snapshot fed into the indexer.
@@ -51,6 +51,7 @@ pub fn build_index(tool_scans: &[IndexedToolScan]) -> Vec<Project> {
                 continue;
             };
             let last_accessed_at = result.last_accessed_at;
+            let path_missing = project_path_missing(&normalized_path);
             let path_key = path_identity_key(&normalized_path);
 
             let project_idx = match project_index.get(&path_key) {
@@ -70,6 +71,7 @@ pub fn build_index(tool_scans: &[IndexedToolScan]) -> Vec<Project> {
                     projects.push(Project {
                         id: uuid::Uuid::new_v4().simple().to_string(),
                         path: normalized_path,
+                        path_missing,
                         last_accessed_at,
                         first_seen_at: Utc::now(),
                         git_branch: result.git_branch.clone(),

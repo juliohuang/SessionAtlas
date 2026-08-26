@@ -6,6 +6,7 @@
 //! never the real `~/.sessionatlas`.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use sessionatlas_core::content_index::ContentIndexOptions;
 use sessionatlas_core::model::{Project, Session, ToolUsage};
 use sessionatlas_core::path;
 use sessionatlas_core::store::{SqliteStore, StoreError};
@@ -50,6 +51,7 @@ fn project_at(
         first_seen_at: first_seen,
         git_branch: None,
         git_remote_url: None,
+        path_missing: false,
         tool_usages: usages.to_vec(),
     }
 }
@@ -93,6 +95,9 @@ fn store_schema_matches_expected_tables_and_indexes() {
         "tool_usages",
         "sessions",
         "projects_fts",
+        "project_content_files",
+        "project_content_fts",
+        "project_content_status",
         "idx_usages_project_tool",
         "idx_sessions_started",
     ] {
@@ -105,6 +110,148 @@ fn store_schema_matches_expected_tables_and_indexes() {
         .query_row("SELECT COUNT(*) FROM projects_fts", [], |row| row.get(0))
         .unwrap();
     assert_eq!(fts_count, 0);
+}
+
+#[test]
+fn store_content_index_is_incremental_compressed_searchable_and_deletes_stale_files() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let project_dir = root.path().join("content-project");
+    std::fs::create_dir_all(project_dir.join("src")).unwrap();
+    let source = project_dir.join("src/main.rs");
+    std::fs::write(&source, "pub fn searchable_component() {}\n".repeat(200)).unwrap();
+    std::fs::write(
+        project_dir.join("README.md"),
+        "bounded full text architecture\n",
+    )
+    .unwrap();
+    std::fs::write(project_dir.join(".env"), "PASSWORD=never_index_secret\n").unwrap();
+    let project_path = path::normalize_native(&project_dir.to_string_lossy()).unwrap();
+
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &project_path,
+                "content-project",
+                utc(2026, 8, 15),
+                &[usage("codex", utc(2026, 8, 16), 1, Some("session"))],
+            )],
+            &["codex"],
+        )
+        .unwrap();
+    let options = ContentIndexOptions {
+        max_walk_entries: 100,
+        max_files_per_project: 20,
+        max_file_bytes: 32 * 1024,
+        max_project_bytes: 64 * 1024,
+        max_preview_bytes: 8 * 1024,
+    };
+    let first = store.refresh_project_content_index_with(options).unwrap();
+
+    assert_eq!(first.projects_scanned, 1);
+    assert_eq!(first.files_indexed, 2);
+    assert_eq!(
+        store
+            .list_projects(Some("searchable_component"), None, 10)
+            .unwrap()[0]
+            .id,
+        "content-project"
+    );
+    assert!(store
+        .list_projects(Some("never_index_secret"), None, 10)
+        .unwrap()
+        .is_empty());
+
+    let second = store.refresh_project_content_index_with(options).unwrap();
+    assert_eq!(second.files_indexed, 0);
+    assert_eq!(second.files_reused, 2);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let (compressed_bytes, indexed_bytes): (i64, i64) = connection
+        .query_row(
+            "SELECT LENGTH(compressed_preview), indexed_bytes
+             FROM project_content_files WHERE relative_path = 'src/main.rs'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let raw_body: Option<String> = connection
+        .query_row("SELECT body FROM project_content_fts LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(compressed_bytes < indexed_bytes);
+    assert!(
+        raw_body.is_none(),
+        "contentless FTS must not retain raw source"
+    );
+    drop(connection);
+
+    std::fs::write(&source, "pub fn replacement_symbol() {}\n").unwrap();
+    let mut store = SqliteStore::new(&db).unwrap();
+    let changed = store.refresh_project_content_index_with(options).unwrap();
+    assert_eq!(changed.files_indexed, 1);
+    assert!(store
+        .list_projects(Some("searchable_component"), None, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .list_projects(Some("replacement_symbol"), None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    std::fs::remove_file(&source).unwrap();
+    let removed = store.refresh_project_content_index_with(options).unwrap();
+    assert_eq!(removed.files_removed, 1);
+    assert!(store
+        .list_projects(Some("replacement_symbol"), None, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn store_recomputes_missing_directory_state_without_rescanning() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let project_dir = root.path().join("project-that-will-be-removed");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_path = path::normalize_native(&project_dir.to_string_lossy()).unwrap();
+
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &project_path,
+                "live-path",
+                utc(2026, 8, 15),
+                &[usage("claude", utc(2026, 8, 16), 1, Some("session"))],
+            )],
+            &["claude"],
+        )
+        .unwrap();
+    assert!(!store.list_projects(None, None, 100).unwrap()[0].path_missing);
+    assert!(
+        !store
+            .get_project_by_path(&project_path)
+            .unwrap()
+            .unwrap()
+            .path_missing
+    );
+
+    std::fs::remove_dir(&project_dir).unwrap();
+    assert!(store.list_projects(None, None, 100).unwrap()[0].path_missing);
+    assert!(
+        store
+            .get_project_by_path(&project_path)
+            .unwrap()
+            .unwrap()
+            .path_missing
+    );
 }
 
 #[test]

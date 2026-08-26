@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
+use sessionatlas_core::indexer::{build_index, IndexedToolScan};
 use sessionatlas_core::path;
 use sessionatlas_core::scanner::claude::ClaudeScanner;
 use sessionatlas_core::scanner::codex::CodexScanner;
@@ -131,6 +132,68 @@ fn project_by_path<'a>(projects: &'a [ScannedProject], normalized: &str) -> &'a 
 
 fn home_join(home: &Path, relative: &str) -> String {
     home.join(relative).to_string_lossy().into_owned()
+}
+
+#[test]
+fn codex_and_claude_keep_missing_configured_projects_for_index_marking() {
+    let dir = tempfile::tempdir().unwrap();
+    with_home(dir.path(), || {
+        let codex_path = home_join(dir.path(), "gone/codex-project");
+        let claude_path = home_join(dir.path(), "gone/claude-project");
+        assert!(!Path::new(&codex_path).exists());
+        assert!(!Path::new(&claude_path).exists());
+
+        let codex_source = codex_sessions(dir.path()).join("2026/08/16");
+        std::fs::create_dir_all(&codex_source).unwrap();
+        write_jsonl(
+            &codex_source.join("missing.jsonl"),
+            &[codex_meta(
+                &codex_path,
+                "codex-missing",
+                "2026-08-16T01:00:00Z",
+            )],
+        );
+
+        let claude_source = claude_projects(dir.path()).join("encoded");
+        std::fs::create_dir_all(&claude_source).unwrap();
+        write_jsonl(
+            &claude_source.join("missing.jsonl"),
+            &[claude_line(
+                Some(&claude_path),
+                Some("claude-missing"),
+                Some("old-branch"),
+                Some("2026-08-16T02:00:00Z"),
+            )],
+        );
+
+        let codex = CodexScanner::with_availability(|| false).scan();
+        let claude = ClaudeScanner::with_availability(|| false).scan();
+        assert_eq!(codex.status(), ScanStatus::Succeeded);
+        assert_eq!(claude.status(), ScanStatus::Succeeded);
+
+        let indexed = build_index(&[
+            IndexedToolScan {
+                tool_key: "codex".to_string(),
+                tool_name: "Codex CLI".to_string(),
+                projects: codex.into_projects(),
+            },
+            IndexedToolScan {
+                tool_key: "claude".to_string(),
+                tool_name: "Claude Code".to_string(),
+                projects: claude.into_projects(),
+            },
+        ]);
+        assert_eq!(indexed.len(), 2);
+        assert!(indexed.iter().all(|project| project.path_missing));
+        assert!(indexed.iter().any(|project| {
+            project.path == path::normalize_native(&codex_path).unwrap()
+                && project.tool_usages[0].tool_key == "codex"
+        }));
+        assert!(indexed.iter().any(|project| {
+            project.path == path::normalize_native(&claude_path).unwrap()
+                && project.tool_usages[0].tool_key == "claude"
+        }));
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -130,6 +130,15 @@ pub fn run_scan(
     }
 
     io.out("索引已原子更新到本地数据库。\n");
+    match store.refresh_project_content_index() {
+        Ok(stats) => io.out(&format!(
+            "内容索引: {} 个项目，更新 {} 个文件，复用 {} 个文件，索引 {} 字节。\n",
+            stats.projects_scanned, stats.files_indexed, stats.files_reused, stats.indexed_bytes
+        )),
+        Err(error) => io.err(&format!(
+            "内容索引更新失败，项目名和路径搜索仍可用: {error}\n"
+        )),
+    }
     if !skipped.is_empty() {
         io.err(&format!("{} 个工具保留了上一份索引。\n", skipped.len()));
     }

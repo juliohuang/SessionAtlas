@@ -21,6 +21,7 @@ import {
   projectCatalogFingerprint,
   projectMatchesFilters,
   sortProjects,
+  sortProjectsForView,
   terminalSessionKey,
 } from "../core.js";
 
@@ -365,6 +366,9 @@ test("catalog fingerprint detects branch and usage changes at equal count and ti
   changed[0].gitBranch = "main";
   changed[0].toolUsages[0].sessionCount = 2;
   assert.notEqual(projectCatalogFingerprint(base), projectCatalogFingerprint(changed));
+  changed[0].toolUsages[0].sessionCount = 1;
+  changed[0].pathMissing = true;
+  assert.notEqual(projectCatalogFingerprint(base), projectCatalogFingerprint(changed));
 });
 
 test("group key uses the assignment or the ungrouped sentinel", () => {
@@ -389,4 +393,37 @@ test("manual project order wins, with recent projects used as the tie breaker", 
 
   sortProjects(projects, { first: 0, new: 1 });
   assert.deepEqual(projects.map(project => project.id), ["first", "new", "unranked"]);
+});
+
+test("priority order surfaces live, available, and frequently used projects", () => {
+  const ago = milliseconds => new Date(Date.now() - milliseconds).toISOString();
+  const projects = [
+    { id: "missing", name: "Missing", pathMissing: true, lastAccessedAt: ago(60_000), toolUsages: [{ sessionCount: 50 }] },
+    { id: "quiet", name: "Quiet", lastAccessedAt: ago(60 * 60_000), toolUsages: [{ sessionCount: 1 }] },
+    { id: "frequent", name: "Frequent", lastAccessedAt: ago(2 * 60 * 60_000), toolUsages: [{ sessionCount: 20 }] },
+    { id: "live", name: "Live", lastAccessedAt: ago(20 * 24 * 60 * 60_000), toolUsages: [] },
+  ];
+
+  sortProjectsForView(projects, "priority", {}, new Set(["live"]));
+
+  assert.deepEqual(projects.map(project => project.id), ["live", "frequent", "quiet", "missing"]);
+});
+
+test("project view modes switch order without dropping catalog members", () => {
+  const projects = [
+    { id: "z", name: "Zulu 10", lastAccessedAt: "2026-01-03T00:00:00Z" },
+    { id: "a2", name: "Alpha 2", lastAccessedAt: "2026-01-01T00:00:00Z" },
+    { id: "a10", name: "Alpha 10", lastAccessedAt: "2026-01-02T00:00:00Z" },
+  ];
+
+  const byName = sortProjectsForView([...projects], "name", {}, new Set());
+  const byRecent = sortProjectsForView([...projects], "recent", {}, new Set());
+  const manual = sortProjectsForView([...projects], "grouped", { a10: 1, z: 2 }, new Set());
+
+  assert.deepEqual(byName.map(project => project.id), ["a2", "a10", "z"]);
+  assert.deepEqual(byRecent.map(project => project.id), ["z", "a10", "a2"]);
+  assert.deepEqual(manual.map(project => project.id), ["a10", "z", "a2"]);
+  assert.equal(byName.length, projects.length);
+  assert.equal(byRecent.length, projects.length);
+  assert.equal(manual.length, projects.length);
 });

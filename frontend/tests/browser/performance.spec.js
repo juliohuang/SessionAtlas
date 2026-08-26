@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 test("2000-project ledger keeps a bounded DOM and fast filtering", async ({ page }) => {
   await page.addInitScript(() => {
+    localStorage.setItem("sessionatlas.projectOrder", "grouped");
     const projects = Array.from({ length: 2000 }, (_, index) => ({
       id: `project-${index}`,
       path: `C:\\workspace\\project-${index}`,
@@ -224,10 +225,9 @@ test("2000-project ledger keeps a bounded DOM and fast filtering", async ({ page
   expect(stableBottomMetrics.height / expectedCompactHeight).toBeGreaterThan(0.85);
   expect(stableBottomMetrics.height / expectedCompactHeight).toBeLessThan(1.15);
 
-  // This fixture intentionally fills LIST_LIMIT. The product refuses a
-  // complete manual-order write at that cap because the catalog may be
-  // truncated; verify the guard while the bottom rows are mounted. The
-  // dedicated bounded-order test below covers a complete catalog.
+  // The current catalog limit is 10,000, so this 2,000-project fixture is a
+  // complete catalog and may submit one delegated manual-order mutation. The
+  // list-limit rejection boundary remains covered by the core unit tests.
   await page.evaluate(() => {
     const source = document.querySelector('#ledger article.entry[data-id="project-1999"]');
     const target = document.querySelector('#ledger article.entry[data-id="project-1998"]');
@@ -243,7 +243,7 @@ test("2000-project ledger keeps a bounded DOM and fast filtering", async ({ page
   await page.waitForTimeout(50);
   expect(await page.evaluate(() =>
     window.__performanceInvokeCalls.filter(call => call.command === "move_group_project").length,
-  )).toBe(0);
+  )).toBe(1);
 
   await page.evaluate(() => {
     window.__filterStartedAt = performance.now();
@@ -258,6 +258,7 @@ test("2000-project ledger keeps a bounded DOM and fast filtering", async ({ page
 
 test("virtualized group move and manual reorder use delegated mutations", async ({ page }) => {
   await page.addInitScript(() => {
+    localStorage.setItem("sessionatlas.projectOrder", "grouped");
     const projects = Array.from({ length: 120 }, (_, index) => ({
       id: `order-project-${index}`,
       path: `C:\\workspace\\order-project-${index}`,

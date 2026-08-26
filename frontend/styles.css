@@ -193,17 +193,17 @@ body.is-maximized .console {
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
 .filters { display: flex; gap: 8px; }
-.filters--recency {
+.filters--order {
   margin-left: auto;
   padding-left: 14px;
   border-left: 1px solid var(--rule);
 }
-.filters--recency .chip {
+.filters--order .chip {
   padding: 6px 10px;
   font-size: 10.5px;
   letter-spacing: .08em;
 }
-.filters--recency .chip.is-active {
+.filters--order .chip.is-active {
   color: var(--ember); border-color: var(--ember); background: transparent;
 }
 .chip {
@@ -378,6 +378,8 @@ body.is-maximized .console {
   transition: background .14s;
   opacity: 0; transform: translateY(6px);
   animation: entryIn .32s cubic-bezier(.2,.7,.2,1) forwards;
+  content-visibility: auto;
+  contain-intrinsic-block-size: 80px;
 }
 @keyframes entryIn { to { opacity: 1; transform: none; } }
 .entry:hover { background: var(--ink-2); }
@@ -400,6 +402,7 @@ body.is-maximized .console {
 .entry:hover .entry__folder { opacity: .85; }
 .entry__folder { color: var(--bone-mute); }
 .entry__folder svg { display: block; fill: currentColor; }
+.entry__identity { min-width: 0; display: grid; gap: 3px; }
 .entry__name {
   flex: 0 1 auto;
   min-width: 0;
@@ -736,6 +739,10 @@ body.is-maximized .console {
   user-select: none;
   -webkit-user-select: none;
 }
+.entry[draggable="false"] {
+  cursor: pointer;
+  -webkit-user-drag: none;
+}
 .entry:active { cursor: grabbing; }
 .entry.is-dragging { opacity: .35; }
 .entry.drop-before { box-shadow: inset 0 2px 0 var(--ember); }
@@ -979,6 +986,11 @@ body.is-maximized .console {
 .entry:nth-child(9){animation-delay:.34s}
 .entry:nth-child(10){animation-delay:.38s}
 .entry:nth-child(n+11){animation-delay:.42s}
+.ledger.is-large .entry {
+  opacity: 1;
+  transform: none;
+  animation: none;
+}
 
 /* load reveal */
 .deck { animation: rise .7s cubic-bezier(.2,.7,.2,1) both; }
@@ -1715,8 +1727,8 @@ body.is-maximized .console {
   animation: drawerIn .22s cubic-bezier(.2,.7,.2,1) both;
 }
 @keyframes drawerIn {
-  from { transform: translateX(20px); opacity: 0; }
-  to   { transform: none; opacity: 1; }
+  from { clip-path: inset(0 0 0 20px); opacity: 0; }
+  to   { clip-path: inset(0); opacity: 1; }
 }
 .drawer__head {
   display: flex; align-items: center; gap: 12px;
@@ -2448,6 +2460,44 @@ body.is-maximized .console {
   color: var(--bone-mute);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.entry__content-match {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.25;
+  color: var(--bone-mute);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.entry__content-path {
+  flex: 0 1 auto;
+  color: var(--accent-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.entry__content-snippet {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.entry__missing-badge {
+  flex: 0 0 auto;
+  padding: 1px 4px;
+  border: 1px solid var(--ember);
+  border-radius: 2px;
+  color: var(--ember);
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: .04em;
+  cursor: help;
+}
+.entry.is-missing .entry__folder { color: var(--ember); opacity: .85; }
+.entry.is-missing .entry__name { color: var(--bone-mute); }
 
 /* ── 2026 workspace refresh ─────────────────────────────── */
 /* This final layer intentionally overrides the legacy two-column journal
@@ -2562,7 +2612,7 @@ body.is-maximized .console { padding: 8px; }
   gap: 10px;
 }
 .filter-cluster:first-child { flex: 1 1 auto; }
-.filter-cluster--recency { flex: 0 0 auto; }
+.filter-cluster--order { flex: 0 0 auto; }
 .filter-cluster__label {
   flex: 0 0 auto;
   color: var(--bone-mute);
@@ -2579,16 +2629,16 @@ body.is-maximized .console { padding: 8px; }
   scrollbar-width: none;
 }
 .filters::-webkit-scrollbar { display: none; }
-.filters--recency { margin: 0; padding: 0; border: 0; }
+.filters--order { margin: 0; padding: 0; border: 0; }
 .chip,
-.filters--recency .chip {
+.filters--order .chip {
   flex: 0 0 auto;
   padding: 4px 9px;
   border-radius: 999px;
   font-size: 10px;
   letter-spacing: .05em;
 }
-.filters--recency .chip.is-active,
+.filters--order .chip.is-active,
 .chip.is-active {
   color: #11170a;
   border-color: var(--accent);

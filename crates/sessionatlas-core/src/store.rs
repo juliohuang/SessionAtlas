@@ -12,7 +12,8 @@ use std::path::Path;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use crate::model::{Project, Session, ToolUsage};
+use crate::content_index::{collect_project_content, ContentFingerprint, ContentIndexOptions};
+use crate::model::{project_path_missing, Project, Session, ToolUsage};
 use crate::path;
 
 /// Result alias for store operations.
@@ -138,6 +139,35 @@ const SCHEMA_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_projects_last_accessed ON projects(last_accessed_at);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS projects_fts USING fts5(name, path);
+
+    CREATE TABLE IF NOT EXISTS project_content_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        modified_ns INTEGER NOT NULL,
+        file_size INTEGER NOT NULL,
+        indexed_bytes INTEGER NOT NULL,
+        compressed_preview BLOB NOT NULL,
+        UNIQUE(project_id, relative_path),
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_content_files_project
+        ON project_content_files(project_id);
+    CREATE VIRTUAL TABLE IF NOT EXISTS project_content_fts USING fts5(
+        relative_path,
+        body,
+        content='',
+        contentless_delete=1,
+        tokenize='unicode61 remove_diacritics 2'
+    );
+    CREATE TABLE IF NOT EXISTS project_content_status (
+        project_id TEXT PRIMARY KEY,
+        indexed_files INTEGER NOT NULL,
+        indexed_bytes INTEGER NOT NULL,
+        skipped_files INTEGER NOT NULL,
+        truncated INTEGER NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
 
     CREATE TABLE IF NOT EXISTS tool_usages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -284,6 +314,18 @@ const PROJECT_COLUMNS: &str =
 /// connection is single-threaded and owned by this struct.
 pub struct SqliteStore {
     connection: Connection,
+}
+
+/// Summary of one incremental content-index refresh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentIndexStats {
+    pub projects_scanned: usize,
+    pub files_indexed: usize,
+    pub files_reused: usize,
+    pub files_removed: usize,
+    pub files_skipped: usize,
+    pub indexed_bytes: usize,
+    pub truncated_projects: usize,
 }
 
 impl SqliteStore {
@@ -439,6 +481,176 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Incrementally refreshes the bounded source/document index for every
+    /// local project. Unchanged files are identified by `(mtime_ns, size)` and
+    /// never opened. Raw bodies are inserted only into the contentless FTS5
+    /// table; SQLite retains terms, while result subtitles use a small LZ4
+    /// preview stored in `project_content_files`.
+    pub fn refresh_project_content_index(&mut self) -> Result<ContentIndexStats> {
+        self.refresh_project_content_index_with(ContentIndexOptions::default())
+    }
+
+    /// Same as [`Self::refresh_project_content_index`] with injectable limits
+    /// for deterministic tests.
+    pub fn refresh_project_content_index_with(
+        &mut self,
+        options: ContentIndexOptions,
+    ) -> Result<ContentIndexStats> {
+        let projects: Vec<(String, String)> = {
+            let mut stmt = self
+                .connection
+                .prepare("SELECT id, path FROM projects ORDER BY rowid")?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        // Cascading deletes remove metadata rows when projects disappear, but
+        // the contentless virtual table has no foreign key of its own.
+        self.connection.execute(
+            "DELETE FROM project_content_fts
+             WHERE rowid NOT IN (SELECT id FROM project_content_files)",
+            [],
+        )?;
+
+        let mut stats = ContentIndexStats::default();
+        for (project_id, project_path) in projects {
+            let known: HashMap<String, ContentFingerprint> = {
+                let mut stmt = self.connection.prepare(
+                    "SELECT relative_path, modified_ns, file_size
+                     FROM project_content_files
+                     WHERE project_id = ?1",
+                )?;
+                let rows = stmt
+                    .query_map(params![project_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            ContentFingerprint {
+                                modified_ns: row.get(1)?,
+                                file_size: row.get(2)?,
+                            },
+                        ))
+                    })?
+                    .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+                rows
+            };
+            let collection = collect_project_content(Path::new(&project_path), &known, options)?;
+            let tx = self.connection.transaction()?;
+
+            for document in &collection.documents {
+                let existing_id = tx
+                    .query_row(
+                        "SELECT id FROM project_content_files
+                         WHERE project_id = ?1 AND relative_path = ?2",
+                        params![project_id, document.relative_path],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                let rowid = if let Some(rowid) = existing_id {
+                    tx.execute(
+                        "DELETE FROM project_content_fts WHERE rowid = ?1",
+                        params![rowid],
+                    )?;
+                    tx.execute(
+                        "UPDATE project_content_files
+                         SET modified_ns = ?1, file_size = ?2, indexed_bytes = ?3,
+                             compressed_preview = ?4
+                         WHERE id = ?5",
+                        params![
+                            document.fingerprint.modified_ns,
+                            document.fingerprint.file_size,
+                            document.indexed_bytes as i64,
+                            document.compressed_preview,
+                            rowid
+                        ],
+                    )?;
+                    rowid
+                } else {
+                    tx.execute(
+                        "INSERT INTO project_content_files
+                            (project_id, relative_path, modified_ns, file_size,
+                             indexed_bytes, compressed_preview)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            project_id,
+                            document.relative_path,
+                            document.fingerprint.modified_ns,
+                            document.fingerprint.file_size,
+                            document.indexed_bytes as i64,
+                            document.compressed_preview
+                        ],
+                    )?;
+                    tx.last_insert_rowid()
+                };
+                tx.execute(
+                    "INSERT INTO project_content_fts (rowid, relative_path, body)
+                     VALUES (?1, ?2, ?3)",
+                    params![rowid, document.relative_path, document.body],
+                )?;
+            }
+
+            let existing_rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, relative_path FROM project_content_files
+                     WHERE project_id = ?1",
+                )?;
+                let rows = stmt
+                    .query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut removed = 0usize;
+            for (rowid, relative_path) in existing_rows {
+                if collection.retained_paths.contains(&relative_path) {
+                    continue;
+                }
+                tx.execute(
+                    "DELETE FROM project_content_fts WHERE rowid = ?1",
+                    params![rowid],
+                )?;
+                tx.execute(
+                    "DELETE FROM project_content_files WHERE id = ?1",
+                    params![rowid],
+                )?;
+                removed += 1;
+            }
+            let (indexed_files, total_bytes): (i64, i64) = tx.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(indexed_bytes), 0)
+                 FROM project_content_files WHERE project_id = ?1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            tx.execute(
+                "INSERT INTO project_content_status
+                    (project_id, indexed_files, indexed_bytes,
+                     skipped_files, truncated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(project_id) DO UPDATE SET
+                    indexed_files = excluded.indexed_files,
+                    indexed_bytes = excluded.indexed_bytes,
+                    skipped_files = excluded.skipped_files,
+                    truncated = excluded.truncated",
+                params![
+                    project_id,
+                    indexed_files,
+                    total_bytes,
+                    collection.skipped_files as i64,
+                    i64::from(collection.truncated)
+                ],
+            )?;
+            tx.commit()?;
+
+            stats.projects_scanned += 1;
+            stats.files_indexed += collection.documents.len();
+            stats.files_reused += collection.reused_files;
+            stats.files_removed += removed;
+            stats.files_skipped += collection.skipped_files;
+            stats.indexed_bytes += collection.indexed_bytes;
+            stats.truncated_projects += usize::from(collection.truncated);
+        }
+        Ok(stats)
+    }
+
     /// Read-only detection of legacy rows that cannot be normalized safely or
     /// that collide after native normalization. No repair is attempted here.
     pub fn inspect_project_path_anomalies(&self) -> Result<Vec<String>> {
@@ -494,9 +706,11 @@ impl SqliteStore {
         };
         let mut projects = Vec::with_capacity(rows.len());
         for (id, project_path, last, first, branch, remote) in rows {
+            let path_missing = project_path_missing(&project_path);
             projects.push(Project {
                 id,
                 path: project_path,
+                path_missing,
                 last_accessed_at: parse_timestamp(&last)?,
                 first_seen_at: parse_timestamp(&first)?,
                 git_branch: branch,
@@ -534,9 +748,11 @@ impl SqliteStore {
         let Some((id, project_path, last, first, branch, remote)) = row else {
             return Ok(None);
         };
+        let path_missing = project_path_missing(&project_path);
         let mut project = Project {
             id,
             path: project_path,
+            path_missing,
             last_accessed_at: parse_timestamp(&last)?,
             first_seen_at: parse_timestamp(&first)?,
             git_branch: branch,
@@ -630,16 +846,45 @@ impl SqliteStore {
         let Some(fts_query) = build_fts_prefix_query(search) else {
             return Ok(Vec::new());
         };
-        let sql = format!(
-            "SELECT p.{PROJECT_COLUMNS} FROM projects p
-             WHERE p.rowid IN (SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1)
-             ORDER BY p.last_accessed_at DESC
-             LIMIT ?2"
-        );
-        let mut stmt = self.connection.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![fts_query, limit as i64], project_fields)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let rows = if let Some(content_query) = build_content_fts_prefix_query(search) {
+            let sql = format!(
+                "SELECT p.{PROJECT_COLUMNS} FROM projects p
+                 WHERE p.rowid IN (
+                           SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1
+                       )
+                    OR p.id IN (
+                           SELECT content_file.project_id
+                           FROM project_content_fts
+                           JOIN project_content_files content_file
+                             ON content_file.id = project_content_fts.rowid
+                           WHERE project_content_fts MATCH ?2
+                       )
+                 ORDER BY p.last_accessed_at DESC
+                 LIMIT ?3"
+            );
+            let mut stmt = self.connection.prepare(&sql)?;
+            let collected = stmt
+                .query_map(
+                    params![fts_query, content_query, limit as i64],
+                    project_fields,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            collected
+        } else {
+            let sql = format!(
+                "SELECT p.{PROJECT_COLUMNS} FROM projects p
+                 WHERE p.rowid IN (
+                     SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1
+                 )
+                 ORDER BY p.last_accessed_at DESC
+                 LIMIT ?2"
+            );
+            let mut stmt = self.connection.prepare(&sql)?;
+            let collected = stmt
+                .query_map(params![fts_query, limit as i64], project_fields)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            collected
+        };
         Ok(rows)
     }
 
@@ -925,18 +1170,33 @@ fn parse_timestamp(text: &str) -> Result<DateTime<Utc>> {
 /// term, so the caller returns an empty result — FTS operators and punctuation
 /// become literal separators.
 fn build_fts_prefix_query(query: &str) -> Option<String> {
+    build_fts_prefix_query_with_minimum(query, 1)
+}
+
+fn build_content_fts_prefix_query(query: &str) -> Option<String> {
+    build_fts_prefix_query_with_minimum(query, 2)
+}
+
+fn build_fts_prefix_query_with_minimum(query: &str, minimum_chars: usize) -> Option<String> {
     let mut terms = Vec::new();
     let mut current = String::new();
-    for character in query.chars() {
+    for character in query.chars().take(256) {
         if character.is_alphanumeric() || character == '_' {
             current.push(character);
             continue;
         }
         if !current.is_empty() {
-            terms.push(std::mem::take(&mut current));
+            if current.chars().count() >= minimum_chars {
+                terms.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+            if terms.len() == 12 {
+                break;
+            }
         }
     }
-    if !current.is_empty() {
+    if terms.len() < 12 && current.chars().count() >= minimum_chars {
         terms.push(current);
     }
     if terms.is_empty() {

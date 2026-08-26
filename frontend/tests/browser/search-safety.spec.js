@@ -49,6 +49,7 @@ test("opaque project IDs stay inert and addressable across entry actions", async
     if (message.type() === "error") errors.push(message.text());
   });
   await page.addInitScript(id => {
+    localStorage.setItem("sessionatlas.projectOrder", "grouped");
     const project = {
       id,
       source: "local",
@@ -161,6 +162,7 @@ test("__proto__ remains an ordinary project ID key", async ({ page }) => {
     if (message.type() === "error") errors.push(message.text());
   });
   await page.addInitScript(id => {
+    localStorage.setItem("sessionatlas.projectOrder", "grouped");
     const project = {
       id,
       source: "local",

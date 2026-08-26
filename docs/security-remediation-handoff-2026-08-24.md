@@ -204,6 +204,8 @@ git status --short --branch
 
 `cargo audit` 扫描 538 个依赖并以成功状态结束，但报告 17 个允许告警，主要来自 Tauri/GTK 传递依赖中的 unmaintained crate，以及 `glib 0.18.5` 的 unsound 告警。Tauri 成功构建时另有 `__TAURI_BUNDLE_TYPE` 未找到的 updater patch 告警；两项都不是本轮门禁失败，但需在发布依赖升级/自动更新验收中继续跟踪。
 
+2026-08-27 更新：已将最新 `origin/main`（`5ed2eae`）合入本分支并解决 6 个冲突，同时保留 S1–S7 安全边界和 `main` 的内容索引、项目排序及 Pi 配置功能。合并后的 Rust workspace、Clippy、fmt、前端检查、单元测试 24/24、浏览器测试 59/59、npm audit、cargo audit、Tauri MSI/NSIS 与 CLI locked release 构建均通过。本次 Tauri 构建未再报告 `__TAURI_BUNDLE_TYPE` updater patch 告警；`cargo audit` 仍有上述 17 个允许告警。
+
 最终还要逐项复核：
 
 1. 所有 7 个原安全触发均不能复现，合法控制样本保持有效。
@@ -215,6 +217,6 @@ git status --short --branch
 ## 5. 安全修复之后仍需用户决策的开源门禁
 
 - 2026-08-26 通过 GitHub 只读接口核实 7 个当前远端分支，分支树中未发现 `.cs` 文件；旧交接记录中的“8 个远端旧分支含 C#”已不再成立。历史提交的高置信密钥格式扫描也为 0，但本机未安装专用 secret scanner，本次采用保守规则扫描。
-- Draft PR #18 当前为 Open + Draft，GitHub 返回 `CONFLICTING`；需要先同步目标分支、解决冲突，再做最终 PR 审核/合并。
+- Draft PR #18 的冲突已通过合并最新 `origin/main` 在本分支解决；推送后需以 GitHub 的重新计算结果为准，再做最终 PR 审核/合并。
 - 原生 Tauri T1–T9、干净环境安装、首次扫描和多平台真实终端仍是发布安装包前的人工门禁。
 - 仓库改为 Public、提交、推送、合并和历史改写都需要单独授权。
