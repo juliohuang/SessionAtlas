@@ -7,21 +7,21 @@
 //! fields; prompts, responses, tool calls, and other conversation content are
 //! never retained.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::base::{
-    complete_session_files, missing_source, probe_directory, source_read_failure, ScanDiagnostic,
-    ScanDiagnosticSeverity, ScanOutcome, ScannedProject, Scanner, SourceProbe,
-    MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, MISSING_SESSION_ID, SESSION_READ_FAILED,
-    TIMESTAMP_FALLBACK,
+    bounded_recursive_files, complete_session_files, missing_source, no_follow_metadata,
+    probe_directory, read_bounded_file_detailed, source_read_failure, BoundedFileError,
+    BoundedLines, BudgetError, ScanBudget, ScanContext, ScanDiagnostic, ScanDiagnosticSeverity,
+    ScanOutcome, ScannedProject, Scanner, SourceProbe, MALFORMED_SESSION_RECORD,
+    MISSING_PROJECT_PATH, MISSING_SESSION_ID, SESSION_READ_FAILED, TIMESTAMP_FALLBACK,
 };
 use super::parsing::{
-    expand_tilde, home_directory, recursive_file_enumeration, try_normalize_project_path,
-    try_read_unix_timestamp, try_read_utc_timestamp,
+    expand_tilde, home_directory, try_normalize_project_path, try_read_unix_timestamp,
+    try_read_utc_timestamp,
 };
 
 const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
@@ -29,6 +29,7 @@ const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
 /// Scanner for Pi Coding Agent's persisted JSONL sessions.
 pub struct PiScanner {
     is_available: Box<dyn Fn() -> bool>,
+    budget: ScanBudget,
 }
 
 impl PiScanner {
@@ -42,7 +43,12 @@ impl PiScanner {
     pub fn with_availability(availability: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_available: Box::new(availability),
+            budget: ScanBudget::default(),
         }
+    }
+    pub fn with_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -75,7 +81,11 @@ impl PiScanner {
         let Some(agent_dir) = resolve_agent_dir() else {
             return missing_source("pi", self.is_available());
         };
-        let sessions_dir = resolve_sessions_dir(&agent_dir);
+        let context = self.budget.context();
+        let sessions_dir = match resolve_sessions_dir_bounded(&agent_dir, &context) {
+            Ok(path) => path,
+            Err(error) => return ScanOutcome::failed([context.diagnostic("pi", error)]),
+        };
         match probe_directory(&sessions_dir) {
             SourceProbe::Missing => return missing_source("pi", self.is_available()),
             SourceProbe::Failed => {
@@ -84,18 +94,27 @@ impl PiScanner {
             SourceProbe::Exists => {}
         }
 
-        let session_files = match enumerate_jsonl_files(&sessions_dir) {
+        let session_files = match enumerate_jsonl_files(&sessions_dir, &context) {
             Ok(files) => files,
-            Err(()) => {
-                return source_read_failure("pi", "the Pi Coding Agent sessions directory");
-            }
+            Err(error) => return ScanOutcome::failed([context.diagnostic("pi", error)]),
         };
 
         let mut projects = Vec::new();
         let mut diagnostics = Vec::new();
         let source_root = agent_dir.to_string_lossy().into_owned();
         for session_file in &session_files {
-            parse_session_file(session_file, &source_root, &mut projects, &mut diagnostics);
+            if context.source_file_path(session_file).is_err() {
+                return ScanOutcome::failed([context.diagnostic("pi", BudgetError::Exceeded)]);
+            }
+            if let Err(error) = parse_session_file(
+                session_file,
+                &source_root,
+                &context,
+                &mut projects,
+                &mut diagnostics,
+            ) {
+                return ScanOutcome::failed([context.diagnostic("pi", error)]);
+            }
         }
 
         complete_session_files("pi", session_files.len(), projects, diagnostics)
@@ -108,6 +127,7 @@ fn resolve_agent_dir() -> Option<PathBuf> {
 
 /// Resolve the official override first, then the global `settings.json`
 /// `sessionDir`, then Pi's default `~/.pi/agent/sessions` location.
+#[cfg(test)]
 fn resolve_sessions_dir(agent_dir: &Path) -> PathBuf {
     if let Some(value) = non_blank_env(SESSION_DIR_ENV) {
         return resolve_configured_path(&value, agent_dir);
@@ -132,6 +152,38 @@ fn resolve_sessions_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("sessions")
 }
 
+fn resolve_sessions_dir_bounded(
+    agent_dir: &Path,
+    context: &ScanContext,
+) -> Result<PathBuf, BudgetError> {
+    if let Some(value) = non_blank_env(SESSION_DIR_ENV) {
+        return Ok(resolve_configured_path(&value, agent_dir));
+    }
+    let settings_path = agent_dir.join("settings.json");
+    if no_follow_metadata(&settings_path).is_ok_and(|metadata| metadata.is_file()) {
+        let content = match read_bounded_file_detailed(&settings_path, context) {
+            Ok(content) => content,
+            Err(BoundedFileError::Budget(error)) => return Err(error),
+            Err(BoundedFileError::Io) => return Ok(agent_dir.join("sessions")),
+        };
+        if let Ok(settings) = serde_json::from_slice::<Value>(
+            content
+                .strip_prefix(&[0xef, 0xbb, 0xbf])
+                .unwrap_or(&content),
+        ) {
+            if let Some(value) = settings
+                .get("sessionDir")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Ok(resolve_configured_path(value, agent_dir));
+            }
+        }
+    }
+    Ok(agent_dir.join("sessions"))
+}
+
 fn non_blank_env(name: &str) -> Option<String> {
     std::env::var_os(name)
         .map(|value| value.to_string_lossy().trim().to_string())
@@ -150,12 +202,14 @@ fn resolve_configured_path(value: &str, agent_dir: &Path) -> PathBuf {
     }
 }
 
-fn enumerate_jsonl_files(sessions_dir: &Path) -> Result<Vec<PathBuf>, ()> {
+fn enumerate_jsonl_files(
+    sessions_dir: &Path,
+    context: &ScanContext,
+) -> Result<Vec<PathBuf>, BudgetError> {
     let mut files = Vec::new();
-    for entry in recursive_file_enumeration(sessions_dir) {
-        let entry = entry.map_err(|_| ())?;
-        if entry.file_type().is_file() && is_jsonl(entry.path()) {
-            files.push(entry.into_path());
+    for path in bounded_recursive_files(sessions_dir, context)? {
+        if is_jsonl(&path) {
+            files.push(path);
         }
     }
     files.sort();
@@ -176,19 +230,21 @@ fn is_jsonl(path: &Path) -> bool {
 fn parse_session_file(
     session_file: &Path,
     source_root: &str,
+    context: &ScanContext,
     projects: &mut Vec<ScannedProject>,
     diagnostics: &mut Vec<ScanDiagnostic>,
-) {
-    let file = match std::fs::File::open(session_file) {
-        Ok(file) => file,
-        Err(_) => {
+) -> Result<(), BudgetError> {
+    let mut lines = match BoundedLines::open(session_file, context) {
+        Ok(lines) => lines,
+        Err(crate::scanner::BoundedLineError::Budget(error)) => return Err(error),
+        Err(crate::scanner::BoundedLineError::Io) => {
             diagnostics.push(ScanDiagnostic::new(
                 "pi",
                 ScanDiagnosticSeverity::Warning,
                 SESSION_READ_FAILED,
                 "A Pi Coding Agent session file could not be read and was skipped.",
             ));
-            return;
+            return Ok(());
         }
     };
 
@@ -198,8 +254,22 @@ fn parse_session_file(
     let mut malformed_lines = 0;
     let mut first_line = true;
 
-    for line in BufReader::new(file).lines() {
-        let line = match line {
+    loop {
+        let raw_line = match lines.next_line() {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(crate::scanner::BoundedLineError::Budget(error)) => return Err(error),
+            Err(crate::scanner::BoundedLineError::Io) => {
+                diagnostics.push(ScanDiagnostic::new(
+                    "pi",
+                    ScanDiagnosticSeverity::Warning,
+                    SESSION_READ_FAILED,
+                    "A Pi Coding Agent session file could not be read and was skipped.",
+                ));
+                return Ok(());
+            }
+        };
+        let line = match String::from_utf8(raw_line) {
             Ok(line) => line,
             Err(_) => {
                 diagnostics.push(ScanDiagnostic::new(
@@ -208,7 +278,7 @@ fn parse_session_file(
                     SESSION_READ_FAILED,
                     "A Pi Coding Agent session file could not be read and was skipped.",
                 ));
-                return;
+                return Ok(());
             }
         };
         let line = if first_line {
@@ -268,7 +338,7 @@ fn parse_session_file(
             MISSING_PROJECT_PATH,
             "A Pi Coding Agent session did not contain a safe absolute cwd and was skipped.",
         ));
-        return;
+        return Ok(());
     };
 
     let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) else {
@@ -278,7 +348,7 @@ fn parse_session_file(
             MISSING_SESSION_ID,
             "A Pi Coding Agent session did not contain a native session ID and was skipped.",
         ));
-        return;
+        return Ok(());
     };
 
     let last_accessed_at = match latest_activity {
@@ -291,7 +361,7 @@ fn parse_session_file(
                 "A Pi Coding Agent session had no valid activity timestamp; file modification time was used.",
             ));
             let Some(fallback) = file_last_write_utc(session_file) else {
-                return;
+                return Ok(());
             };
             fallback
         }
@@ -303,6 +373,7 @@ fn parse_session_file(
         session_id: Some(session_id),
         git_branch: None,
     });
+    Ok(())
 }
 
 fn file_last_write_utc(path: &Path) -> Option<DateTime<Utc>> {

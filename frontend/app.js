@@ -82,7 +82,7 @@ function groupPickerHtml(projectId) {
     .join("");
   return `<div class="group-picker">
     <span class="entry__launch-label">${escapeHtml(tr("entry.label.group"))}</span>
-    <select class="group-picker__select" data-group-picker data-project-id="${escapeHtml(projectId)}">
+    <select class="group-picker__select" data-group-picker data-project-id="${escapeHtml(String(projectId))}">
       ${opts}
     </select>
   </div>`;
@@ -106,8 +106,8 @@ const state = {
   menuOpenId: null,         // project id whose `...` popover is open, or null
   groups: [],               // [{id, name, sortOrder, memberCount}] from list_groups
   groupRevision: 0,         // optimistic-concurrency revision from prefs.db
-  assignments: {},          // {projectId: groupId} from list_group_assignments
-  sortOrders: {},           // {projectId: sortOrder} from list_sort_orders (manual order)
+  assignments: createProjectKeyedMap(), // {projectId: groupId} from list_group_assignments
+  sortOrders: createProjectKeyedMap(),  // {projectId: sortOrder} from list_sort_orders (manual order)
   viewMode: "ledger",       // "ledger" | "files" — which view occupies the left pane
   expandedId: null,         // project id whose inline session panel is open, or null
   remoteServers: [],         // [{id, label, user, host, port, identityFile, scanRoots, lastScannedAt, osFamily}] from list_remote_servers
@@ -119,8 +119,8 @@ const state = {
   sessionCleanupSelected: new Set(),
   sessionCleanupLoading: false,
   sessionCleanupStale: false,
-  gitStatusByProject: {},   // local/remote-ref GitInfo cache by project id
-  gitStatusAtByProject: {}, // monotonic cache timestamps for GitInfo TTL
+  gitStatusByProject: createProjectKeyedMap(),   // local/remote-ref GitInfo cache by project id
+  gitStatusAtByProject: createProjectKeyedMap(), // monotonic cache timestamps for GitInfo TTL
   remoteScanIds: new Set(), // server ids currently scanning on background workers
   tuiMachines: {},          // {local|remote:<id>: live installed/enabled capabilities}
   tuiCapabilityAt: {},      // monotonic timestamps for the capability TTL
@@ -305,8 +305,8 @@ async function loadGroups() {
     state.groups = [
       { id: 1, name: "Active", sortOrder: 10, memberCount: 0 },
     ];
-    state.assignments = {};
-    state.sortOrders = {};
+    state.assignments = createProjectKeyedMap();
+    state.sortOrders = createProjectKeyedMap();
     applyFilters();
     renderSelectedLaunchPanel();
     return;
@@ -319,11 +319,11 @@ async function loadGroups() {
       invoke("get_group_revision"),
     ]);
     state.groups = groups;
-    state.assignments = assignments;
+    state.assignments = createProjectKeyedMap(assignments);
     // Flatten sort rows into a {projectId: sortOrder} map. group_key is
     // redundant here — assignment is the source of truth for which bucket a
     // project renders in; this map only supplies the within-bucket order.
-    const orders = {};
+    const orders = createProjectKeyedMap();
     for (const r of sortRows) orders[r.projectId] = r.sortOrder;
     state.sortOrders = orders;
     state.groupRevision = revision;
@@ -349,7 +349,7 @@ async function refreshSortOrders() {
   if (!HAS_TAURI) return;
   try {
     const rows = await invoke("list_sort_orders");
-    const orders = {};
+    const orders = createProjectKeyedMap();
     for (const r of rows) orders[r.projectId] = r.sortOrder;
     state.sortOrders = orders;
   } catch (e) { /* keep stale on failure */ }
@@ -358,7 +358,7 @@ async function refreshSortOrders() {
 async function setProjectGroup(projectId, groupId) {
   const prev = state.assignments[projectId] ?? null;
   // Optimistic update so the UI re-renders immediately.
-  const next = { ...state.assignments };
+  const next = createProjectKeyedMap(state.assignments);
   if (groupId == null) delete next[projectId];
   else next[projectId] = groupId;
   state.assignments = next;
@@ -384,7 +384,7 @@ async function setProjectGroup(projectId, groupId) {
     } catch (e) {
       console.error("assign_project_to_group failed", e);
       // Revert optimistic update on failure.
-      state.assignments = { ...state.assignments };
+      state.assignments = createProjectKeyedMap(state.assignments);
       if (prev == null) delete state.assignments[projectId];
       else state.assignments[projectId] = prev;
       for (const g of state.groups) {
@@ -1296,7 +1296,7 @@ function entryHtml(p) {
     ? state.tabs.find(t => t.isQueue && t.project?.id === p.id)
     : null;
   const queuePanel = hasClaude ? `
-      <div class="entry__expanded__queue" data-queue-panel data-project-id="${escapeHtml(p.id)}">
+      <div class="entry__expanded__queue" data-queue-panel data-project-id="${escapeHtml(String(p.id))}">
         <span class="entry__expanded__queue-label">${escapeHtml(tr("queue.panelLabel"))}</span>
         <textarea class="entry__expanded__queue-input" data-queue-input rows="3"
           placeholder="${escapeHtml(tr("queue.placeholder"))}"></textarea>
@@ -1324,7 +1324,7 @@ function entryHtml(p) {
   }
   const expandLabel = isExpanded ? tr("entry.collapseSessions") : tr("entry.expandSessions");
   return `
-    <article class="entry ${state.selectedId===p.id?"is-selected":""} ${isMenuOpen?"is-menu-open":""} ${hasSession?"has-session":""} ${isExpanded?"is-expanded":""}" data-id="${p.id}" draggable="true">
+    <article class="entry ${state.selectedId===p.id?"is-selected":""} ${isMenuOpen?"is-menu-open":""} ${hasSession?"has-session":""} ${isExpanded?"is-expanded":""}" data-id="${escapeHtml(String(p.id))}" draggable="true">
       <div class="entry__body">
         <button type="button" class="entry__expand" data-expand-toggle draggable="false"
           aria-expanded="${isExpanded}" aria-label="${escapeHtml(expandLabel)}" title="${escapeHtml(expandLabel)}">
@@ -1371,7 +1371,7 @@ function entryMenuHtml(p, isOpen) {
     ? `<span class="tag tag--branch">⎇ ${escapeHtml(p.gitBranch)}</span>` : "";
 
   const pills = usages.map(u =>
-    `<button class="launch-pill" data-project-id="${p.id}" data-tool="${escapeHtml(u.toolKey)}" ${disabledTuiAttrs(p, u.toolKey)}>
+    `<button class="launch-pill" data-project-id="${escapeHtml(String(p.id))}" data-tool="${escapeHtml(u.toolKey)}" ${disabledTuiAttrs(p, u.toolKey)}>
        <i class="dot ${toolDotClass(u.toolKey)}" style="background:${toolColor(u.toolKey)}"></i>
        ${escapeHtml(u.toolName)}<small>${u.sessionCount} ${escapeHtml(sessAbbr)}</small>
      </button>`).join("");
@@ -1381,7 +1381,7 @@ function entryMenuHtml(p, isOpen) {
   const openerPills = openers.map(o => {
     const hint = (o.command || "").replace(/\{path\}/g, "").trim() || openHint;
     return `<button class="launch-pill launch-pill--ext"
-              data-project-id="${p.id}" data-opener-id="${escapeHtml(String(o.id))}">
+              data-project-id="${escapeHtml(String(p.id))}" data-opener-id="${escapeHtml(String(o.id))}">
               ${escapeHtml(o.label)}<small>${escapeHtml(hint)}</small>
     </button>`;
   }).join("");
@@ -1417,7 +1417,7 @@ function entryMenuHtml(p, isOpen) {
     <div class="entry__launch">
       <span class="entry__launch-label">${escapeHtml(tr("entry.label.openSession"))}</span>
       ${pills || `<span style="color:var(--bone-mute);font-size:12px">${escapeHtml(tr("entry.noInstruments"))}</span>`}
-      <button class="launch-pill launch-pill--new" data-project-id="${p.id}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
+      <button class="launch-pill launch-pill--new" data-project-id="${escapeHtml(String(p.id))}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
       ${openers.length ? `
         <div class="entry__openers">
           <span class="entry__launch-label entry__launch-label--ember">${escapeHtml(tr("entry.label.openWith"))}</span>
@@ -2241,7 +2241,7 @@ function toggleEntryExpand(projectId) {
   // control so keyboard users can immediately collapse it again with Space
   // or Enter and mouse users retain a clear visual state.
   requestAnimationFrame(() => {
-    const selector = `.entry[data-id="${CSS.escape(String(projectId))}"] [data-expand-toggle]`;
+    const selector = `${projectEntrySelector(projectId)} [data-expand-toggle]`;
     ledger.querySelector(selector)?.focus({ preventScroll: true });
   });
 }
@@ -2556,8 +2556,8 @@ function renderedGroupOrder(groupKey) {
 // cross-group positional move). Optimistic: mutate sortOrders + assignments
 // and re-render immediately, then reconcile from the server on success.
 async function setGroupOrder(groupKey, orderedIds) {
-  const prevOrders = { ...state.sortOrders };
-  const prevAssignments = { ...state.assignments };
+  const prevOrders = createProjectKeyedMap(state.sortOrders);
+  const prevAssignments = createProjectKeyedMap(state.assignments);
   // Optimistic: assign 10/20/30… so the bucket re-sorts to the new order.
   orderedIds.forEach((id, i) => { state.sortOrders[id] = (i + 1) * 10; });
   if (groupKey === "ungrouped") {
@@ -3371,7 +3371,7 @@ function renderSelectedLaunchPanel() {
         t.kind === "pty" && t.project?.id === project.id && t.usage?.toolKey === u.toolKey);
       const actionAttrs = openTab
         ? `data-switch-tab="${escapeHtml(String(openTab.tabId))}"`
-        : `data-project-id="${escapeHtml(project.id)}" data-tool="${escapeHtml(u.toolKey)}"`;
+        : `data-project-id="${escapeHtml(String(project.id))}" data-tool="${escapeHtml(u.toolKey)}"`;
       const disabledAttrs = openTab ? "" : disabledTuiAttrs(project, u.toolKey);
       const actionLabel = openTab ? tr("overview.openTerminal") : tr("entry.resume");
       const rawId = String(u.lastSessionId);
@@ -3391,7 +3391,7 @@ function renderSelectedLaunchPanel() {
   const openerPills = openers.map(o => {
     const hint = (o.command || "").replace(/\{path\}/g, "").trim() || openHint;
     return `<button class="launch-pill launch-pill--ext"
-              data-project-id="${escapeHtml(project.id)}" data-opener-id="${escapeHtml(String(o.id))}">
+              data-project-id="${escapeHtml(String(project.id))}" data-opener-id="${escapeHtml(String(o.id))}">
               ${escapeHtml(o.label)}<small>${escapeHtml(hint)}</small>
             </button>`;
   }).join("");
@@ -3428,7 +3428,7 @@ function renderSelectedLaunchPanel() {
 
     <div class="overview__section overview__group">
       <span class="overview__section-title">${escapeHtml(tr("entry.label.group"))}</span>
-      <select class="group-picker__select" data-group-picker data-project-id="${escapeHtml(project.id)}">
+      <select class="group-picker__select" data-group-picker data-project-id="${escapeHtml(String(project.id))}">
         <option value="">${escapeHtml(tr("group.ungrouped"))}</option>
         ${state.groups.map(g => `<option value="${g.id}" ${state.assignments[project.id] === g.id ? "selected" : ""}>${escapeHtml(g.name)}</option>`).join("")}
       </select>
@@ -3456,7 +3456,7 @@ function renderSelectedLaunchPanel() {
     <div class="overview__section">
       <span class="overview__section-title">${escapeHtml(tr("overview.quickActions"))}</span>
       <div class="overview__actions">
-        <button class="launch-pill launch-pill--new" data-project-id="${escapeHtml(project.id)}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
+        <button class="launch-pill launch-pill--new" data-project-id="${escapeHtml(String(project.id))}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
         <button class="launch-pill" data-overview-files>${escapeHtml(tr("overview.files"))}</button>
         <button class="launch-pill" data-overview-settings>${escapeHtml(tr("overview.settings"))}</button>
         <button class="launch-pill launch-pill--danger" data-ignore-project>${escapeHtml(tr("entry.ignoreTree"))}</button>
@@ -3809,7 +3809,7 @@ async function syncTrayProjects() {
   const groups = state.groups.map(g => ({ id: g.id, name: g.name }));
   // state.assignments is { projectId: groupId } — flatten into the
   // {projectId: groupId} shape the backend expects.
-  const assignments = { ...state.assignments };
+  const assignments = createProjectKeyedMap(state.assignments);
   try {
     await invoke("update_tray_projects", { projects, groups, assignments });
   } catch (e) { /* tray might not exist in some contexts */ }
@@ -5624,8 +5624,8 @@ async function reload() {
 // rebuild. Lets `↑↓` nav and row-click feel instant on large archives.
 function updateSelectionHighlight(prevId, newId) {
   if (prevId === newId) return;
-  const prev = prevId ? ledger.querySelector(`.entry[data-id="${prevId}"]`) : null;
-  const next = newId ? ledger.querySelector(`.entry[data-id="${newId}"]`) : null;
+  const prev = prevId ? ledger.querySelector(projectEntrySelector(prevId)) : null;
+  const next = newId ? ledger.querySelector(projectEntrySelector(newId)) : null;
   prev?.classList.remove("is-selected");
   next?.classList.add("is-selected");
 }
@@ -5678,7 +5678,7 @@ function moveCursor(delta) {
   if (!state.filtered.length) return;
   state.cursor = (state.cursor + delta + state.filtered.length) % state.filtered.length;
   select(state.filtered[state.cursor].id);
-  let el = ledger.querySelector(`.entry[data-id="${state.filtered[state.cursor].id}"]`);
+  let el = ledger.querySelector(projectEntrySelector(state.filtered[state.cursor].id));
   if (!el) {
     const targetId = state.filtered[state.cursor].id;
     const layoutIndex = state.ledgerLayout?.rows.findIndex(row =>
@@ -5687,7 +5687,7 @@ function moveCursor(delta) {
     const targetOffset = layoutIndex >= 0 ? state.ledgerLayout.offsets[layoutIndex] : 0;
     ledger.scrollTop = Math.max(0, targetOffset);
     renderVirtualLedger();
-    el = ledger.querySelector(`.entry[data-id="${targetId}"]`);
+    el = ledger.querySelector(projectEntrySelector(targetId));
   }
   el?.scrollIntoView({ block: "nearest" });
 }
@@ -5739,7 +5739,7 @@ let _gitSelectionToken = 0;
 const _gitInflight = new Map();
 
 function patchGitSyncBadge(projectId) {
-  const entry = ledger.querySelector(`.entry[data-id="${CSS.escape(String(projectId))}"]`);
+  const entry = ledger.querySelector(projectEntrySelector(projectId));
   if (!entry) return;
   const body = entry.querySelector(".entry__body");
   if (!body) return;
@@ -6333,6 +6333,23 @@ function setupThemeToggle() {
 }
 
 function escapeHtml(s) { return String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+// Project IDs come from the index and remain opaque for backwards
+// compatibility. Keep project-keyed state maps free of prototype inheritance
+// so IDs such as "__proto__" and "constructor" behave like ordinary keys.
+function createProjectKeyedMap(source) {
+  const map = Object.create(null);
+  if (!source || typeof source !== "object") return map;
+  for (const [key, value] of Object.entries(source)) map[String(key)] = value;
+  return map;
+}
+
+// Every selector that interpolates a project ID must pass through this helper.
+// CSS.escape protects opaque IDs containing quotes, brackets, slashes, and
+// selector punctuation while preserving exact dataset matching.
+function projectEntrySelector(projectId) {
+  return `.entry[data-id="${CSS.escape(String(projectId))}"]`;
+}
 
 /* ── i18n: static-HTML localization + language switching ──── */
 

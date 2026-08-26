@@ -31,8 +31,8 @@ mod session_cleanup;
 mod tui_tools;
 
 use process::{
-    git_read_spec, output_with_timeout, ProcessOutput, ProcessRunner, SystemProcessRunner,
-    TimeoutProcessRunner,
+    git_read_spec, git_user_operation_spec, output_with_timeout, ProcessOutput, ProcessRunner,
+    SystemProcessRunner, TimeoutProcessRunner,
 };
 use pty::{
     normalize_pty_size, take_once, validate_pty_input, PtyOutputBatcher, SessionStore,
@@ -52,6 +52,11 @@ const TUI_LOCAL_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const TUI_REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const TUI_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const TUI_MUTATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const REMOTE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_CONNECTION_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const REMOTE_SCAN_TIMEOUT: Duration = Duration::from_secs(120);
+const REMOTE_SCAN_MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REMOTE_SCAN_RECORDS: usize = 50_000;
 
 fn resolve_home_directory(
     override_home: Option<&str>,
@@ -129,6 +134,15 @@ fn adapter_selected(
     Ok(tui_preference(server_id, &adapter.id)?.unwrap_or(adapter.source == AdapterSource::Bundled))
 }
 
+fn adapter_probe_selected(
+    server_id: Option<i64>,
+    config: &core_config::AppConfig,
+    registry: &AdapterRegistry,
+    adapter: &TuiDefinition,
+) -> Result<bool, String> {
+    adapter_selected(server_id, config, registry, adapter)
+}
+
 fn write_local_adapter_selection(tool_key: &str, enabled: bool) -> Result<(), String> {
     let path = cli_config_path();
     let (_, registry) = load_adapter_context()?;
@@ -157,6 +171,34 @@ fn write_local_adapter_selection(tool_key: &str, enabled: bool) -> Result<(), St
     })
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+fn write_tui_selection(
+    server_id: Option<i64>,
+    tool_key: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    match server_id {
+        None => write_local_adapter_selection(tool_key, enabled),
+        Some(server_id) => write_tui_preference(Some(server_id), tool_key, enabled),
+    }
+}
+
+fn probe_with_selection_rollback<F>(
+    probe: Result<TuiMachineCapabilities, String>,
+    prior_enabled: bool,
+    restore: F,
+) -> Result<TuiMachineCapabilities, String>
+where
+    F: FnOnce(bool) -> Result<(), String>,
+{
+    match probe {
+        Ok(capabilities) => Ok(capabilities),
+        Err(error) => {
+            let _ = restore(prior_enabled);
+            Err(error)
+        }
+    }
 }
 
 fn resolve_tool_launch_argv_from_config(
@@ -3663,7 +3705,9 @@ fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, S
                 .map(|definition| {
                     let support_error =
                         adapter_support_error(definition, false, std::env::consts::OS);
-                    let detected = if support_error.is_none() {
+                    let probe_selected =
+                        adapter_probe_selected(None, &config, &registry, definition)?;
+                    let detected = if support_error.is_none() && probe_selected {
                         tui_tools::detect_local(definition, &runner)
                     } else {
                         tui_tools::DetectedTui {
@@ -3696,7 +3740,13 @@ fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, S
                 .filter(|definition| {
                     adapter_support_error(definition, true, &server.os_family).is_none()
                 })
-                .cloned()
+                .map(|definition| {
+                    adapter_probe_selected(Some(server_id), &config, &registry, definition)
+                        .map(|selected| selected.then(|| definition.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .collect::<Vec<_>>();
             let remote_command = tui_tools::remote_probe_script(&probe_catalog)?;
             let command = build_ssh_command(
@@ -3850,34 +3900,49 @@ async fn set_tui_enabled(
     enabled: bool,
 ) -> Result<TuiMachineCapabilities, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (_, registry) = load_adapter_context()?;
+        let (config, registry) = load_adapter_context()?;
         let definition = registry
             .find(&tool_key)
             .cloned()
             .ok_or_else(|| format!("adapter '{tool_key}' is not installed"))?;
-        let mut capabilities = probe_tui_machine(server_id)?;
-        let capability = capabilities
-            .tools
-            .iter_mut()
-            .find(|item| item.tool_key == definition.id)
-            .ok_or_else(|| format!("{} is not supported on this machine", definition.name))?;
-        if enabled && !capability.supported {
-            return Err(capability.support_error.clone().unwrap_or_else(|| {
-                format!("{} is not supported on this machine", definition.name)
-            }));
-        }
-        if enabled && !capability.installed {
+        ensure_adapter_supports_machine(&definition, server_id)?;
+        let prior_enabled = adapter_selected(server_id, &config, &registry, &definition)?;
+        if enabled && server_id.is_none() && !tui_tools::local_command_available(&definition) {
             return Err(format!(
                 "{} is not installed on this machine; install it before enabling it",
                 definition.name
             ));
         }
-        match server_id {
-            None => write_local_adapter_selection(&definition.id, enabled)?,
-            Some(_) => write_tui_preference(server_id, &definition.id, enabled)?,
+        write_tui_selection(server_id, &definition.id, enabled)?;
+        let mut capabilities = probe_with_selection_rollback(
+            probe_tui_machine(server_id),
+            prior_enabled,
+            |selection| write_tui_selection(server_id, &definition.id, selection),
+        )?;
+        let Some(capability) = capabilities
+            .tools
+            .iter_mut()
+            .find(|item| item.tool_key == definition.id)
+        else {
+            let _ = write_tui_selection(server_id, &definition.id, prior_enabled);
+            return Err(format!(
+                "{} is not supported on this machine",
+                definition.name
+            ));
+        };
+        if enabled && !capability.supported {
+            let _ = write_tui_selection(server_id, &definition.id, prior_enabled);
+            return Err(capability.support_error.clone().unwrap_or_else(|| {
+                format!("{} is not supported on this machine", definition.name)
+            }));
         }
-        capability.adapter_enabled = enabled;
-        capability.enabled = capability.installed && enabled;
+        if enabled && !capability.installed {
+            let _ = write_tui_selection(server_id, &definition.id, prior_enabled);
+            return Err(format!(
+                "{} is not installed on this machine; install it before enabling it",
+                definition.name
+            ));
+        }
         Ok(capabilities)
     })
     .await
@@ -3890,12 +3955,13 @@ async fn install_tui(
     tool_key: String,
 ) -> Result<TuiMachineCapabilities, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (_, registry) = load_adapter_context()?;
+        let (config, registry) = load_adapter_context()?;
         let definition = registry
             .find(&tool_key)
             .cloned()
             .ok_or_else(|| format!("adapter '{tool_key}' is not installed"))?;
         ensure_adapter_supports_machine(&definition, server_id)?;
+        let prior_enabled = adapter_selected(server_id, &config, &registry, &definition)?;
         match server_id {
             None => tui_tools::run_local_install(
                 &definition,
@@ -3922,23 +3988,25 @@ async fn install_tui(
                 }
             }
         }
-        let capabilities = probe_tui_machine(server_id)?;
+        write_tui_selection(server_id, &definition.id, true)?;
+        let capabilities = probe_with_selection_rollback(
+            probe_tui_machine(server_id),
+            prior_enabled,
+            |selection| write_tui_selection(server_id, &definition.id, selection),
+        )?;
         let installed = capabilities
             .tools
             .iter()
             .find(|tool| tool.tool_key == definition.id)
             .is_some_and(|tool| tool.installed);
         if !installed {
+            let _ = write_tui_selection(server_id, &definition.id, prior_enabled);
             return Err(format!(
                 "{} installer finished, but the command is still not available on PATH",
                 definition.name
             ));
         }
-        match server_id {
-            None => write_local_adapter_selection(&definition.id, true)?,
-            Some(_) => write_tui_preference(server_id, &definition.id, true)?,
-        }
-        probe_tui_machine(server_id)
+        Ok(capabilities)
     })
     .await
     .map_err(|error| format!("TUI install worker panicked: {error}"))?
@@ -4239,7 +4307,15 @@ fn run_remote_connection_probe(
         idfile.as_deref().and_then(|path| path.to_str()),
         probe,
     )?;
-    let out = SystemProcessRunner.output(&cmd).map_err(|e| {
+    let out = TimeoutProcessRunner::with_limits(
+        REMOTE_CONNECTION_TIMEOUT,
+        REMOTE_CONNECTION_MAX_OUTPUT_BYTES,
+    )
+    .output(&cmd)
+    .map_err(|e| {
+        if e.starts_with("process timed out") || e.contains("output limit") {
+            return format!("remote SSH connection probe failed: {e}");
+        }
         // Failed to even spawn ssh — usually means ssh isn't installed.
         format!(
             "Could not start ssh.\n\
@@ -4531,7 +4607,12 @@ fn parse_remote_scan_output(
             fields.len()
         ));
     }
-
+    let record_count = fields.len() / 3;
+    if record_count > MAX_REMOTE_SCAN_RECORDS {
+        return Err(format!(
+            "remote scan returned too many records ({record_count}; maximum is {MAX_REMOTE_SCAN_RECORDS})"
+        ));
+    }
     let mut deduplicated: BTreeMap<String, RemoteScanRow> = BTreeMap::new();
     for record in fields.chunks_exact(3) {
         let path = std::str::from_utf8(record[0])
@@ -4645,6 +4726,22 @@ fn validate_remote_scan_output(
     parse_remote_scan_output(&output.stdout, remote_home)
 }
 
+fn validate_remote_scan_before_write<T, F>(
+    output: &ProcessOutput,
+    remote_home: &str,
+    user: &str,
+    host: &str,
+    port: u16,
+    identity_file: Option<&str>,
+    write_snapshot: F,
+) -> Result<T, String>
+where
+    F: FnOnce(Vec<RemoteScanRow>) -> Result<T, String>,
+{
+    let rows = validate_remote_scan_output(output, remote_home, user, host, port, identity_file)?;
+    write_snapshot(rows)
+}
+
 fn legacy_remote_project_path(path: &str) -> String {
     format!("{}/.git", path.trim_end_matches('/'))
 }
@@ -4735,7 +4832,15 @@ fn run_remote_server_scan(server_id: i64) -> Result<i64, String> {
             idfile.as_deref(),
             &identity_cmd,
         )?;
-        let out = SystemProcessRunner.output(&cmd).map_err(|e| {
+        let out = TimeoutProcessRunner::with_limits(
+            REMOTE_CONNECTION_TIMEOUT,
+            REMOTE_CONNECTION_MAX_OUTPUT_BYTES,
+        )
+        .output(&cmd)
+        .map_err(|e| {
+            if e.starts_with("process timed out") || e.contains("output limit") {
+                return format!("remote SSH identity probe failed: {e}");
+            }
             format!(
                 "Could not start ssh.\n\
                  Is OpenSSH installed and on PATH? ({e})\n\
@@ -4770,121 +4875,132 @@ fn run_remote_server_scan(server_id: i64) -> Result<i64, String> {
             idfile.as_deref(),
             &find_cmd,
         )?;
-        SystemProcessRunner.output(&cmd).map_err(|e| {
-            format!(
-                "Could not start ssh.\n\
+        TimeoutProcessRunner::with_limits(REMOTE_SCAN_TIMEOUT, REMOTE_SCAN_MAX_OUTPUT_BYTES)
+            .output(&cmd)
+            .map_err(|e| {
+                if e.starts_with("process timed out") || e.contains("output limit") {
+                    return format!("remote SSH project scan failed: {e}");
+                }
+                format!(
+                    "Could not start ssh.\n\
                  Is OpenSSH installed and on PATH? ({e})\n\
                  无法启动 ssh。\n\
                  请确认已安装 OpenSSH 并在 PATH 中。({e})"
-            )
-        })?
+                )
+            })?
     };
-    let rows = validate_remote_scan_output(
+    validate_remote_scan_before_write(
         &out,
         &home,
         &server.user,
         &server.host,
         port,
         idfile.as_deref(),
-    )?;
-
-    // Upsert into remote_projects. Use a transaction so a partial scan
-    // never leaves the table half-written. We replace the entire set
-    // for this server (matches the local `scan_projects` model — each
-    // scan is a snapshot, deletions happen because the dir is gone).
-    with_prefs(|c| {
-        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
-        // Manual ignore rules hide rows at presentation time rather than
-        // deleting scanner-owned data. Keep inserting every discovered row so
-        // removing a rule restores it immediately, but report only the rows a
-        // user can actually see after this scan.
-        let ignore_rules = list_project_ignores_from_connection(&tx)?;
-        let previous_access: HashMap<String, String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT path, last_accessed_at
+        |rows| {
+            // Upsert into remote_projects. Use a transaction so a partial scan
+            // never leaves the table half-written. We replace the entire set
+            // for this server (matches the local `scan_projects` model — each
+            // scan is a snapshot, deletions happen because the dir is gone).
+            with_prefs(|c| {
+                let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+                // Manual ignore rules hide rows at presentation time rather than
+                // deleting scanner-owned data. Keep inserting every discovered row so
+                // removing a rule restores it immediately, but report only the rows a
+                // user can actually see after this scan.
+                let ignore_rules = list_project_ignores_from_connection(&tx)?;
+                let previous_access: HashMap<String, String> = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT path, last_accessed_at
                      FROM remote_projects
                      WHERE server_id = ?1",
-                )
-                .map_err(|e| e.to_string())?;
-            let values = stmt
-                .query_map(params![server_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<_, _>>()
-                .map_err(|e| e.to_string())?;
-            values
-        };
-        for row in &rows {
-            let project_id = remote_project_id(server_id, &row.path);
-            let legacy_project_id =
-                remote_project_id(server_id, &legacy_remote_project_path(&row.path));
-            migrate_legacy_remote_tool_usages(&tx, server_id, &legacy_project_id, &project_id)?;
-        }
-        let latest_tool_access: HashMap<String, String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT project_id, MAX(last_used_at)
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let values = stmt
+                        .query_map(params![server_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| e.to_string())?
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| e.to_string())?;
+                    values
+                };
+                for row in &rows {
+                    let project_id = remote_project_id(server_id, &row.path);
+                    let legacy_project_id =
+                        remote_project_id(server_id, &legacy_remote_project_path(&row.path));
+                    migrate_legacy_remote_tool_usages(
+                        &tx,
+                        server_id,
+                        &legacy_project_id,
+                        &project_id,
+                    )?;
+                }
+                let latest_tool_access: HashMap<String, String> = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT project_id, MAX(last_used_at)
                      FROM remote_tool_usages
                      WHERE server_id = ?1
                      GROUP BY project_id",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let values = stmt
+                        .query_map(params![server_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| e.to_string())?
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| e.to_string())?;
+                    values
+                };
+                tx.execute(
+                    "DELETE FROM remote_projects WHERE server_id = ?1",
+                    params![server_id],
                 )
                 .map_err(|e| e.to_string())?;
-            let values = stmt
-                .query_map(params![server_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<_, _>>()
-                .map_err(|e| e.to_string())?;
-            values
-        };
-        tx.execute(
-            "DELETE FROM remote_projects WHERE server_id = ?1",
-            params![server_id],
-        )
-        .map_err(|e| e.to_string())?;
-        let now = chrono_like_now_iso();
-        let mut total: i64 = 0;
-        for row in &rows {
-            let path = &row.path;
-            let legacy_path = legacy_remote_project_path(path);
-            // project_id is synthetic: 'r<server_id>:<path>'. We hash the
-            // path into a short hex suffix so the id stays well-bounded
-            // for the frontend (avoids giant DOM ids in queries).
-            let project_id = remote_project_id(server_id, path);
-            let last_accessed_at = remote_last_accessed_at(
-                row.last_activity_epoch,
-                latest_tool_access.get(&project_id).map(String::as_str),
-                previous_access
-                    .get(path)
-                    .or_else(|| previous_access.get(&legacy_path))
-                    .map(String::as_str),
-                &now,
-            );
-            tx.execute(
-                "INSERT INTO remote_projects
+                let now = chrono_like_now_iso();
+                let mut total: i64 = 0;
+                for row in &rows {
+                    let path = &row.path;
+                    let legacy_path = legacy_remote_project_path(path);
+                    // project_id is synthetic: 'r<server_id>:<path>'. We hash the
+                    // path into a short hex suffix so the id stays well-bounded
+                    // for the frontend (avoids giant DOM ids in queries).
+                    let project_id = remote_project_id(server_id, path);
+                    let last_accessed_at = remote_last_accessed_at(
+                        row.last_activity_epoch,
+                        latest_tool_access.get(&project_id).map(String::as_str),
+                        previous_access
+                            .get(path)
+                            .or_else(|| previous_access.get(&legacy_path))
+                            .map(String::as_str),
+                        &now,
+                    );
+                    tx.execute(
+                        "INSERT INTO remote_projects
                    (project_id, server_id, path, name, last_accessed_at, git_branch)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    project_id,
-                    server_id,
-                    path,
-                    project_name_from_path(path),
-                    last_accessed_at,
-                    row.branch.as_deref()
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-            if !project_path_is_excluded("remote", Some(server_id), path, &ignore_rules) {
-                total += 1;
-            }
-        }
-        update_remote_server_scan_metadata(&tx, server_id, &now, &identity.os_family)?;
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(total)
-    })
+                        params![
+                            project_id,
+                            server_id,
+                            path,
+                            project_name_from_path(path),
+                            last_accessed_at,
+                            row.branch.as_deref()
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    if !project_path_is_excluded("remote", Some(server_id), path, &ignore_rules) {
+                        total += 1;
+                    }
+                }
+                update_remote_server_scan_metadata(&tx, server_id, &now, &identity.os_family)?;
+                tx.commit().map_err(|e| e.to_string())?;
+                Ok(total)
+            })
+        },
+    )
 }
 
 /// Remote discovery can wait on two SSH processes and perform SQLite work.
@@ -5530,6 +5646,28 @@ fn run_git_with(runner: &dyn ProcessRunner, path: &str, args: &[&str]) -> Option
     }
 }
 
+fn run_git_user_operation(path: &str, args: &[&str]) -> Option<String> {
+    run_git_user_operation_with(&SystemProcessRunner, path, args)
+}
+
+fn run_git_user_operation_with(
+    runner: &dyn ProcessRunner,
+    path: &str,
+    args: &[&str],
+) -> Option<String> {
+    let spec = git_user_operation_spec(std::path::Path::new(path), args);
+    let out = runner.output(&spec).ok()?;
+    if !out.success {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 #[derive(Default)]
 struct LocalGitStatus {
     branch: Option<String>,
@@ -5597,6 +5735,26 @@ fn git_fetch_spec(path: &Path) -> process::ProcessSpec {
     .env("GCM_INTERACTIVE", "Never")
 }
 
+fn is_supported_git_remote_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() || url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("ssh://") {
+        return true;
+    }
+    // Git's scp-like SSH syntax (for example git@example.test:org/repo.git)
+    // has no URI scheme but is still an explicitly supported SSH transport.
+    let Some((user_host, remote_path)) = url.split_once(':') else {
+        return false;
+    };
+    !user_host.is_empty()
+        && user_host.contains('@')
+        && !remote_path.is_empty()
+        && !user_host.starts_with('-')
+}
+
 fn run_git_fetch_with_timeout(path: &str, timeout: Duration) -> Result<Option<String>, String> {
     let spec = git_fetch_spec(Path::new(path));
     let output = match output_with_timeout(&spec, timeout) {
@@ -5618,6 +5776,20 @@ fn run_git_fetch_with_timeout(path: &str, timeout: Duration) -> Result<Option<St
     } else {
         message.chars().take(300).collect()
     }))
+}
+
+fn run_git_fetch_and_read_status<Fetch, ReadStatus>(
+    fetch: Fetch,
+    read_status: ReadStatus,
+) -> Result<(Option<String>, LocalGitStatus), String>
+where
+    Fetch: FnOnce() -> Result<Option<String>, String>,
+    ReadStatus: FnOnce() -> Option<LocalGitStatus>,
+{
+    let fetch_error = fetch()?;
+    let status =
+        read_status().ok_or_else(|| "could not read Git status after fetch".to_string())?;
+    Ok((fetch_error, status))
 }
 
 fn run_parallel_git_metadata<F>(run: F) -> (Option<String>, Option<String>, Option<String>)
@@ -5756,8 +5928,9 @@ fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod git_sync_tests {
     use super::{
-        git_fetch_spec, parse_ahead_behind, parse_local_git_status, parse_remote_git_info,
-        run_parallel_git_metadata,
+        git_fetch_spec, is_supported_git_remote_url, parse_ahead_behind, parse_local_git_status,
+        parse_remote_git_info, run_git_fetch_and_read_status, run_parallel_git_metadata,
+        LocalGitStatus,
     };
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5855,6 +6028,69 @@ mod git_sync_tests {
             .environment
             .iter()
             .any(|(key, value)| key == "GCM_INTERACTIVE" && value == "Never"));
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("protocol.allow=never"),
+            ]
+        }));
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("protocol.https.allow=always"),
+            ]
+        }));
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("protocol.ssh.allow=always"),
+            ]
+        }));
+    }
+
+    #[test]
+    fn background_fetch_accepts_only_explicit_https_or_ssh_remotes() {
+        assert!(is_supported_git_remote_url("https://example.test/repo.git"));
+        assert!(is_supported_git_remote_url(
+            "ssh://git@example.test/repo.git"
+        ));
+        assert!(is_supported_git_remote_url("git@example.test:org/repo.git"));
+        assert!(!is_supported_git_remote_url("http://example.test/repo.git"));
+        assert!(!is_supported_git_remote_url("file:///tmp/repo"));
+        assert!(!is_supported_git_remote_url("ext::echo should-not-run"));
+        assert!(!is_supported_git_remote_url("helper::example.test/repo"));
+    }
+
+    #[test]
+    fn post_fetch_status_is_the_snapshot_returned_to_the_caller() {
+        let before = LocalGitStatus {
+            behind: 3,
+            ..LocalGitStatus::default()
+        };
+        let after = LocalGitStatus {
+            behind: 0,
+            ..before
+        };
+        let (fetch_error, status) = run_git_fetch_and_read_status(
+            || Ok(Some("remote was temporarily unavailable".to_string())),
+            || Some(after),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fetch_error.as_deref(),
+            Some("remote was temporarily unavailable")
+        );
+        assert_eq!(status.behind, 0);
+    }
+
+    #[test]
+    fn post_fetch_status_failure_keeps_an_explicit_error() {
+        let error = match run_git_fetch_and_read_status(|| Ok(None), || None) {
+            Ok(_) => panic!("post-fetch status should be required"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "could not read Git status after fetch");
     }
 }
 
@@ -5862,9 +6098,31 @@ fn run_git_sync(path: &str) -> Result<GitSyncInfo, String> {
     if !Path::new(path).is_dir() {
         return Err(format!("directory not found: {path}"));
     }
-    let fetch_error = run_git_fetch_with_timeout(path, Duration::from_secs(10))?;
     let status =
-        run_git_status(path).ok_or_else(|| "could not read Git status after fetch".to_string())?;
+        run_git_status(path).ok_or_else(|| "could not read Git status before fetch".to_string())?;
+    let (status, fetch_error) = match status.upstream.as_deref() {
+        Some(upstream) => {
+            let remote_name = upstream.split_once('/').map(|(name, _)| name);
+            match remote_name.and_then(|name| run_git(path, &["remote", "get-url", "--", name])) {
+                Some(url) if is_supported_git_remote_url(&url) => {
+                    let (fetch_error, status) = run_git_fetch_and_read_status(
+                        || run_git_fetch_with_timeout(path, Duration::from_secs(10)),
+                        || run_git_status(path),
+                    )?;
+                    (status, fetch_error)
+                }
+                Some(_) => (
+                    status,
+                    Some("git fetch skipped: remote transport is not HTTPS or SSH".into()),
+                ),
+                None => (
+                    status,
+                    Some("git fetch skipped: could not resolve upstream remote".into()),
+                ),
+            }
+        }
+        None => (status, None),
+    };
     Ok(GitSyncInfo {
         branch: status.branch,
         head_short: status.head_short,
@@ -6055,12 +6313,12 @@ fn add_git_remote(path: String, name: String, url: String) -> Result<(), String>
     // remote can be attached. This makes "+ add remote" a one-click
     // "make this a git project and connect it" affordance — the user
     // can then `git add . && git commit` to push their first commit.
-    let is_repo = run_git(&path, &["rev-parse", "--is-inside-work-tree"])
+    let is_repo = run_git_user_operation(&path, &["rev-parse", "--is-inside-work-tree"])
         .map(|s| s == "true")
         .unwrap_or(false);
     if !is_repo {
         let init = SystemProcessRunner
-            .output(&git_read_spec(Path::new(&path), &["init"]))
+            .output(&git_user_operation_spec(Path::new(&path), &["init"]))
             .map_err(|e| format!("failed to run git: {e}"))?;
         if !init.success {
             return Err(format!(
@@ -6070,7 +6328,7 @@ fn add_git_remote(path: String, name: String, url: String) -> Result<(), String>
         }
     }
     let out = SystemProcessRunner
-        .output(&git_read_spec(
+        .output(&git_user_operation_spec(
             Path::new(&path),
             &["remote", "add", name, url],
         ))
@@ -6110,7 +6368,7 @@ fn checkout_branch(path: String, name: String) -> Result<(), String> {
         return Err(format!("invalid branch name: {name}"));
     }
     // Confirm the branch actually exists in the local repo.
-    let known = run_git(
+    let known = run_git_user_operation(
         &path,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
     )
@@ -6122,7 +6380,10 @@ fn checkout_branch(path: String, name: String) -> Result<(), String> {
     // `git switch` (not `checkout`) is the modern, safer command —
     // refuses to clobber uncommitted changes unless --force.
     let out = SystemProcessRunner
-        .output(&git_read_spec(Path::new(&path), &["switch", name]))
+        .output(&git_user_operation_spec(
+            Path::new(&path),
+            &["switch", name],
+        ))
         .map_err(|e| format!("failed to run git: {e}"))?;
     if !out.success {
         return Err(format!(
@@ -7473,6 +7734,62 @@ mod baseline_tests {
     }
 
     #[test]
+    fn adapter_probe_selection_defaults_to_official_and_requires_extension_enablement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("adapters");
+        let source = temporary.path().join("demo.json");
+        std::fs::write(
+            &source,
+            r#"{
+              "apiVersion": 1,
+              "id": "demo",
+              "name": "Demo",
+              "adapterVersion": "1.0.0",
+              "command": "demo",
+              "launch": { "newArgs": [], "resumeArgs": [] },
+              "scanner": { "handler": "metadata-v1", "dataDirectory": "~/.demo/sessions" }
+            }"#,
+        )
+        .unwrap();
+        sessionatlas_core::adapter::install_manifest_file(&source, &root).unwrap();
+
+        let config = core_config::AppConfig::default();
+        let registry = AdapterRegistry::load(&root, &config).unwrap();
+        let official = registry.find("codex").unwrap();
+        let extension = registry.find("demo").unwrap();
+        assert!(adapter_probe_selected(None, &config, &registry, official).unwrap());
+        assert!(!adapter_probe_selected(None, &config, &registry, extension).unwrap());
+
+        let mut extension_only = config.clone();
+        extension_only.enabled_adapters = Some(vec!["demo".to_string()]);
+        assert!(!adapter_probe_selected(None, &extension_only, &registry, official).unwrap());
+        assert!(adapter_probe_selected(None, &extension_only, &registry, extension).unwrap());
+
+        let mut enabled = config.clone();
+        enabled.enabled_adapters = Some(vec!["codex".to_string(), "demo".to_string()]);
+        assert!(adapter_probe_selected(None, &enabled, &registry, official).unwrap());
+        assert!(adapter_probe_selected(None, &enabled, &registry, extension).unwrap());
+    }
+
+    #[test]
+    fn probe_failure_restores_the_prior_adapter_selection() {
+        for prior_enabled in [true, false] {
+            let restored = std::cell::Cell::new(None);
+            let result = probe_with_selection_rollback(
+                Err("probe failed".to_string()),
+                prior_enabled,
+                |selection| {
+                    restored.set(Some(selection));
+                    Ok(())
+                },
+            );
+
+            assert!(result.is_err());
+            assert_eq!(restored.get(), Some(prior_enabled));
+        }
+    }
+
+    #[test]
     fn explicit_adapter_selection_preserves_concurrent_extension_ids() {
         let registry = AdapterRegistry::bundled().unwrap();
         let mut config = core_config::AppConfig::default();
@@ -7794,6 +8111,117 @@ mod baseline_tests {
     }
 
     #[test]
+    fn remote_scan_output_accepts_the_record_limit_before_deduplication() {
+        let mut stdout = Vec::new();
+        for _ in 0..MAX_REMOTE_SCAN_RECORDS {
+            stdout.extend_from_slice(b"/srv/repo\x00main\x001720000000\x00");
+        }
+        let rows = parse_remote_scan_output(&stdout, "/home/demo").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn remote_scan_output_rejects_one_record_over_the_limit_before_deduplication() {
+        let mut stdout = Vec::new();
+        for _ in 0..=MAX_REMOTE_SCAN_RECORDS {
+            stdout.extend_from_slice(b"/srv/repo\x00main\x001720000000\x00");
+        }
+        let error = parse_remote_scan_output(&stdout, "/home/demo").unwrap_err();
+        assert!(error.contains("too many records"));
+        assert!(error.contains("50001"));
+    }
+
+    #[test]
+    fn remote_scan_validation_does_not_invoke_snapshot_writer_on_failure() {
+        use std::cell::Cell;
+
+        let mut stdout = Vec::new();
+        for _ in 0..=MAX_REMOTE_SCAN_RECORDS {
+            stdout.extend_from_slice(b"/srv/repo\x00main\x001720000000\x00");
+        }
+        let writer_called = Cell::new(false);
+        let result = validate_remote_scan_before_write(
+            &ProcessOutput {
+                success: true,
+                status_code: Some(0),
+                stdout,
+                stderr: Vec::new(),
+            },
+            "/home/demo",
+            "demo",
+            "example.test",
+            22,
+            None,
+            |_| {
+                writer_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!writer_called.get());
+    }
+
+    #[test]
+    fn remote_scan_validation_failure_preserves_existing_snapshot_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE remote_projects (server_id INTEGER, path TEXT);
+                 CREATE TABLE remote_servers (id INTEGER PRIMARY KEY, last_scanned_at TEXT);
+                 INSERT INTO remote_projects VALUES (7, '/srv/old');
+                 INSERT INTO remote_servers VALUES (7, '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        let mut stdout = Vec::new();
+        for _ in 0..=MAX_REMOTE_SCAN_RECORDS {
+            stdout.extend_from_slice(b"/srv/repo\x00main\x001720000000\x00");
+        }
+
+        let result = validate_remote_scan_before_write(
+            &ProcessOutput {
+                success: true,
+                status_code: Some(0),
+                stdout,
+                stderr: Vec::new(),
+            },
+            "/home/demo",
+            "demo",
+            "example.test",
+            22,
+            None,
+            |rows| {
+                connection
+                    .execute("DELETE FROM remote_projects", [])
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE remote_servers SET last_scanned_at = 'changed' WHERE id = 7",
+                        [],
+                    )
+                    .unwrap();
+                Ok(rows.len())
+            },
+        );
+        assert!(result.is_err());
+        let project_path: String = connection
+            .query_row(
+                "SELECT path FROM remote_projects WHERE server_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let scanned_at: String = connection
+            .query_row(
+                "SELECT last_scanned_at FROM remote_servers WHERE id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(project_path, "/srv/old");
+        assert_eq!(scanned_at, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
     fn remote_recency_uses_real_activity_without_rescan_churn() {
         let previous_scan_time = "2099-01-01T00:00:00Z";
         let tool_access = "2025-01-01T00:00:00Z";
@@ -7992,6 +8420,67 @@ mod baseline_tests {
             ]
         );
         assert!(!args.iter().any(|argument| argument == "friendly-key"));
+    }
+
+    #[test]
+    fn legacy_resume_rejects_option_session_ids_before_remote_command_building() {
+        let mut config = core_config::AppConfig::default();
+        config.custom_tools = vec![sessionatlas_core::model::ToolSource {
+            key: "legacy-tool".to_string(),
+            cli_command: "fixture-cli".to_string(),
+            is_enabled: true,
+            ..sessionatlas_core::model::ToolSource::default()
+        }];
+        let registry = AdapterRegistry::bundled().unwrap();
+
+        for session_id in [
+            "-x",
+            "--help",
+            " -x ",
+            "\u{2212}x",
+            "\u{2011}x",
+            "legacy\nresume",
+        ] {
+            assert!(
+                resolve_tool_launch_argv_from_config(
+                    "legacy-tool",
+                    Some(session_id),
+                    &config,
+                    &registry,
+                )
+                .is_err(),
+                "local legacy launch accepted {session_id:?}"
+            );
+
+            let mut remote_builder_called = false;
+            let result = resolve_tool_launch_argv_from_config(
+                "legacy-tool",
+                Some(session_id),
+                &config,
+                &registry,
+            )
+            .and_then(|argv| {
+                remote_builder_called = true;
+                build_remote_tmux_command("/srv/project", Some("legacy-tool"), Some(&argv))
+            });
+            assert!(result.is_err());
+            assert!(!remote_builder_called);
+        }
+
+        let valid = resolve_tool_launch_argv_from_config(
+            "legacy-tool",
+            Some("provider.v2_1:part+2-id"),
+            &config,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(
+            valid.last().map(String::as_str),
+            Some("provider.v2_1:part+2-id")
+        );
+        let remote =
+            build_remote_tmux_command("/srv/project", Some("legacy-tool"), Some(&valid)).unwrap();
+        assert!(remote.contains("--resume provider.v2_1:part+2-id"));
     }
 
     #[test]

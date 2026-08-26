@@ -4,7 +4,7 @@ use serde::Serialize;
 #[cfg(test)]
 use sessionatlas_core::adapter::AdapterRegistry;
 use sessionatlas_core::adapter::{AdapterSource, RegisteredAdapter};
-use sessionatlas_core::process::resolve_program;
+use sessionatlas_core::process::{is_bare_program_name, resolve_bare_program};
 use sessionatlas_core::security::{build_posix_command, parse_safe_command, quote_posix};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -238,7 +238,7 @@ pub(crate) fn detect_local<R: ProcessRunner>(
             version: None,
         };
     };
-    let Some(program) = resolve_program(program_name) else {
+    let Some(program) = resolve_bare_program(program_name) else {
         return DetectedTui {
             installed: false,
             version: None,
@@ -275,12 +275,12 @@ pub(crate) fn local_command_available(definition: &TuiDefinition) -> bool {
     parse_safe_command(&definition.command)
         .ok()
         .and_then(|argv| argv.into_iter().next())
-        .and_then(|program| resolve_program(&program))
+        .and_then(|program| resolve_bare_program(&program))
         .is_some()
 }
 
 pub(crate) fn local_manager_path(definition: &TuiDefinition) -> Option<PathBuf> {
-    definition.manager.as_deref().and_then(resolve_program)
+    definition.manager.as_deref().and_then(resolve_bare_program)
 }
 
 fn local_installed_package_spec(definition: &TuiDefinition) -> Result<ProcessSpec, String> {
@@ -439,6 +439,9 @@ fn remote_version_command(definition: &TuiDefinition) -> Result<(String, String)
         .first()
         .cloned()
         .ok_or_else(|| "adapter command is empty".to_string())?;
+    if !is_bare_program_name(&executable) {
+        return Err("adapter command must be a bare executable name resolved through PATH".into());
+    }
     argv.extend(definition.version_args.iter().cloned());
     let command = build_posix_command(&argv).map_err(|error| error.to_string())?;
     Ok((
@@ -675,6 +678,25 @@ pub(crate) fn validate_remote_probe(
 mod tests {
     use super::*;
 
+    struct CountingRunner(std::cell::Cell<usize>);
+
+    impl ProcessRunner for CountingRunner {
+        fn output(&self, _spec: &ProcessSpec) -> Result<ProcessOutput, String> {
+            self.0.set(self.0.get() + 1);
+            Ok(ProcessOutput {
+                success: true,
+                status_code: Some(0),
+                stdout: b"demo 1.0.0\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn spawn(&self, _spec: &ProcessSpec) -> Result<(), String> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
     fn test_catalog() -> Vec<TuiDefinition> {
         bundled_catalog()
     }
@@ -700,6 +722,32 @@ mod tests {
         assert!(probe.contains("npm list --global '@earendil-works/pi-coding-agent'"));
         assert!(definition(&catalog, "shell").is_err());
         assert!(definition(&catalog, "npm install evil").is_err());
+    }
+
+    #[test]
+    fn local_probe_rejects_path_commands_without_starting_a_runner() {
+        let mut definition = bundled_catalog().into_iter().next().unwrap();
+        definition.manifest.command = r"C:\tools\codex.exe".to_string();
+        let runner = CountingRunner(std::cell::Cell::new(0));
+
+        let detected = detect_local(&definition, &runner);
+
+        assert_eq!(
+            detected,
+            DetectedTui {
+                installed: false,
+                version: None
+            }
+        );
+        assert_eq!(runner.0.get(), 0);
+    }
+
+    #[test]
+    fn remote_probe_rejects_path_commands_before_building_shell_text() {
+        let mut definition = bundled_catalog().into_iter().next().unwrap();
+        definition.manifest.command = "./tools/codex".to_string();
+
+        assert!(remote_probe_script(&[definition]).is_err());
     }
 
     #[test]

@@ -15,9 +15,9 @@ use chrono::{DateTime, Utc};
 
 use crate::scanner::custom::executable_on_path;
 use crate::scanner::{
-    complete_session_files, home_directory, missing_source, probe_directory,
-    recursive_file_enumeration, source_read_failure, ScanDiagnostic, ScanDiagnosticSeverity,
-    ScanOutcome, ScannedProject, Scanner, SourceProbe, SESSION_READ_FAILED,
+    bounded_recursive_files, complete_session_files, home_directory, missing_source,
+    no_follow_metadata, probe_directory, source_read_failure, ScanBudget, ScanDiagnostic,
+    ScanDiagnosticSeverity, ScanOutcome, ScannedProject, Scanner, SourceProbe, SESSION_READ_FAILED,
 };
 
 /// Aider history-marker file name; a project is its parent directory.
@@ -29,6 +29,7 @@ const SEARCH_ROOTS: [&str; 4] = ["work", "projects", "dev", "src"];
 /// Aider scanner.
 pub struct AiderScanner {
     is_command_available: Box<dyn Fn() -> bool>,
+    budget: ScanBudget,
 }
 
 impl AiderScanner {
@@ -43,7 +44,12 @@ impl AiderScanner {
     pub fn with_availability(is_available: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_command_available: Box::new(is_available),
+            budget: ScanBudget::default(),
         }
+    }
+    pub fn with_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -91,25 +97,31 @@ impl Scanner for AiderScanner {
 
         let mut projects: Vec<ScannedProject> = Vec::new();
         let mut diagnostics: Vec<ScanDiagnostic> = Vec::new();
+        let context = self.budget.context();
         let mut seen_paths: HashSet<String> = HashSet::new();
         let mut marker_count: usize = 0;
 
         for root in &roots {
-            for entry in recursive_file_enumeration(root) {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(_) => {
-                        return source_read_failure(
-                            self.tool_key(),
-                            "the configured Aider search roots",
-                        );
-                    }
-                };
-                if !entry.file_type().is_file() || entry.file_name() != HISTORY_MARKER {
+            let entries = match bounded_recursive_files(root, &context) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return ScanOutcome::failed([context.diagnostic(self.tool_key(), error)])
+                }
+            };
+            for path in entries {
+                if no_follow_metadata(&path).map_or(true, |meta| !meta.is_file())
+                    || path.file_name().is_none_or(|name| name != HISTORY_MARKER)
+                {
                     continue;
                 }
                 marker_count += 1;
-                let Some(parent) = entry.path().parent() else {
+                if let Err(error) = context.source_file(0) {
+                    return ScanOutcome::failed([context.diagnostic(self.tool_key(), error)]);
+                }
+                if let Err(error) = context.record() {
+                    return ScanOutcome::failed([context.diagnostic(self.tool_key(), error)]);
+                }
+                let Some(parent) = path.parent() else {
                     continue;
                 };
                 let Some(normalized) = crate::path::normalize_native(&parent.to_string_lossy())
@@ -119,19 +131,19 @@ impl Scanner for AiderScanner {
                 if !seen_paths.insert(case_fold(&normalized)) {
                     continue;
                 }
-                let last_accessed =
-                    match std::fs::metadata(entry.path()).and_then(|meta| meta.modified()) {
-                        Ok(modified) => DateTime::<Utc>::from(modified),
-                        Err(_) => {
-                            diagnostics.push(ScanDiagnostic::new(
-                                self.tool_key(),
-                                ScanDiagnosticSeverity::Warning,
-                                SESSION_READ_FAILED,
-                                "An Aider history marker could not be inspected and was skipped.",
-                            ));
-                            continue;
-                        }
-                    };
+                let last_accessed = match no_follow_metadata(&path).and_then(|meta| meta.modified())
+                {
+                    Ok(modified) => DateTime::<Utc>::from(modified),
+                    Err(_) => {
+                        diagnostics.push(ScanDiagnostic::new(
+                            self.tool_key(),
+                            ScanDiagnosticSeverity::Warning,
+                            SESSION_READ_FAILED,
+                            "An Aider history marker could not be inspected and was skipped.",
+                        ));
+                        continue;
+                    }
+                };
                 projects.push(ScannedProject {
                     path: normalized,
                     last_accessed_at: last_accessed,

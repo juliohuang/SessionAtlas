@@ -40,14 +40,17 @@ pub mod parsing;
 pub mod pi;
 
 pub use base::{
-    complete_session_files, missing_source, probe_directory, probe_file, source_read_failure,
-    ScanDiagnostic, ScanDiagnosticSeverity, ScanOutcome, ScanStatus, ScannedProject, Scanner,
-    SourceProbe,
+    bounded_recursive_files, complete_session_files, missing_source, no_follow_metadata,
+    probe_directory, probe_file, read_bounded_file, source_read_failure, BoundedLines, BudgetError,
+    ScanBudget, ScanContext, ScanDiagnostic, ScanDiagnosticSeverity, ScanOutcome, ScanStatus,
+    ScannedProject, Scanner, SourceProbe,
 };
+pub(crate) use base::{read_bounded_file_detailed, BoundedFileError, BoundedLineError};
 pub use base::{
     ADAPTER_LOAD_FAILED, AUXILIARY_SESSION_FILTERED, CONFIG_READ_FAILED, MALFORMED_SESSION_RECORD,
-    MISSING_PROJECT_PATH, MISSING_SESSION_ID, NO_VALID_SESSIONS, SESSION_READ_FAILED,
-    SOURCE_READ_FAILED, SOURCE_UNAVAILABLE, TIMESTAMP_FALLBACK, UNEXPECTED_SCANNER_FAILURE,
+    MISSING_PROJECT_PATH, MISSING_SESSION_ID, NO_VALID_SESSIONS, SCAN_CANCELLED,
+    SCAN_RESOURCE_LIMIT_EXCEEDED, SESSION_READ_FAILED, SOURCE_READ_FAILED, SOURCE_UNAVAILABLE,
+    TIMESTAMP_FALLBACK, UNEXPECTED_SCANNER_FAILURE,
 };
 pub use parsing::{
     expand_tilde, home_directory, recursive_file_enumeration, trim_trailing_separators,

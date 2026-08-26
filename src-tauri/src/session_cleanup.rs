@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 const RECENT_PROTECTION_DAYS: i64 = 14;
 const TRIVIAL_AGE_DAYS: i64 = 30;
@@ -383,13 +385,14 @@ fn collect_codex_sessions_at(
         (home.join(".codex/archived_sessions"), "archived"),
     ];
     for (root, state) in roots {
-        if !root.is_dir() {
+        let Some((safe_root, canonical_root)) = safe_source_root(home, &root) else {
             continue;
-        }
+        };
         visit_files(&root, &mut |path| {
             if path
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+                && safe_candidate_path(path, &safe_root, &canonical_root)
             {
                 if let Some(parsed) = parse_or_cached_session(
                     path,
@@ -415,13 +418,14 @@ fn collect_claude_sessions_at(
     now: DateTime<Utc>,
 ) -> Result<(), String> {
     let root = home.join(".claude/projects");
-    if !root.is_dir() {
+    let Some((safe_root, canonical_root)) = safe_source_root(home, &root) else {
         return Ok(());
-    }
+    };
     visit_files(&root, &mut |path| {
         if !path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+            || !safe_candidate_path(path, &safe_root, &canonical_root)
         {
             return;
         }
@@ -454,7 +458,10 @@ fn parse_or_cached_session(
     cache: &mut SessionCleanupCache,
     parser: fn(&Path) -> Result<ParsedSession, String>,
 ) -> Option<ParsedSession> {
-    let metadata = fs::metadata(path).ok()?;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !is_regular_file(&metadata) {
+        return None;
+    }
     let modified = metadata.modified().ok()?;
     let modified_ns = modified
         .duration_since(UNIX_EPOCH)
@@ -509,6 +516,130 @@ fn normalize_source_path(path: &Path) -> String {
     {
         canonical.to_string_lossy().into_owned()
     }
+}
+
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x400 != 0 {
+        return true;
+    }
+    false
+}
+
+fn is_regular_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !metadata_is_link_or_reparse(metadata)
+}
+
+fn is_safe_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir() && !metadata_is_link_or_reparse(&metadata))
+        .unwrap_or(false)
+}
+
+fn canonical_home(home: &Path) -> Option<PathBuf> {
+    if !is_safe_directory(home) {
+        return None;
+    }
+    let canonical = fs::canonicalize(home).ok()?;
+    is_safe_directory(&canonical).then_some(canonical)
+}
+
+fn comparison_path(path: &Path) -> Option<String> {
+    let mut value = path.to_str()?.to_string();
+    #[cfg(windows)]
+    {
+        value = value.replace('/', "\\");
+        if let Some(stripped) = value.strip_prefix(r"\\?\") {
+            value = stripped.to_string();
+        }
+        value.make_ascii_lowercase();
+    }
+    Some(value)
+}
+
+fn is_same_or_child_path(candidate: &Path, parent: &Path) -> bool {
+    let Some(candidate) = comparison_path(candidate) else {
+        return false;
+    };
+    let Some(parent) = comparison_path(parent) else {
+        return false;
+    };
+    sessionatlas_core::path::is_same_or_child_native(&candidate, &parent)
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    comparison_path(left) == comparison_path(right)
+}
+
+fn safe_source_root(home: &Path, root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let canonical_home = canonical_home(home)?;
+    if !is_safe_directory(root) {
+        return None;
+    }
+    let canonical_root = fs::canonicalize(root).ok()?;
+    if !is_same_or_child_path(&canonical_root, &canonical_home) {
+        return None;
+    }
+    Some((root.to_path_buf(), canonical_root))
+}
+
+fn safe_parent_chain(path: &Path, root: &Path) -> bool {
+    let mut current = path;
+    loop {
+        let Ok(metadata) = fs::symlink_metadata(current) else {
+            return false;
+        };
+        if metadata_is_link_or_reparse(&metadata) {
+            return false;
+        }
+        if same_path(current, root) {
+            return true;
+        }
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if same_path(current, parent) {
+            return false;
+        }
+        current = parent;
+    }
+}
+
+fn safe_candidate_path(path: &Path, root: &Path, canonical_root: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !is_regular_file(&metadata) || !safe_parent_chain(path, root) {
+        return false;
+    }
+    let Ok(canonical_path) = fs::canonicalize(path) else {
+        return false;
+    };
+    is_same_or_child_path(&canonical_path, canonical_root)
+}
+
+fn approved_source_roots(home: &Path) -> Vec<(PathBuf, PathBuf)> {
+    [
+        home.join(".codex/sessions"),
+        home.join(".codex/archived_sessions"),
+        home.join(".claude/projects"),
+    ]
+    .into_iter()
+    .filter_map(|root| safe_source_root(home, &root))
+    .collect()
+}
+
+fn validate_source_file(home: &Path, path: &Path) -> Option<PathBuf> {
+    for (root, canonical_root) in approved_source_roots(home) {
+        if safe_candidate_path(path, &root, &canonical_root) {
+            return Some(canonical_root);
+        }
+    }
+    None
 }
 
 fn file_modified_ns(path: &Path) -> Option<String> {
@@ -651,20 +782,24 @@ fn stable_fingerprint<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
 }
 
 fn visit_files(root: &Path, visit: &mut impl FnMut(&Path)) -> Result<(), String> {
+    if !is_safe_directory(root) {
+        return Ok(());
+    }
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         let entries = fs::read_dir(&directory)
             .map_err(|error| format!("could not inspect {}: {error}", directory.display()))?;
         for entry in entries {
             let entry = entry.map_err(|error| error.to_string())?;
-            let file_type = entry.file_type().map_err(|error| error.to_string())?;
-            if file_type.is_symlink() {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if metadata_is_link_or_reparse(&metadata) {
                 continue;
             }
-            if file_type.is_dir() {
-                pending.push(entry.path());
-            } else if file_type.is_file() {
-                visit(&entry.path());
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                visit(&path);
             }
         }
     }
@@ -927,8 +1062,108 @@ fn short_title(value: String) -> String {
     collapsed.chars().take(120).collect()
 }
 
-fn trash_root(home: &Path) -> PathBuf {
-    home.join(".sessionatlas/session-trash")
+fn safe_trash_root(home: &Path, create: bool) -> Result<Option<PathBuf>, String> {
+    let canonical_home = canonical_home(home)
+        .ok_or_else(|| "home directory is not a safe regular directory".to_string())?;
+    let root = canonical_home.join(".sessionatlas").join("session-trash");
+    let mut current = canonical_home.clone();
+    for component in [".sessionatlas", "session-trash"] {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
+                    return Err("recovery area contains a link or reparse point".to_string());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                fs::create_dir(&current).map_err(|error| error.to_string())?;
+                let metadata = fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+                if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
+                    return Err("recovery area contains a link or reparse point".to_string());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let canonical_root = fs::canonicalize(&root).map_err(|error| error.to_string())?;
+    if !is_same_or_child_path(&canonical_root, &canonical_home) {
+        return Err("recovery area escapes the home directory".to_string());
+    }
+    Ok(Some(canonical_root))
+}
+
+fn safe_batch_directory(root: &Path, batch: &Path) -> Result<(), String> {
+    if !is_safe_directory(root) || !safe_parent_chain(batch, root) {
+        return Err("recovery batch is not inside a safe recovery area".to_string());
+    }
+    let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let canonical_batch = fs::canonicalize(batch).map_err(|error| error.to_string())?;
+    if same_path(&canonical_batch, &canonical_root)
+        || !is_same_or_child_path(&canonical_batch, &canonical_root)
+    {
+        return Err("recovery batch escapes the recovery area".to_string());
+    }
+    Ok(())
+}
+
+fn safe_trash_file(root: &Path, batch: &Path, path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !is_regular_file(&metadata) || safe_batch_directory(root, batch).is_err() {
+        return false;
+    }
+    if !safe_parent_chain(path, batch) {
+        return false;
+    }
+    let Ok(canonical_path) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(canonical_batch) = fs::canonicalize(batch) else {
+        return false;
+    };
+    is_same_or_child_path(&canonical_path, &canonical_batch)
+}
+
+fn safe_trash_destination(root: &Path, batch: &Path, path: &Path) -> bool {
+    if fs::symlink_metadata(path).is_ok() || safe_batch_directory(root, batch).is_err() {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if !safe_parent_chain(parent, batch) {
+        return false;
+    }
+    let Ok(canonical_parent) = fs::canonicalize(parent) else {
+        return false;
+    };
+    let Ok(canonical_batch) = fs::canonicalize(batch) else {
+        return false;
+    };
+    is_same_or_child_path(&canonical_parent, &canonical_batch)
+}
+
+fn create_batch_directory(root: &Path) -> Result<(String, PathBuf), String> {
+    let base = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    for attempt in 0..100u32 {
+        let batch_id = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let batch = root.join(&batch_id);
+        match fs::create_dir(&batch) {
+            Ok(()) => {
+                safe_batch_directory(root, &batch)?;
+                return Ok((batch_id, batch));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("could not allocate a recovery batch".to_string())
 }
 
 pub(crate) fn quarantine_sessions(
@@ -976,7 +1211,9 @@ pub(crate) fn quarantine_sessions(
         return Err("one or more selected sessions are protected".to_string());
     }
     for candidate in &candidates {
-        if !inventory_paths.contains(&normalize_source_path(&candidate.source_path)) {
+        if !inventory_paths.contains(&normalize_source_path(&candidate.source_path))
+            || validate_source_file(home, &candidate.source_path).is_none()
+        {
             return Err("one or more session candidates are stale; analyze again".to_string());
         }
         let fingerprint = file_fingerprint(&candidate.source_path)
@@ -988,9 +1225,9 @@ pub(crate) fn quarantine_sessions(
         }
     }
 
-    let batch_id = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
-    let batch_dir = trash_root(home).join(&batch_id);
-    fs::create_dir_all(&batch_dir).map_err(|error| error.to_string())?;
+    let trash =
+        safe_trash_root(home, true)?.ok_or_else(|| "could not create recovery area".to_string())?;
+    let (batch_id, batch_dir) = create_batch_directory(&trash)?;
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut entries = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
@@ -1000,8 +1237,20 @@ pub(crate) fn quarantine_sessions(
             .and_then(|value| value.to_str())
             .ok_or_else(|| "session file name is not valid UTF-8".to_string())?;
         let destination = batch_dir.join(format!("{index:04}-{file_name}"));
+        // Recheck the source and both sides of the move immediately before rename.
+        if validate_source_file(home, &candidate.source_path).is_none()
+            || file_fingerprint(&candidate.source_path).is_none_or(|fingerprint| {
+                fingerprint.size_bytes != candidate.size_bytes
+                    || fingerprint.modified_ns != candidate.source_modified_ns
+            })
+            || safe_batch_directory(&trash, &batch_dir).is_err()
+            || fs::symlink_metadata(&destination).is_ok()
+        {
+            rollback_moves(home, &trash, &batch_dir, &moved);
+            return Err("session path or recovery area changed; analyze again".to_string());
+        }
         if let Err(error) = fs::rename(&candidate.source_path, &destination) {
-            rollback_moves(&moved);
+            rollback_moves(home, &trash, &batch_dir, &moved);
             return Err(format!(
                 "could not move session into recovery area: {error}"
             ));
@@ -1021,15 +1270,26 @@ pub(crate) fn quarantine_sessions(
     };
     let manifest_path = batch_dir.join("manifest.json");
     let json = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
-    if let Err(error) = fs::write(&manifest_path, json) {
-        rollback_moves(&moved);
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_path)?;
+        file.write_all(&json)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        rollback_moves(home, &trash, &batch_dir, &moved);
         return Err(format!("could not write recovery manifest: {error}"));
     }
     Ok(batch_summary(&manifest))
 }
 
 fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
-    let metadata = fs::metadata(path).ok()?;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !is_regular_file(&metadata) {
+        return None;
+    }
     Some(FileFingerprint {
         normalized_path: normalize_source_path(path),
         size_bytes: metadata.len(),
@@ -1039,19 +1299,12 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
 
 fn collect_inventory(home: &Path) -> Result<Vec<FileFingerprint>, String> {
     let mut inventory = Vec::new();
-    let roots = [
-        home.join(".codex/sessions"),
-        home.join(".codex/archived_sessions"),
-        home.join(".claude/projects"),
-    ];
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
+    for (root, canonical_root) in approved_source_roots(home) {
         visit_files(&root, &mut |path| {
             if path
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+                && safe_candidate_path(path, &root, &canonical_root)
             {
                 if let Some(fingerprint) = file_fingerprint(path) {
                     inventory.push(fingerprint);
@@ -1063,25 +1316,42 @@ fn collect_inventory(home: &Path) -> Result<Vec<FileFingerprint>, String> {
     Ok(inventory)
 }
 
-fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
+fn rollback_moves(home: &Path, root: &Path, batch: &Path, moved: &[(PathBuf, PathBuf)]) {
     for (original, destination) in moved.iter().rev() {
-        let _ = fs::rename(destination, original);
+        if safe_trash_file(root, batch, destination)
+            && validate_original_path(home, original).is_some()
+            && fs::symlink_metadata(original).is_err()
+        {
+            let _ = fs::rename(destination, original);
+        }
     }
 }
 
 pub(crate) fn list_session_trash(home: &Path) -> Result<Vec<SessionTrashBatch>, String> {
-    let root = trash_root(home);
-    if !root.is_dir() {
+    let Some(root) = safe_trash_root(home, false)? else {
         return Ok(Vec::new());
-    }
+    };
     let mut batches = Vec::new();
     for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
-        let path = entry
-            .map_err(|error| error.to_string())?
-            .path()
-            .join("manifest.json");
-        if !path.is_file() {
-            continue;
+        let batch = entry.map_err(|error| error.to_string())?.path();
+        if !is_safe_directory(&batch) {
+            return Err("recovery area contains an unsafe batch".to_string());
+        }
+        safe_batch_directory(&root, &batch)?;
+        let path = batch.join("manifest.json");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !is_regular_file(&metadata) {
+            return Err("recovery manifest is not a regular file".to_string());
+        }
+        if !safe_parent_chain(&path, &batch) {
+            return Err("recovery manifest is outside its batch".to_string());
+        }
+        if !safe_trash_file(&root, &batch, &path) {
+            return Err("recovery manifest is not in a safe batch".to_string());
         }
         let json = fs::read(&path).map_err(|error| error.to_string())?;
         if let Ok(manifest) = serde_json::from_slice::<TrashManifest>(&json) {
@@ -1092,50 +1362,196 @@ pub(crate) fn list_session_trash(home: &Path) -> Result<Vec<SessionTrashBatch>, 
     Ok(batches)
 }
 
-pub(crate) fn restore_session_trash(home: &Path, batch_id: &str) -> Result<usize, String> {
-    if batch_id.is_empty()
-        || !batch_id.chars().all(|character| {
+fn valid_batch_id(batch_id: &str) -> bool {
+    !batch_id.is_empty()
+        && batch_id != "."
+        && batch_id != ".."
+        && !batch_id.chars().all(|character| character == '.')
+        && batch_id.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | 'T' | 'Z')
         })
+        && Path::new(batch_id)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn validate_original_path(home: &Path, original: &Path) -> Option<(PathBuf, PathBuf)> {
+    if !original.is_absolute()
+        || original
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
     {
+        return None;
+    }
+    let parent = original.parent()?;
+    let mut existing = parent.to_path_buf();
+    let mut missing = Vec::new();
+    while fs::symlink_metadata(&existing).is_err() {
+        missing.push(existing.clone());
+        existing = existing.parent()?.to_path_buf();
+    }
+    let existing_metadata = fs::symlink_metadata(&existing).ok()?;
+    if !existing_metadata.is_dir() || metadata_is_link_or_reparse(&existing_metadata) {
+        return None;
+    }
+    let canonical_existing = fs::canonicalize(&existing).ok()?;
+    for (root, canonical_root) in approved_source_roots(home) {
+        if !safe_parent_chain(&existing, &root)
+            || !is_same_or_child_path(&canonical_existing, &canonical_root)
+        {
+            continue;
+        }
+        let mut projected = canonical_existing.clone();
+        for missing_path in missing.iter().rev() {
+            projected.push(missing_path.file_name()?);
+        }
+        projected.push(original.file_name()?);
+        if is_same_or_child_path(&projected, &canonical_root) {
+            return Some((root, canonical_root));
+        }
+    }
+    None
+}
+
+fn ensure_original_parent(home: &Path, original: &Path) -> Result<(), String> {
+    let parent = original
+        .parent()
+        .ok_or_else(|| "original session path has no parent".to_string())?;
+    let mut existing = parent.to_path_buf();
+    let mut missing = Vec::new();
+    while fs::symlink_metadata(&existing).is_err() {
+        missing.push(existing.clone());
+        existing = existing
+            .parent()
+            .ok_or_else(|| "original session path has no safe parent".to_string())?
+            .to_path_buf();
+    }
+    validate_original_path(home, original)
+        .ok_or_else(|| "original session path is outside approved roots".to_string())?;
+    for directory in missing.iter().rev() {
+        match fs::create_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if !is_safe_directory(directory) {
+            return Err("original session parent contains a link or reparse point".to_string());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn restore_session_trash(home: &Path, batch_id: &str) -> Result<usize, String> {
+    if !valid_batch_id(batch_id) {
         return Err("invalid recovery batch id".to_string());
     }
-    let batch_dir = trash_root(home).join(batch_id);
+    let lock = SESSION_CLEANUP_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| "session cleanup lock poisoned".to_string())?;
+    let Some(root) = safe_trash_root(home, false)? else {
+        return Err("recovery batch was not found".to_string());
+    };
+    let batch_dir = root.join(batch_id);
+    safe_batch_directory(&root, &batch_dir)?;
     let manifest_path = batch_dir.join("manifest.json");
+    let manifest_metadata =
+        fs::symlink_metadata(&manifest_path).map_err(|error| error.to_string())?;
+    if !is_regular_file(&manifest_metadata) || !safe_trash_file(&root, &batch_dir, &manifest_path) {
+        return Err("recovery manifest is not a safe regular file".to_string());
+    }
     let json = fs::read(&manifest_path).map_err(|error| error.to_string())?;
     let manifest: TrashManifest =
         serde_json::from_slice(&json).map_err(|error| error.to_string())?;
     if manifest.batch_id != batch_id {
         return Err("recovery manifest does not match its directory".to_string());
     }
-    let mut restored = Vec::new();
+
+    // Validate every manifest entry before moving any file. This makes a
+    // modified manifest fail closed without a partial restore.
+    let manifest_key = comparison_path(&manifest_path)
+        .ok_or_else(|| "recovery manifest path is not valid".to_string())?;
+    let mut endpoints = HashSet::new();
     for entry in &manifest.entries {
         let original = PathBuf::from(&entry.original_path);
         let trashed = PathBuf::from(&entry.trashed_path);
-        if original.exists() {
-            rollback_restores(&restored);
+        let original_key = comparison_path(&original)
+            .ok_or_else(|| "recovery manifest contains an invalid original path".to_string())?;
+        let trashed_key = comparison_path(&trashed)
+            .ok_or_else(|| "recovery manifest contains an invalid trashed path".to_string())?;
+        if trashed_key == manifest_key
+            || !endpoints.insert(original_key)
+            || !endpoints.insert(trashed_key)
+        {
+            return Err("recovery manifest contains duplicate or conflicting paths".to_string());
+        }
+        if validate_original_path(home, &original).is_none() {
+            return Err("recovery manifest contains an unsafe original path".to_string());
+        }
+        if fs::symlink_metadata(&original).is_ok() {
             return Err(format!(
                 "original session path already exists: {}",
                 original.display()
             ));
         }
-        if let Some(parent) = original.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        if !safe_trash_file(&root, &batch_dir, &trashed) {
+            return Err("recovery manifest contains an unsafe trashed path".to_string());
+        }
+    }
+
+    let mut restored = Vec::new();
+    for entry in &manifest.entries {
+        let original = PathBuf::from(&entry.original_path);
+        let trashed = PathBuf::from(&entry.trashed_path);
+        if let Err(error) = ensure_original_parent(home, &original) {
+            rollback_restores(home, &root, &batch_dir, &restored);
+            return Err(error);
+        }
+        // Revalidate both endpoints immediately before every rename.
+        if validate_original_path(home, &original).is_none() {
+            rollback_restores(home, &root, &batch_dir, &restored);
+            return Err("original session path changed; refusing restore".to_string());
+        }
+        if fs::symlink_metadata(&original).is_ok()
+            || !safe_trash_file(&root, &batch_dir, &trashed)
+            || safe_batch_directory(&root, &batch_dir).is_err()
+            || safe_trash_root(home, false)
+                .ok()
+                .flatten()
+                .is_none_or(|current| !same_path(&current, &root))
+        {
+            rollback_restores(home, &root, &batch_dir, &restored);
+            return Err("recovery paths changed; refusing restore".to_string());
         }
         if let Err(error) = fs::rename(&trashed, &original) {
-            rollback_restores(&restored);
+            rollback_restores(home, &root, &batch_dir, &restored);
             return Err(format!("could not restore session: {error}"));
         }
         restored.push((original, trashed));
     }
-    fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
+    if !safe_trash_file(&root, &batch_dir, &manifest_path) {
+        rollback_restores(home, &root, &batch_dir, &restored);
+        return Err("recovery manifest changed; refusing restore".to_string());
+    }
+    if let Err(error) = safe_batch_directory(&root, &batch_dir) {
+        rollback_restores(home, &root, &batch_dir, &restored);
+        return Err(error);
+    }
+    fs::remove_file(&manifest_path).map_err(|error| {
+        rollback_restores(home, &root, &batch_dir, &restored);
+        error.to_string()
+    })?;
     let _ = fs::remove_dir(&batch_dir);
     Ok(restored.len())
 }
 
-fn rollback_restores(restored: &[(PathBuf, PathBuf)]) {
+fn rollback_restores(home: &Path, root: &Path, batch: &Path, restored: &[(PathBuf, PathBuf)]) {
     for (original, trashed) in restored.iter().rev() {
-        let _ = fs::rename(original, trashed);
+        if validate_source_file(home, original).is_some()
+            && safe_trash_destination(root, batch, trashed)
+        {
+            let _ = fs::rename(original, trashed);
+        }
     }
 }
 
@@ -1152,6 +1568,69 @@ fn batch_summary(manifest: &TrashManifest) -> SessionTrashBatch {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn make_directory_link(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let result = std::os::unix::fs::symlink(target, link);
+            assert!(
+                result.is_ok(),
+                "symlink fixture creation failed ({} -> {}): {}",
+                link.display(),
+                target.display(),
+                result.unwrap_err()
+            );
+            true
+        }
+        #[cfg(windows)]
+        {
+            let link_text = link.to_string_lossy().into_owned();
+            let link_text = link_text
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&link_text)
+                .replace('/', "\\");
+            let target_text = target.to_string_lossy().into_owned();
+            let target_text = target_text
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&target_text)
+                .replace('/', "\\");
+            let command = format!("mklink /J {link_text} {target_text}");
+            let output = std::process::Command::new("cmd")
+                .args(["/c", &command])
+                .output()
+                .expect("mklink command must start");
+            assert!(
+                output.status.success(),
+                "junction fixture creation failed ({} -> {}): {}",
+                link_text,
+                target_text,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            true
+        }
+    }
+
+    fn remove_directory_link(path: &Path) {
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(path);
+        }
+        #[cfg(windows)]
+        {
+            let _ = fs::remove_dir(path);
+        }
+    }
+
+    fn replace_directory_with_link(root: &Path, target: &Path) -> Option<PathBuf> {
+        let backup =
+            root.with_file_name(format!("{}-original", root.file_name()?.to_string_lossy()));
+        fs::rename(root, &backup).ok()?;
+        if !make_directory_link(root, target) {
+            let _ = fs::rename(&backup, root);
+            return None;
+        }
+        Some(backup)
+    }
 
     fn write_codex_session(
         home: &Path,
@@ -1360,6 +1839,377 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("inventory changed") || error.contains("stale"));
         assert!(path.is_file());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn source_root_and_nested_directory_links_never_become_candidates() {
+        let home = tempfile::tempdir().unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let regular = write_codex_session(
+            home.path(),
+            "regular",
+            None,
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "regular",
+            "2026-01-01T00:00:00Z",
+        );
+        let external = tempfile::tempdir().unwrap();
+        let external_session = write_codex_session(
+            external.path(),
+            "external",
+            None,
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "external",
+            "2026-01-01T00:00:00Z",
+        );
+        let nested_link = home.path().join(".codex/sessions/nested-link");
+        fs::create_dir_all(nested_link.parent().unwrap()).unwrap();
+        if !make_directory_link(&nested_link, external.path()) {
+            eprintln!("directory-link fixture unavailable; link test not verified");
+            return;
+        }
+        let analysis = analyze_sessions_at(home.path(), now).unwrap();
+        assert!(analysis
+            .candidates
+            .iter()
+            .all(|candidate| candidate.source_path != external_session));
+        assert!(analysis.candidates.iter().any(|candidate| {
+            candidate.source_path == fs::canonicalize(&regular).unwrap()
+                || candidate.source_path == regular
+        }));
+        remove_directory_link(&nested_link);
+
+        let root = home.path().join(".codex/sessions");
+        let outside_root = tempfile::tempdir().unwrap();
+        let backup = replace_directory_with_link(&root, outside_root.path());
+        if backup.is_none() {
+            eprintln!("top-level directory-link fixture unavailable; nested link was verified");
+            return;
+        }
+        let replaced = analyze_sessions_at(home.path(), now).unwrap();
+        assert!(replaced
+            .candidates
+            .iter()
+            .all(|candidate| { !candidate.source_path.starts_with(outside_root.path()) }));
+        remove_directory_link(&root);
+        fs::rename(backup.unwrap(), &root).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn quarantine_rejects_source_root_replacement_after_analysis() {
+        let home = tempfile::tempdir().unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let source = write_codex_session(
+            home.path(),
+            "replace-root",
+            None,
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "replace root",
+            "2026-01-01T00:00:00Z",
+        );
+        let analysis = analyze_sessions_at(home.path(), now).unwrap();
+        let candidate = analysis
+            .candidates
+            .iter()
+            .find(|candidate| candidate.source_path == source)
+            .unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_file = external.path().join("outside.jsonl");
+        fs::write(&external_file, b"outside").unwrap();
+        let root = home.path().join(".codex/sessions");
+        let backup = replace_directory_with_link(&root, external.path());
+        if backup.is_none() {
+            eprintln!("source-root replacement fixture unavailable; not verified");
+            return;
+        }
+        let result = quarantine_sessions(
+            home.path(),
+            &analysis.snapshot_id,
+            std::slice::from_ref(&candidate.key),
+        );
+        assert!(result.is_err());
+        assert!(external_file.is_file());
+        assert!(!home.path().join(".sessionatlas/session-trash").exists());
+        remove_directory_link(&root);
+        fs::rename(backup.unwrap(), &root).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_tampered_manifest_paths_and_unsafe_batch_ids() {
+        let home = tempfile::tempdir().unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let source = write_codex_session(
+            home.path(),
+            "tamper",
+            None,
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "tamper",
+            "2026-01-01T00:00:00Z",
+        );
+        let analysis = analyze_sessions_at(home.path(), now).unwrap();
+        let key = analysis
+            .candidates
+            .iter()
+            .find(|candidate| candidate.source_path == source)
+            .map(|candidate| candidate.key.clone())
+            .unwrap();
+        let batch = quarantine_sessions(home.path(), &analysis.snapshot_id, &[key]).unwrap();
+        assert!(restore_session_trash(home.path(), ".").is_err());
+        assert!(restore_session_trash(home.path(), "..").is_err());
+        assert!(restore_session_trash(home.path(), "...").is_err());
+
+        let root = safe_trash_root(home.path(), false).unwrap().unwrap();
+        let batch_dir = root.join(&batch.batch_id);
+        let manifest_path = batch_dir.join("manifest.json");
+        let mut manifest: TrashManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.entries[0].trashed_path = manifest_path.to_string_lossy().into_owned();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(restore_session_trash(home.path(), &batch.batch_id).is_err());
+        assert!(manifest_path.is_file());
+        assert!(!source.exists());
+
+        manifest = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let original = manifest.entries[0].original_path.clone();
+        manifest.entries[0].original_path = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("outside.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(restore_session_trash(home.path(), &batch.batch_id).is_err());
+        assert!(!PathBuf::from(original).exists());
+
+        manifest.entries[0].original_path = source.to_string_lossy().into_owned();
+        manifest.entries[0].trashed_path = home
+            .path()
+            .join("outside-trashed.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(restore_session_trash(home.path(), &batch.batch_id).is_err());
+        assert!(!source.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn list_and_restore_reject_linked_trash_root_and_batch() {
+        let home = tempfile::tempdir().unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let source = write_codex_session(
+            home.path(),
+            "linked-trash",
+            None,
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "linked trash",
+            "2026-01-01T00:00:00Z",
+        );
+        let analysis = analyze_sessions_at(home.path(), now).unwrap();
+        let key = analysis
+            .candidates
+            .iter()
+            .find(|candidate| candidate.source_path == source)
+            .map(|candidate| candidate.key.clone())
+            .unwrap();
+        let batch = quarantine_sessions(home.path(), &analysis.snapshot_id, &[key]).unwrap();
+        let root = safe_trash_root(home.path(), false).unwrap().unwrap();
+        let external_root = tempfile::tempdir().unwrap();
+        let root_backup = root.with_file_name("session-trash-original");
+        fs::rename(&root, &root_backup).unwrap();
+        if !make_directory_link(&root, external_root.path()) {
+            eprintln!("trash-root link fixture unavailable; not verified");
+            fs::rename(&root_backup, &root).unwrap();
+            return;
+        }
+        assert!(list_session_trash(home.path()).is_err());
+        assert!(restore_session_trash(home.path(), &batch.batch_id).is_err());
+        remove_directory_link(&root);
+        fs::rename(&root_backup, &root).unwrap();
+
+        let batch_dir = root.join(&batch.batch_id);
+        let batch_backup = root.join(format!("{}-original", batch.batch_id));
+        let external_batch = tempfile::tempdir().unwrap();
+        fs::rename(&batch_dir, &batch_backup).unwrap();
+        if !make_directory_link(&batch_dir, external_batch.path()) {
+            eprintln!("trash-batch link fixture unavailable; root link was verified");
+            fs::rename(&batch_backup, &batch_dir).unwrap();
+            return;
+        }
+        assert!(list_session_trash(home.path()).is_err());
+        assert!(restore_session_trash(home.path(), &batch.batch_id).is_err());
+        remove_directory_link(&batch_dir);
+        fs::rename(batch_backup, batch_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_normal_paths_are_contained_through_analysis_quarantine_and_restore() {
+        let home = tempfile::tempdir().unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let source = write_codex_session(
+            home.path(),
+            "unix-contained",
+            Some("parent"),
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "unix contained",
+            "2026-01-01T00:00:00Z",
+        );
+        let root = home.path().join(".codex/sessions");
+        let (safe_root, canonical_root) = safe_source_root(home.path(), &root).unwrap();
+        assert!(safe_candidate_path(&source, &safe_root, &canonical_root));
+        let analysis = analyze_sessions_at(home.path(), now).unwrap();
+        let candidate = analysis
+            .candidates
+            .iter()
+            .find(|candidate| candidate.source_path == source)
+            .unwrap();
+        // Make the child independently cleanable without relying on a
+        // platform-specific link fixture.
+        let mut candidate = candidate.clone();
+        candidate.can_clean = true;
+        let batch = quarantine_sessions(
+            home.path(),
+            &analysis.snapshot_id,
+            std::slice::from_ref(&candidate.key),
+        );
+        assert!(
+            batch.is_err(),
+            "the stale cache candidate must be authoritative"
+        );
+
+        let parent = write_codex_session(
+            home.path(),
+            "unix-parent",
+            None,
+            serde_json::json!("vscode"),
+            "unix parent",
+            "2026-01-01T00:00:00Z",
+        );
+        let child = write_codex_session(
+            home.path(),
+            "unix-child",
+            Some("unix-parent"),
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "unix child",
+            "2026-01-01T00:00:00Z",
+        );
+        let analysis = analyze_sessions_at(home.path(), now).unwrap();
+        let child_candidate = analysis
+            .candidates
+            .iter()
+            .find(|candidate| candidate.source_path == child)
+            .unwrap();
+        assert!(safe_candidate_path(&child, &safe_root, &canonical_root));
+        let batch = quarantine_sessions(
+            home.path(),
+            &analysis.snapshot_id,
+            std::slice::from_ref(&child_candidate.key),
+        )
+        .unwrap();
+        let trash = safe_trash_root(home.path(), false).unwrap().unwrap();
+        let batch_dir = trash.join(&batch.batch_id);
+        assert!(is_same_or_child_path(&batch_dir, &trash));
+        assert!(!same_path(&batch_dir, &trash));
+        assert!(!child.exists());
+        assert!(parent.exists());
+        assert_eq!(
+            restore_session_trash(home.path(), &batch.batch_id).unwrap(),
+            1
+        );
+        assert!(child.is_file());
+    }
+
+    #[test]
+    fn rollback_restores_all_previously_restored_files_and_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let parent = write_codex_session(
+            home.path(),
+            "rollback-parent",
+            None,
+            serde_json::json!("vscode"),
+            "rollback parent",
+            "2026-01-01T00:00:00Z",
+        );
+        let child_one = write_codex_session(
+            home.path(),
+            "rollback-one",
+            Some("rollback-parent"),
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "rollback one",
+            "2026-01-01T00:00:00Z",
+        );
+        let child_two = write_codex_session(
+            home.path(),
+            "rollback-two",
+            Some("rollback-parent"),
+            serde_json::json!({"subagent": {"other": "guardian"}}),
+            "rollback two",
+            "2026-01-01T00:00:00Z",
+        );
+        let analysis = analyze_sessions_at(home.path(), now).unwrap();
+        let keys = analysis
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.source_path == child_one || candidate.source_path == child_two
+            })
+            .map(|candidate| candidate.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 2);
+        let batch = quarantine_sessions(home.path(), &analysis.snapshot_id, &keys).unwrap();
+        let root = safe_trash_root(home.path(), false).unwrap().unwrap();
+        let batch_dir = root.join(&batch.batch_id);
+        let manifest: TrashManifest =
+            serde_json::from_slice(&fs::read(batch_dir.join("manifest.json")).unwrap()).unwrap();
+        let first = (
+            PathBuf::from(&manifest.entries[0].original_path),
+            PathBuf::from(&manifest.entries[0].trashed_path),
+        );
+        let second = (
+            PathBuf::from(&manifest.entries[1].original_path),
+            PathBuf::from(&manifest.entries[1].trashed_path),
+        );
+        fs::rename(&first.1, &first.0).unwrap();
+        fs::rename(&second.1, &second.0).unwrap();
+        rollback_restores(
+            home.path(),
+            &root,
+            &batch_dir,
+            &[first.clone(), second.clone()],
+        );
+        assert!(!child_one.exists());
+        assert!(!child_two.exists());
+        assert!(fs::symlink_metadata(&first.1).is_ok());
+        assert!(fs::symlink_metadata(&second.1).is_ok());
+
+        fs::rename(&first.1, &first.0).unwrap();
+        fs::rename(&second.1, &second.0).unwrap();
+        let unsafe_trashed = home.path().join("unsafe-rollback-target.jsonl");
+        fs::write(&unsafe_trashed, b"occupied").unwrap();
+        let mut rollback_entries = vec![first, second];
+        rollback_entries[1].1 = unsafe_trashed.clone();
+        rollback_restores(home.path(), &root, &batch_dir, &rollback_entries);
+        assert!(!child_one.exists());
+        assert!(child_two.exists());
+        assert!(fs::symlink_metadata(&manifest.entries[0].trashed_path).is_ok());
+        assert!(fs::symlink_metadata(&unsafe_trashed).is_ok());
+        assert!(parent.exists());
     }
 
     #[cfg(not(windows))]

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -14,9 +14,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::base::ScannedProject;
+use super::base::{no_follow_metadata, open_regular_file};
 
 const CACHE_VERSION: u32 = 1;
 const CACHE_FILE: &str = "scanner-cache-v1.json";
+#[cfg(test)]
+const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedProject {
@@ -46,13 +49,21 @@ pub(crate) struct FileCache {
     parser_version: u32,
     document: CacheDocument,
     dirty: bool,
+    max_bytes: u64,
 }
 
 impl FileCache {
+    #[cfg(test)]
     pub(crate) fn load(home: &Path, parser_version: u32) -> Self {
+        Self::load_with_limit(home, parser_version, MAX_CACHE_BYTES)
+    }
+
+    pub(crate) fn load_with_limit(home: &Path, parser_version: u32, max_bytes: u64) -> Self {
         let path = home.join(".sessionatlas").join(CACHE_FILE);
-        let document = fs::read(&path)
+        let document = no_follow_metadata(&path)
             .ok()
+            .filter(|metadata| metadata.is_file() && metadata.len() <= max_bytes)
+            .and_then(|_| read_bounded_bytes(&path, max_bytes))
             .and_then(|bytes| serde_json::from_slice::<CacheDocument>(&bytes).ok())
             .filter(|document| document.version == CACHE_VERSION)
             .unwrap_or_else(|| CacheDocument {
@@ -64,6 +75,7 @@ impl FileCache {
             parser_version,
             document,
             dirty: false,
+            max_bytes,
         }
     }
 
@@ -144,13 +156,6 @@ impl FileCache {
         if fs::create_dir_all(parent).is_err() {
             return;
         }
-        let Ok(bytes) = serde_json::to_vec(&self.document) else {
-            return;
-        };
-        if fs::read(&self.path).is_ok_and(|current| current == bytes) {
-            self.dirty = false;
-            return;
-        }
         let temporary = parent.join(format!(
             ".{CACHE_FILE}.{}.{}.tmp",
             std::process::id(),
@@ -158,11 +163,17 @@ impl FileCache {
         ));
         let write_result = (|| -> std::io::Result<()> {
             {
-                let mut file = OpenOptions::new()
+                let file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(&temporary)?;
-                file.write_all(&bytes)?;
+                let mut limited = LimitedWriter::new(file, self.max_bytes);
+                if serde_json::to_writer(&mut limited, &self.document).is_err() {
+                    let _ = fs::remove_file(&temporary);
+                    self.dirty = false;
+                    return Ok(());
+                }
+                let file = limited.into_inner();
                 file.sync_all()?;
             }
             crate::config::atomic_replace_file(&temporary, &self.path)
@@ -174,8 +185,50 @@ impl FileCache {
     }
 }
 
+fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let file = open_regular_file(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
+}
+
+struct LimitedWriter<W> {
+    inner: W,
+    written: u64,
+    max: u64,
+}
+impl<W: Write> LimitedWriter<W> {
+    fn new(inner: W, max: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            max,
+        }
+    }
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+impl<W: Write> Write for LimitedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.written.saturating_add(bytes.len() as u64) > self.max {
+            return Err(std::io::Error::other("cache size limit"));
+        }
+        let written = self.inner.write(bytes)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn cache_key(tool_key: &str, path: &Path) -> String {
-    let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Scanner paths have already been validated as no-follow regular files;
+    // avoid a second canonicalization that could follow a raced symlink.
+    let normalized = path.to_path_buf();
     #[cfg(windows)]
     let text = normalized
         .to_string_lossy()
@@ -187,7 +240,7 @@ fn cache_key(tool_key: &str, path: &Path) -> String {
 }
 
 fn file_fingerprint(path: &Path) -> Option<(u64, String)> {
-    let metadata = fs::metadata(path).ok()?;
+    let metadata = no_follow_metadata(path).ok()?;
     let modified_ns = metadata
         .modified()
         .ok()?
@@ -239,6 +292,47 @@ mod tests {
         fs::write(path, b"broken").unwrap();
         let cache = FileCache::load(home.path(), 1);
         assert!(cache.document.entries.is_empty());
+    }
+
+    #[test]
+    fn scanner_cache_load_with_limit_reads_at_most_max_plus_one() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".sessionatlas/scanner-cache-v1.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"0123456789").unwrap();
+
+        let cache = FileCache::load_with_limit(home.path(), 1, 4);
+        assert!(cache.document.entries.is_empty());
+        assert!(read_bounded_bytes(&path, 4).is_none());
+    }
+
+    #[test]
+    fn scanner_cache_limited_writer_allows_exact_boundary_and_rejects_one_more() {
+        use std::io::Write as _;
+
+        let mut exact = LimitedWriter::new(Vec::new(), 3);
+        exact.write_all(b"abc").unwrap();
+        assert_eq!(exact.into_inner(), b"abc");
+
+        let mut over = LimitedWriter::new(Vec::new(), 3);
+        over.write_all(b"abc").unwrap();
+        assert!(over.write_all(b"d").is_err());
+    }
+
+    #[test]
+    fn scanner_cache_oversized_save_keeps_existing_cache_file() {
+        let home = tempfile::tempdir().unwrap();
+        let cache_path = home.path().join(".sessionatlas/scanner-cache-v1.json");
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, b"existing-cache").unwrap();
+        let source = home.path().join("session.jsonl");
+        fs::write(&source, b"one").unwrap();
+
+        let mut cache = FileCache::load_with_limit(home.path(), 1, 1);
+        cache.record("codex", &source, &[project("a-very-long-project-path")]);
+        cache.save();
+
+        assert_eq!(fs::read(&cache_path).unwrap(), b"existing-cache");
     }
 
     #[test]

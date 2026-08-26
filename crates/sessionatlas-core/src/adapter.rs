@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
+use crate::process::is_bare_program_name;
 use crate::security;
 
 pub const ADAPTER_API_VERSION: u32 = 1;
@@ -143,6 +144,11 @@ impl AdapterManifest {
         if command.len() != 1 {
             return Err(AdapterError::new(
                 "adapter command must name exactly one executable; put launch arguments in launch.newArgs or launch.resumeArgs",
+            ));
+        }
+        if !is_bare_program_name(&command[0]) {
+            return Err(AdapterError::new(
+                "adapter command must be a bare executable name resolved through PATH",
             ));
         }
         validate_version_probe(&self.version_args)?;
@@ -902,6 +908,38 @@ mod tests {
             );
             assert!(AdapterManifest::parse(changed.as_bytes()).is_ok());
         }
+    }
+
+    #[test]
+    fn manifest_commands_reject_absolute_relative_and_multi_component_paths() {
+        let base = BUILTIN_MANIFESTS[2];
+        for command in [
+            r#"C:\tools\codex.exe"#,
+            r#"C:/tools/codex.exe"#,
+            r#"\\server\share\codex.exe"#,
+            "/opt/tools/codex",
+            "./tools/codex",
+            "../tools/codex",
+            "tools/codex",
+            r#"tools\codex"#,
+            "C:codex",
+        ] {
+            let changed = base.replace(
+                "\"command\": \"codex\"",
+                &format!("\"command\": \"{command}\""),
+            );
+            assert!(
+                AdapterManifest::parse(changed.as_bytes()).is_err(),
+                "path command accepted: {command}"
+            );
+        }
+
+        let quoted_path = base.replace(
+            "\"command\": \"codex\"",
+            "\"command\": \"\\\"C:/tools/codex.exe\\\"\"",
+        );
+        assert!(AdapterManifest::parse(quoted_path.as_bytes()).is_err());
+        assert!(AdapterManifest::parse(base.as_bytes()).is_ok());
     }
 
     #[test]

@@ -5,27 +5,26 @@
 //! session ID and activity timestamp are extracted from each record; prompt,
 //! message and other session content is never read into the output.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::base::{
-    complete_session_files, missing_source, probe_directory, source_read_failure, ScanDiagnostic,
+    bounded_recursive_files, complete_session_files, missing_source, probe_directory,
+    source_read_failure, BoundedLines, BudgetError, ScanBudget, ScanContext, ScanDiagnostic,
     ScanDiagnosticSeverity, ScanOutcome, ScannedProject, Scanner, SourceProbe,
     MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, MISSING_SESSION_ID, SESSION_READ_FAILED,
     TIMESTAMP_FALLBACK,
 };
 use super::cache::FileCache;
-use super::parsing::{
-    home_directory, recursive_file_enumeration, try_normalize_project_path, try_read_utc_timestamp,
-};
+use super::parsing::{home_directory, try_normalize_project_path, try_read_utc_timestamp};
 
 /// Codex CLI scanner for date-nested rollout JSONL files under
 /// `~/.codex/sessions/YYYY/MM/DD/`.
 pub struct CodexScanner {
     is_available: Box<dyn Fn() -> bool>,
+    budget: ScanBudget,
 }
 
 const PARSER_VERSION: u32 = 1;
@@ -41,7 +40,12 @@ impl CodexScanner {
     pub fn with_availability(availability: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_available: Box::new(availability),
+            budget: ScanBudget::default(),
         }
+    }
+    pub fn with_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -84,46 +88,65 @@ impl CodexScanner {
             SourceProbe::Exists => {}
         }
 
-        let session_files = match enumerate_jsonl_files(&sessions_dir) {
+        let context = self.budget.context();
+        let session_files = match enumerate_jsonl_files(&sessions_dir, &context) {
             Ok(files) => files,
-            Err(()) => return source_read_failure("codex", "the Codex sessions directory"),
+            Err(error) => return ScanOutcome::failed([context.diagnostic("codex", error)]),
         };
 
         let mut projects = Vec::new();
         let mut diagnostics = Vec::new();
         let codex_home = codex_home.to_string_lossy().into_owned();
-        let mut cache = FileCache::load(&home, PARSER_VERSION);
+        let mut cache =
+            FileCache::load_with_limit(&home, PARSER_VERSION, context.budget.max_cache_bytes);
         cache.retain_paths("codex", &session_files);
         for session_file in &session_files {
+            if context.source_file_path(session_file).is_err() {
+                return ScanOutcome::failed([context.diagnostic("codex", BudgetError::Exceeded)]);
+            }
             if let Some(cached) = cache.get("codex", session_file) {
+                for _ in &cached {
+                    if let Err(error) = context.record() {
+                        return ScanOutcome::failed([context.diagnostic("codex", error)]);
+                    }
+                }
                 projects.extend(cached);
                 continue;
             }
             let project_start = projects.len();
             let diagnostic_start = diagnostics.len();
-            parse_session_file(session_file, &codex_home, &mut projects, &mut diagnostics);
+            if let Err(error) = parse_session_file(
+                session_file,
+                &codex_home,
+                &context,
+                &mut projects,
+                &mut diagnostics,
+            ) {
+                return ScanOutcome::failed([context.diagnostic("codex", error)]);
+            }
             if diagnostics.len() == diagnostic_start && projects.len() > project_start {
                 cache.record("codex", session_file, &projects[project_start..]);
             }
         }
-        cache.save();
-
-        complete_session_files("codex", session_files.len(), projects, diagnostics)
+        let outcome = complete_session_files("codex", session_files.len(), projects, diagnostics);
+        if outcome.is_successful() {
+            cache.save();
+        }
+        outcome
     }
 }
 
 /// Recursively enumerates `*.jsonl` session files in ordinal path order.
 /// Any inaccessible entry surfaces as `Err(())`; enumeration stops on the
 /// first unreadable path.
-fn enumerate_jsonl_files(sessions_dir: &Path) -> Result<Vec<PathBuf>, ()> {
+fn enumerate_jsonl_files(
+    sessions_dir: &Path,
+    context: &ScanContext,
+) -> Result<Vec<PathBuf>, BudgetError> {
     let mut files = Vec::new();
-    for entry in recursive_file_enumeration(sessions_dir) {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => return Err(()),
-        };
-        if entry.file_type().is_file() && is_jsonl(entry.path()) {
-            files.push(entry.into_path());
+    for path in bounded_recursive_files(sessions_dir, context)? {
+        if is_jsonl(&path) {
+            files.push(path);
         }
     }
     files.sort();
@@ -147,19 +170,21 @@ fn is_jsonl(path: &Path) -> bool {
 fn parse_session_file(
     session_file: &Path,
     codex_home: &str,
+    context: &ScanContext,
     projects: &mut Vec<ScannedProject>,
     diagnostics: &mut Vec<ScanDiagnostic>,
-) {
-    let file = match std::fs::File::open(session_file) {
-        Ok(file) => file,
-        Err(_) => {
+) -> Result<(), BudgetError> {
+    let mut lines = match BoundedLines::open(session_file, context) {
+        Ok(lines) => lines,
+        Err(crate::scanner::BoundedLineError::Budget(error)) => return Err(error),
+        Err(crate::scanner::BoundedLineError::Io) => {
             diagnostics.push(ScanDiagnostic::new(
                 "codex",
                 ScanDiagnosticSeverity::Warning,
                 SESSION_READ_FAILED,
                 "A Codex session file could not be read and was skipped.",
             ));
-            return;
+            return Ok(());
         }
     };
 
@@ -169,8 +194,22 @@ fn parse_session_file(
     let mut malformed_lines = 0;
     let mut first_line = true;
 
-    for line in BufReader::new(file).lines() {
-        let line = match line {
+    loop {
+        let raw_line = match lines.next_line() {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(crate::scanner::BoundedLineError::Budget(error)) => return Err(error),
+            Err(crate::scanner::BoundedLineError::Io) => {
+                diagnostics.push(ScanDiagnostic::new(
+                    "codex",
+                    ScanDiagnosticSeverity::Warning,
+                    SESSION_READ_FAILED,
+                    "A Codex session file could not be read and was skipped.",
+                ));
+                return Ok(());
+            }
+        };
+        let line = match String::from_utf8(raw_line) {
             Ok(line) => line,
             Err(_) => {
                 diagnostics.push(ScanDiagnostic::new(
@@ -179,7 +218,7 @@ fn parse_session_file(
                     SESSION_READ_FAILED,
                     "A Codex session file could not be read and was skipped.",
                 ));
-                return;
+                return Ok(());
             }
         };
         let line = if first_line {
@@ -241,7 +280,7 @@ fn parse_session_file(
             MISSING_PROJECT_PATH,
             "A Codex session did not contain a safe absolute project path and was skipped.",
         ));
-        return;
+        return Ok(());
     };
 
     let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) else {
@@ -251,7 +290,7 @@ fn parse_session_file(
             MISSING_SESSION_ID,
             "A Codex session did not contain a native session ID and was skipped.",
         ));
-        return;
+        return Ok(());
     };
 
     let last_accessed_at = match latest_activity {
@@ -264,7 +303,7 @@ fn parse_session_file(
                 "A Codex session had no valid activity timestamp; file modification time was used.",
             ));
             let Some(fallback) = file_last_write_utc(session_file) else {
-                return;
+                return Ok(());
             };
             fallback
         }
@@ -276,6 +315,7 @@ fn parse_session_file(
         session_id: Some(session_id),
         git_branch: None,
     });
+    Ok(())
 }
 
 /// Reads the file modification time as a UTC timestamp. Returns `None` only when the metadata
