@@ -158,6 +158,31 @@ the opener on Escape. README badge/image Markdown rendered as labelled chips
 without the earlier raw `![...]` fragments. No real terminal command or remote
 SSH rescan was launched during UI automation; those remain separate live gates.
 
+## Open-source preflight rerun (R16, 2026-08-18, Windows x64)
+
+R16 reran the complete locally automatable release gate after the security and
+documentation fixes. The current evidence is:
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | passed (exit 0) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | passed (exit 0) |
+| `cargo test --workspace --no-fail-fast` | 461 passed, 0 failed/ignored: CLI 96, core 258, Tauri 107 |
+| frontend syntax check | passed (exit 0) |
+| frontend tests | 22 unit + 53 Playwright browser tests passed |
+| dependency audit | npm: 0 vulnerabilities; Rust: 538 dependencies, 0 vulnerabilities, 17 tracked upstream warnings |
+| `cargo tauri build --ci` | passed; MSI + NSIS produced |
+| release CLI build and isolated acceptance | passed; 2 synthetic projects, 2 session IDs, 2 UTC timestamps, 0 SQLite sidecars |
+| real-data isolation sentinels | `index.db`, `config.json`, and `prefs.db` hashes and sizes unchanged before/after acceptance |
+| static repository checks | 14 JSON and 7 YAML files parsed; 29 Markdown files had no broken relative links; `git diff --check` passed |
+| secret scan | 0 high-confidence credential matches and 0 sensitive filenames in the working tree; 0 high-confidence matches in Git history |
+
+The MSI, NSIS installer, and release CLI were intentionally unsigned, matching
+the documented beta policy. The three validated security findings were
+remediated by constraining automatic adapter version probes and creating Unix
+cache/process-output files with mode `0600`; regression tests cover the new
+adapter contract and Unix permission assertions run on Unix CI.
+
 ### Contracts protected now
 
 - `ProjectIndexer` merges tool observations, counts distinct native session
@@ -210,7 +235,7 @@ release gates and must be executed before release:
 - Windows/Ubuntu hosted CI on the current commit (including the hosted Security
   workflow). Local R14 does not substitute for a hosted runner; RI-04 stays
   BLOCKED until such evidence exists on a shared commit.
-- `cargo audit` rerun: on 2026-08-16, local `cargo audit 0.22.2` scanned 542
+- `cargo audit` rerun: on 2026-08-18, local `cargo audit 0.22.2` scanned 538
   locked crates and exited 0 with no vulnerabilities. The 17 upstream
   informational warnings are tracked in `execution-security-contract.md`.
   The hosted Security workflow remains a separate release gate for the delivery

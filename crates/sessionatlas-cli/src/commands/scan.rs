@@ -11,18 +11,10 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
-use sessionatlas_core::config::load as load_config;
 use sessionatlas_core::indexer::{build_index, IndexedToolScan};
-use sessionatlas_core::scanner::aider::AiderScanner;
-use sessionatlas_core::scanner::claude::ClaudeScanner;
-use sessionatlas_core::scanner::codex::CodexScanner;
-use sessionatlas_core::scanner::custom::CustomToolScanner;
-use sessionatlas_core::scanner::kimi::KimiScanner;
-use sessionatlas_core::scanner::opencode::OpenCodeScanner;
-use sessionatlas_core::scanner::pi::PiScanner;
 use sessionatlas_core::scanner::{
-    ScanDiagnostic, ScanDiagnosticSeverity, ScanStatus, ScannedProject, Scanner,
-    CONFIG_READ_FAILED, UNEXPECTED_SCANNER_FAILURE,
+    build_adapter_scanners, ScanDiagnostic, ScanDiagnosticSeverity, ScanStatus, ScannedProject,
+    Scanner, UNEXPECTED_SCANNER_FAILURE,
 };
 use sessionatlas_core::store::SqliteStore;
 
@@ -36,35 +28,7 @@ use crate::Io;
 /// the config cannot be read or parsed, built-ins remain available and a
 /// a `config_read_failed` diagnostic is returned.
 pub fn build_default_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec<ScanDiagnostic>) {
-    let mut scanners: Vec<Box<dyn Scanner>> = vec![
-        Box::new(ClaudeScanner::new()),
-        Box::new(KimiScanner::new()),
-        Box::new(CodexScanner::new()),
-        Box::new(OpenCodeScanner::new()),
-        Box::new(AiderScanner::new()),
-        Box::new(PiScanner::new()),
-    ];
-    let mut diagnostics = Vec::new();
-    match load_config(config_path) {
-        Ok(config) => {
-            for tool in config.custom_tools.iter().filter(|tool| tool.is_enabled) {
-                if scanners
-                    .iter()
-                    .any(|scanner| scanner.tool_key().eq_ignore_ascii_case(&tool.key))
-                {
-                    continue;
-                }
-                scanners.push(Box::new(CustomToolScanner::new(tool.clone())));
-            }
-        }
-        Err(_) => diagnostics.push(ScanDiagnostic::new(
-            "config",
-            ScanDiagnosticSeverity::Warning,
-            CONFIG_READ_FAILED,
-            "The custom-tool configuration could not be read; built-in scanners remain available.",
-        )),
-    }
-    (scanners, diagnostics)
+    build_adapter_scanners(config_path)
 }
 
 /// Runs `scan` against an injected scanner list. Only successful outcomes are

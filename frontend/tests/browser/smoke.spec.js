@@ -174,33 +174,69 @@ test("mocked Tauri mode publishes backend projects", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
-test("large catalogs render compact rows without hidden expanded controls", async ({ page }) => {
+test("activity-only OpenCode sessions do not shadow a resumable main session", async ({ page }) => {
   await page.addInitScript(() => {
-    const projects = Array.from({ length: 2_000 }, (_, index) => ({
-      id: `project-${index}`,
-      path: `C:\\workspace\\project-${index}`,
-      name: `project-${index}`,
-      lastAccessedAt: new Date(Date.now() - index * 60_000).toISOString(),
+    localStorage.setItem("sessionatlas.lang", "en");
+    const project = {
+      id: "delegated-project",
+      path: "C:\\workspace\\delegated-project",
+      name: "delegated-project",
+      source: "local",
+      lastAccessedAt: "2026-08-18T10:00:00Z",
       gitBranch: "main",
-      toolUsages: [{
-        toolKey: "codex",
-        toolName: "Codex CLI",
-        lastUsedAt: new Date(Date.now() - index * 60_000).toISOString(),
-        sessionCount: index % 20,
-        lastSessionId: `session-${index}`,
-      }],
-    }));
+      toolUsages: [
+        {
+          toolKey: "opencode",
+          toolName: "OpenCode",
+          lastUsedAt: "2026-08-18T10:00:00Z",
+          sessionCount: 0,
+          lastSessionId: null,
+        },
+        {
+          toolKey: "codex",
+          toolName: "Codex CLI",
+          lastUsedAt: "2026-08-18T09:00:00Z",
+          sessionCount: 1,
+          lastSessionId: "codex-main-session",
+        },
+      ],
+    };
+    const capabilities = {
+      source: "local",
+      serverId: null,
+      label: "Local",
+      tools: ["opencode", "codex"].map(toolKey => ({
+        toolKey,
+        toolName: toolKey === "codex" ? "Codex CLI" : "OpenCode",
+        installed: true,
+        enabled: true,
+        adapterEnabled: true,
+      })),
+    };
+    window.__ptyCalls = [];
     window.__TAURI__ = {
       core: {
-        invoke: async command => {
-          if (command === "list_projects") return projects;
-          if (command === "list_tools") return [{ toolKey: "codex", toolName: "Codex CLI" }];
+        invoke: async (command, payload = {}) => {
+          if (command === "local_index_exists") return true;
+          if (command === "list_projects") return [project];
+          if (command === "list_tools") return capabilities.tools;
+          if ([
+            "list_remote_projects", "list_remote_servers", "list_project_ignores",
+            "list_groups", "list_sort_orders", "list_opener_prefs",
+            "list_web_development_tools",
+          ].includes(command)) return [];
+          if (command === "list_group_assignments") return {};
           if (command === "get_group_revision") return 0;
           if (command === "get_git_info") return { isRepo: false, remotes: [] };
-          if (command === "list_group_assignments") return {};
-          if (command === "list_groups" || command === "list_sort_orders"
-              || command === "list_remote_projects" || command === "list_remote_servers"
-              || command === "list_opener_prefs" || command === "search_remote_projects") return [];
+          if (command === "probe_tui_capabilities") return capabilities;
+          if (command === "pty_spawn") {
+            window.__ptyCalls.push({ command, payload });
+            return 77;
+          }
+          if (command === "pty_attach") {
+            window.__ptyCalls.push({ command, payload });
+            return null;
+          }
           return null;
         },
       },
@@ -210,12 +246,71 @@ test("large catalogs render compact rows without hidden expanded controls", asyn
   });
 
   await page.goto("/index.html");
+  const entry = page.locator('article.entry[data-id="delegated-project"]');
+  await expect(entry).toBeVisible();
+  await entry.locator("[data-expand-toggle]").click();
 
-  await expect(page.locator("article.entry")).toHaveCount(2_000);
-  await expect(page.locator(".entry__expanded")).toHaveCount(0);
+  const openCodeCard = entry.locator(".session-card").filter({ hasText: "OpenCode" });
+  await expect(openCodeCard).toContainText("Child/delegated activity excluded");
+  await expect(openCodeCard.locator("[data-launch-tool=opencode]")).toHaveText("New session");
+
+  const codexCard = entry.locator(".session-card").filter({ hasText: "Codex CLI" });
+  await expect(codexCard).toContainText("1 resumable session");
+  await expect(codexCard.locator("[data-launch-tool=codex]")).toHaveText("Resume");
+  await expect(codexCard.locator("[data-launch-tool=codex]")).toBeEnabled();
+  await expect(page.locator("#termsSelectedLaunch .overview__session-row")).toHaveCount(1);
+
+  await entry.dispatchEvent("dblclick");
+  await expect.poll(() => page.evaluate(() => window.__ptyCalls
+    .find(call => call.command === "pty_attach")?.payload)).toEqual({
+    id: 77,
+    toolKey: "codex",
+    sessionId: "codex-main-session",
+  });
+});
+
+test("large catalogs keep a bounded ledger while scrolling reaches the directory tail", async ({ page }) => {
+  await page.addInitScript(() => {
+    const projects = Array.from({ length: 2_000 }, (_, index) => ({
+      id: `large-${index}`,
+      path: `C:\\workspace\\large-${index}`,
+      name: `large-project-${String(index).padStart(4, "0")}`,
+      lastAccessedAt: "2026-08-03T00:00:00Z",
+      gitBranch: "main",
+      toolUsages: [],
+    }));
+    window.__TAURI__ = {
+      core: {
+        invoke: async (command) => {
+          if (command === "list_projects") return projects;
+          if (command === "list_tools" || command === "list_remote_projects"
+              || command === "list_remote_servers" || command === "list_opener_prefs"
+              || command === "search_remote_projects" || command === "list_groups"
+              || command === "list_sort_orders") return [];
+          if (command === "list_group_assignments") return {};
+          if (command === "get_group_revision") return 0;
+          if (command === "get_git_info") return { isRepo: false, remotes: [] };
+          return null;
+        },
+      },
+      event: { listen: async () => () => {} },
+      window: { getCurrentWindow: () => ({ isMaximized: async () => false }) },
+    };
+  });
+
+  await page.goto("/index.html");
+  await expect(page.locator("#ledgerCount")).toContainText("2000");
   await expect(page.locator("#ledger")).toHaveClass(/is-large/);
-  await page.locator('[data-project-order="name"]').click();
-  await expect(page.locator("article.entry")).toHaveCount(2_000);
+  const initialCount = await page.locator("#ledger article.entry").count();
+  expect(initialCount).toBeLessThan(200);
+
+  await page.locator("#ledger").evaluate(element => {
+    element.scrollTop = element.scrollHeight;
+    element.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  await expect.poll(() => page.locator('#ledger article.entry[data-id="large-1999"]').count()).toBe(1);
+  const tailCount = await page.locator("#ledger article.entry").count();
+  expect(tailCount).toBeLessThan(200);
 });
 
 test("content search shows the matching file and a text-only subtitle", async ({ page }) => {

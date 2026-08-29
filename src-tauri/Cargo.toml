@@ -26,6 +26,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 dirs = "6"
 portable-pty = "0.9"
 url = "2"
+semver = "1"
 sessionatlas-core = { path = "../crates/sessionatlas-core" }
 
 [dev-dependencies]

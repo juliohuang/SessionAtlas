@@ -210,6 +210,31 @@ pub fn resolve_program(program: &str) -> Option<PathBuf> {
     search_path(program, &path_var, &path_ext)
 }
 
+/// Returns whether `program` is a single executable name resolved through
+/// PATH, rather than an absolute or relative path. This is intentionally
+/// stricter than [`search_path`], which also supports explicit paths for
+/// trusted local process configuration.
+pub fn is_bare_program_name(program: &str) -> bool {
+    !program.is_empty()
+        && program == program.trim()
+        && !program.starts_with('-')
+        && !matches!(program, "." | "..")
+        && !program.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | ':')
+        })
+}
+
+/// Resolve an executable only when it is a bare PATH name. Explicit paths
+/// remain available through [`resolve_program`] for trusted configuration,
+/// but adapter manifests must use this narrower boundary.
+pub fn resolve_bare_program(program: &str) -> Option<PathBuf> {
+    is_bare_program_name(program)
+        .then(|| resolve_program(program))
+        .flatten()
+}
+
 /// Pure PATH search over an explicit `path_var` (and `path_ext` on Windows),
 /// so tests can point it at synthetic temporary directories without touching
 /// the process environment. On POSIX an executable must also carry an execute
@@ -235,16 +260,20 @@ pub fn search_path(program: &str, path_var: &str, path_ext: &str) -> Option<Path
         }
         let base = Path::new(directory).join(program);
         if cfg!(windows) {
-            if let Some(path) = executable_file(&base) {
-                return Some(path.to_path_buf());
-            }
             if Path::new(program).extension().is_none() {
+                // Windows package managers such as npm place both a POSIX
+                // extensionless shim and a native `.cmd` launcher on PATH.
+                // `CreateProcessW` cannot execute the POSIX shim, so respect
+                // PATHEXT before considering an exact extensionless file.
                 for extension in &extensions {
                     let with_extension = base.with_extension(extension.trim_start_matches('.'));
                     if let Some(path) = executable_file(&with_extension) {
                         return Some(path.to_path_buf());
                     }
                 }
+            }
+            if let Some(path) = executable_file(&base) {
+                return Some(path.to_path_buf());
             }
         } else if let Some(path) = executable_file(&base) {
             return Some(path.to_path_buf());
@@ -268,4 +297,36 @@ fn executable_file(path: &Path) -> Option<&Path> {
         }
     }
     Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_bare_program_name, resolve_bare_program, search_path};
+
+    #[test]
+    fn bare_program_names_reject_path_forms_on_all_platforms() {
+        for value in [
+            r"C:\tools\codex.exe",
+            r"C:/tools/codex.exe",
+            r"\\server\share\codex.exe",
+            "/opt/tools/codex",
+            "./tools/codex",
+            "../tools/codex",
+            "tools/codex",
+            "tools\\codex",
+            "C:codex",
+        ] {
+            assert!(!is_bare_program_name(value), "path accepted: {value}");
+        }
+    }
+
+    #[test]
+    fn bare_program_names_keep_valid_path_lookup_and_reject_direct_resolution() {
+        assert!(is_bare_program_name("codex"));
+        assert!(is_bare_program_name("my-tool.v2"));
+        assert!(!is_bare_program_name(" codex "));
+        assert!(!is_bare_program_name("-codex"));
+        assert!(resolve_bare_program("definitely-not-installed-sessionatlas").is_none());
+        assert!(search_path("tools/codex", "", "").is_none());
+    }
 }

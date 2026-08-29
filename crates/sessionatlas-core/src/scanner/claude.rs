@@ -5,26 +5,28 @@
 //! ID, git branch and activity timestamp are extracted; prompt and message
 //! content is never read into the output.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::base::{
-    complete_session_files, missing_source, probe_directory, source_read_failure, ScanDiagnostic,
-    ScanDiagnosticSeverity, ScanOutcome, ScannedProject, Scanner, SourceProbe,
+    bounded_recursive_files, complete_session_files, missing_source, probe_directory,
+    source_read_failure, BoundedLineError, BoundedLines, BudgetError, ScanBudget, ScanContext,
+    ScanDiagnostic, ScanDiagnosticSeverity, ScanOutcome, ScannedProject, Scanner, SourceProbe,
     MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, SESSION_READ_FAILED, TIMESTAMP_FALLBACK,
 };
-use super::parsing::{
-    home_directory, recursive_file_enumeration, try_normalize_project_path, try_read_utc_timestamp,
-};
+use super::cache::FileCache;
+use super::parsing::{home_directory, try_normalize_project_path, try_read_utc_timestamp};
 
 /// Claude Code scanner for project-bucket JSONL sessions under
 /// `~/.claude/projects/`.
 pub struct ClaudeScanner {
     is_available: Box<dyn Fn() -> bool>,
+    budget: ScanBudget,
 }
+
+const PARSER_VERSION: u32 = 1;
 
 impl ClaudeScanner {
     /// Availability defaults to whether `claude` is on `PATH`; historical data
@@ -37,7 +39,12 @@ impl ClaudeScanner {
     pub fn with_availability(availability: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_available: Box::new(availability),
+            budget: ScanBudget::default(),
         }
+    }
+    pub fn with_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -80,36 +87,67 @@ impl ClaudeScanner {
             SourceProbe::Exists => {}
         }
 
-        let session_files = match enumerate_jsonl_files(&projects_dir) {
+        let context = self.budget.context();
+        let session_files = match enumerate_jsonl_files(&projects_dir, &context) {
             Ok(files) => files,
-            Err(()) => {
-                return source_read_failure("claude", "the Claude Code projects directory");
+            Err(error) => {
+                return ScanOutcome::failed([context.diagnostic("claude", error)]);
             }
         };
 
         let mut projects = Vec::new();
         let mut diagnostics = Vec::new();
         let claude_home = claude_home.to_string_lossy().into_owned();
+        let mut cache =
+            FileCache::load_with_limit(&home, PARSER_VERSION, context.budget.max_cache_bytes);
+        cache.retain_paths("claude", &session_files);
         for session_file in &session_files {
-            parse_session_file(session_file, &claude_home, &mut projects, &mut diagnostics);
+            if context.source_file_path(session_file).is_err() {
+                return ScanOutcome::failed([context.diagnostic("claude", BudgetError::Exceeded)]);
+            }
+            if let Some(cached) = cache.get("claude", session_file) {
+                for _ in &cached {
+                    if let Err(error) = context.record() {
+                        return ScanOutcome::failed([context.diagnostic("claude", error)]);
+                    }
+                }
+                projects.extend(cached);
+                continue;
+            }
+            let project_start = projects.len();
+            let diagnostic_start = diagnostics.len();
+            if let Err(error) = parse_session_file(
+                session_file,
+                &claude_home,
+                &context,
+                &mut projects,
+                &mut diagnostics,
+            ) {
+                return ScanOutcome::failed([context.diagnostic("claude", error)]);
+            }
+            if diagnostics.len() == diagnostic_start && projects.len() > project_start {
+                cache.record("claude", session_file, &projects[project_start..]);
+            }
         }
-
-        complete_session_files("claude", session_files.len(), projects, diagnostics)
+        let outcome = complete_session_files("claude", session_files.len(), projects, diagnostics);
+        if outcome.is_successful() {
+            cache.save();
+        }
+        outcome
     }
 }
 
 /// Recursively enumerates `*.jsonl` session files in ordinal path order.
 /// Any inaccessible entry surfaces as `Err(())`; enumeration stops on the
 /// first unreadable path.
-fn enumerate_jsonl_files(projects_dir: &Path) -> Result<Vec<PathBuf>, ()> {
+fn enumerate_jsonl_files(
+    projects_dir: &Path,
+    context: &ScanContext,
+) -> Result<Vec<PathBuf>, BudgetError> {
     let mut files = Vec::new();
-    for entry in recursive_file_enumeration(projects_dir) {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => return Err(()),
-        };
-        if entry.file_type().is_file() && is_jsonl(entry.path()) {
-            files.push(entry.into_path());
+    for path in bounded_recursive_files(projects_dir, context)? {
+        if is_jsonl(&path) {
+            files.push(path);
         }
     }
     files.sort();
@@ -133,19 +171,21 @@ fn is_jsonl(path: &Path) -> bool {
 fn parse_session_file(
     session_file: &Path,
     claude_home: &str,
+    context: &ScanContext,
     projects: &mut Vec<ScannedProject>,
     diagnostics: &mut Vec<ScanDiagnostic>,
-) {
-    let file = match std::fs::File::open(session_file) {
-        Ok(file) => file,
-        Err(_) => {
+) -> Result<(), BudgetError> {
+    let mut lines = match BoundedLines::open(session_file, context) {
+        Ok(lines) => lines,
+        Err(BoundedLineError::Budget(error)) => return Err(error),
+        Err(BoundedLineError::Io) => {
             diagnostics.push(ScanDiagnostic::new(
                 "claude",
                 ScanDiagnosticSeverity::Warning,
                 SESSION_READ_FAILED,
                 "A Claude Code session file could not be read and was skipped.",
             ));
-            return;
+            return Ok(());
         }
     };
 
@@ -156,8 +196,22 @@ fn parse_session_file(
     let mut malformed_lines = 0;
     let mut first_line = true;
 
-    for line in BufReader::new(file).lines() {
-        let line = match line {
+    loop {
+        let raw_line = match lines.next_line() {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(BoundedLineError::Budget(error)) => return Err(error),
+            Err(BoundedLineError::Io) => {
+                diagnostics.push(ScanDiagnostic::new(
+                    "claude",
+                    ScanDiagnosticSeverity::Warning,
+                    SESSION_READ_FAILED,
+                    "A Claude Code session file could not be read and was skipped.",
+                ));
+                return Ok(());
+            }
+        };
+        let line = match String::from_utf8(raw_line) {
             Ok(line) => line,
             Err(_) => {
                 diagnostics.push(ScanDiagnostic::new(
@@ -166,7 +220,7 @@ fn parse_session_file(
                     SESSION_READ_FAILED,
                     "A Claude Code session file could not be read and was skipped.",
                 ));
-                return;
+                return Ok(());
             }
         };
         let line = if first_line {
@@ -222,7 +276,7 @@ fn parse_session_file(
             MISSING_PROJECT_PATH,
             "A Claude Code session did not contain a safe absolute project path and was skipped.",
         ));
-        return;
+        return Ok(());
     };
 
     let session_id = session_id.or_else(|| {
@@ -241,7 +295,7 @@ fn parse_session_file(
                 "A Claude Code session had no valid activity timestamp; file modification time was used.",
             ));
             let Some(fallback) = file_last_write_utc(session_file) else {
-                return;
+                return Ok(());
             };
             fallback
         }
@@ -253,6 +307,7 @@ fn parse_session_file(
         session_id,
         git_branch,
     });
+    Ok(())
 }
 
 /// Reads the file modification time as a UTC timestamp. Returns `None` only when the metadata

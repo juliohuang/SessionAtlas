@@ -305,6 +305,26 @@ body.is-maximized .console {
   flex: 1 1 auto;
   min-height: 0;
 }
+.ledger__virtual-spacer {
+  position: relative;
+  min-width: 100%;
+}
+.ledger__virtual-window {
+  position: absolute;
+  inset-inline: 0;
+  top: 0;
+}
+.ledger__virtual-row {
+  display: flow-root;
+  min-width: 100%;
+}
+/* Virtual rows are recycled while scrolling. Keep the bounded DOM from
+   replaying the staggered entry animation or hiding a newly mounted row. */
+.ledger__virtual-window .entry {
+  animation: none;
+  opacity: 1;
+  transform: none;
+}
 .ledger__count {
   padding: 5px 14px;
   font-family: "JetBrains Mono", monospace;
@@ -359,7 +379,7 @@ body.is-maximized .console {
   opacity: 0; transform: translateY(6px);
   animation: entryIn .32s cubic-bezier(.2,.7,.2,1) forwards;
   content-visibility: auto;
-  contain-intrinsic-block-size: 42px;
+  contain-intrinsic-block-size: 80px;
 }
 @keyframes entryIn { to { opacity: 1; transform: none; } }
 .entry:hover { background: var(--ink-2); }
@@ -1052,16 +1072,39 @@ body.is-maximized .console {
 .entry__expand {
   flex: 0 0 auto;
   display: inline-flex; align-items: center; justify-content: center;
-  width: 14px; height: 22px;
+  width: 30px; height: 30px;
+  margin: -4px 0;
   background: transparent; border: 1px solid transparent;
+  border-radius: 5px;
   color: var(--bone-mute);
   font-family: var(--mono); font-size: 11px; line-height: 1;
   cursor: pointer; padding: 0;
   -webkit-user-drag: none;
-  transition: color .14s;
+  touch-action: manipulation;
+  transition: color .14s, background .14s, border-color .14s;
 }
-.entry__expand:hover { color: var(--accent); }
-.entry.is-expanded .entry__expand { color: var(--accent); }
+.entry__expand-icon {
+  display: block;
+  transform-origin: 50% 50%;
+  transition: transform .14s cubic-bezier(.2,.7,.2,1);
+}
+.entry__expand:hover {
+  color: var(--accent);
+  border-color: var(--rule-bright);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+.entry__expand:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  outline: 2px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  outline-offset: 1px;
+}
+.entry.is-expanded .entry__expand {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--rule));
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+.entry.is-expanded .entry__expand-icon { transform: rotate(90deg); }
 .entry__expanded {
   grid-column: 1 / -1;
   margin-top: 12px; padding-top: 12px;
@@ -1085,6 +1128,12 @@ body.is-maximized .console {
   background: var(--ink-2); border: 1px solid var(--rule);
   font-family: var(--mono); font-size: 11.5px;
   color: var(--bone-dim);
+}
+.session-card--activity-only {
+  border-style: dashed;
+}
+.session-card--activity-only .session-card__meta {
+  color: var(--bone-mute);
 }
 .session-card__dot {
   width: 9px; height: 9px; display: inline-block; flex: 0 0 auto;
@@ -1635,6 +1684,17 @@ body.is-maximized .console {
 }
 .launch-pill--ext small { color: var(--ember); opacity: .7; font-size: 9px; }
 .launch-pill--ext:hover small { color: var(--ink); opacity: .8; }
+.launch-pill--web {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+.launch-pill--web:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+.launch-pill--web small { color: var(--accent-dim); }
+.launch-pill--web:hover small { color: var(--ink); }
 
 /* ── masthead ghost variant of scan button (gear / settings) */
 .scan-btn--ghost { border-color: var(--rule-bright); color: var(--bone-dim); }
@@ -1927,8 +1987,7 @@ body.is-maximized .console {
   font-family: var(--mono);
 }
 
-/* Per-machine AI TUI capabilities. Installation status is the primary
-   signal; the switch appears only after a command has been detected. */
+/* Declarative TUI adapters plus per-machine installation capabilities. */
 .tui-intro {
   padding: 10px 12px;
   border: 1px solid var(--accent-dim);
@@ -1938,6 +1997,39 @@ body.is-maximized .console {
   font-size: 10.5px;
   line-height: 1.55;
 }
+.tui-adapter-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 11px 12px;
+  border: 1px solid var(--rule);
+  background: var(--ink-2);
+}
+.tui-adapter-form__copy {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--mono);
+}
+.tui-adapter-form__copy strong { color: var(--bone); font-size: 10.5px; }
+.tui-adapter-form__copy span { color: var(--bone-mute); font-size: 9.5px; line-height: 1.5; }
+.tui-adapter-form .custom-form__input { min-width: 0; }
+.tui-adapter-form .scan-btn { align-self: stretch; }
+.tui-adapter-diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--ember) 60%, var(--rule));
+  background: color-mix(in srgb, var(--ember) 6%, var(--ink));
+  color: var(--ember);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.tui-adapter-diagnostics strong { color: var(--bone); font-size: 10px; }
 .tui-machine {
   border: 1px solid var(--rule);
   background: var(--ink-2);
@@ -1969,8 +2061,21 @@ body.is-maximized .console {
   letter-spacing: .16em;
   text-transform: uppercase;
 }
+.tui-machine__actions,
+.tui-row__actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+.tui-machine__actions,
+.tui-row__actions { flex-wrap: wrap; }
 .tui-machine__refresh,
-.tui-row__install {
+.tui-machine__check,
+.tui-row__install,
+.tui-row__upgrade,
+.tui-row__adapter-action {
   flex: 0 0 auto;
   padding: 5px 8px;
   border: 1px solid var(--rule-bright);
@@ -1982,9 +2087,18 @@ body.is-maximized .console {
   letter-spacing: .08em;
 }
 .tui-machine__refresh:hover:not(:disabled),
-.tui-row__install:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.tui-machine__check:hover:not(:disabled),
+.tui-row__install:hover:not(:disabled),
+.tui-row__upgrade:hover:not(:disabled),
+.tui-row__adapter-action:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .tui-machine__refresh:disabled,
-.tui-row__install:disabled { cursor: not-allowed; opacity: .45; }
+.tui-machine__check:disabled,
+.tui-row__install:disabled,
+.tui-row__upgrade:disabled,
+.tui-row__adapter-action:disabled { cursor: not-allowed; opacity: .45; }
+.tui-machine__check,
+.tui-row__upgrade { border-color: var(--accent-dim); color: var(--accent); }
+.tui-row__adapter-action { border-color: var(--rule-bright); color: var(--bone-mute); }
 .tui-machine__tools { display: flex; flex-direction: column; }
 .tui-row {
   display: grid;
@@ -2008,6 +2122,12 @@ body.is-maximized .console {
 .tui-row__main small { color: var(--bone-mute); font-family: var(--mono); font-size: 9.5px; }
 .tui-row__main small.is-installed { color: var(--accent-dim); }
 .tui-row__main small.is-missing { color: var(--ember); }
+.tui-row__main .tui-row__adapter { color: var(--bone-dim); font-size: 8.5px; }
+.tui-row__main .tui-row__update { font-size: 8.5px; }
+.tui-row__update.is-checking { color: var(--bone-dim); }
+.tui-row__update.is-current { color: var(--accent-dim); }
+.tui-row__update.is-update { color: var(--accent); }
+.tui-row__update.is-error { color: var(--ember); cursor: help; }
 .tui-row__toggle {
   display: inline-flex;
   align-items: center;
@@ -2018,6 +2138,8 @@ body.is-maximized .console {
   font-size: 9.5px;
 }
 .tui-row__toggle input { accent-color: var(--accent); cursor: pointer; }
+.tui-row__toggle:has(input:disabled) { cursor: not-allowed; opacity: .48; }
+.tui-row__toggle input:disabled { cursor: not-allowed; }
 .tui-machine__error {
   padding: 11px 12px;
   color: var(--ember);
@@ -2139,6 +2261,89 @@ body.is-maximized .console {
   border: 1px solid var(--rule-bright);
 }
 
+/* browser-based development tools */
+.web-development__intro,
+.web-development__error {
+  padding: 10px 12px;
+  border: 1px solid var(--accent-dim);
+  background: color-mix(in srgb, var(--accent) 6%, var(--ink-2));
+  color: var(--bone-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+.web-development__error {
+  border-color: var(--ember);
+  color: var(--ember);
+  overflow-wrap: anywhere;
+}
+.web-tool-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--rule);
+  background: var(--ink);
+}
+.web-tool-row__toggle {
+  grid-column: 1 / -1;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--bone);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+.web-tool-row__toggle input { accent-color: var(--accent); cursor: pointer; }
+.web-tool-row__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 18px;
+  border: 1px solid var(--accent-dim);
+  color: var(--accent);
+  font-size: 8px;
+  letter-spacing: .08em;
+}
+.web-tool-row__field {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  color: var(--bone-mute);
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+.web-tool-row__field .custom-form__input { min-width: 0; width: 100%; }
+.web-tool-row__actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.web-tool-row__actions button {
+  padding: 5px 9px;
+  border: 1px solid var(--rule-bright);
+  background: transparent;
+  color: var(--bone-dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: .08em;
+  cursor: pointer;
+}
+.web-tool-row__actions button:hover { border-color: var(--accent); color: var(--accent); }
+.web-tool-row__actions .web-tool-row__delete:hover { border-color: var(--ember); color: var(--ember); }
+.web-development__hint {
+  grid-column: 1 / -1;
+  color: var(--bone-mute);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+
 /* custom opener form */
 .custom-form {
   display: grid;
@@ -2213,6 +2418,11 @@ body.is-maximized .console {
 @media (max-width: 460px) {
   .server-form { grid-template-columns: minmax(0, 1fr) auto; }
   .server-form .ssh-command-field { grid-column: 1 / -1; }
+  .tui-adapter-form { grid-template-columns: minmax(0, 1fr); }
+  .tui-adapter-form .scan-btn { width: 100%; }
+  .web-tool-row__field { grid-template-columns: minmax(0, 1fr); }
+  #webDevelopmentNewForm { grid-template-columns: minmax(0, 1fr); }
+  #webDevelopmentNewForm .scan-btn { width: 100%; }
 }
 
 /* ── file-tab right-click context menu ──────────────────── */

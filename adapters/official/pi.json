@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "id": "pi",
+  "name": "Pi Coding Agent",
+  "adapterVersion": "1.0.0",
+  "command": "pi",
+  "versionArgs": ["--version"],
+  "launch": {
+    "newArgs": [],
+    "resumeArgs": ["--session", "{sessionId}"]
+  },
+  "manager": "npm",
+  "package": "@earendil-works/pi-coding-agent",
+  "scanner": { "handler": "builtin.pi" },
+  "platforms": ["windows", "macos", "linux"],
+  "supportsRemote": true
+}

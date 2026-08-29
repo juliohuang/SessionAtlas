@@ -22,7 +22,7 @@ Before launch, make an explicit keep-or-rename decision for `SessionAtlas`. An u
 - Enable private vulnerability reporting, secret scanning, push protection, Dependabot alerts, dependency graph, and CodeQL.
 - Protect `main`: require a pull request, CI and Security checks, conversation resolution, and no force pushes or deletions.
 - Verify the Apache-2.0 license is detected and the community profile recognizes the contribution files.
-- Publish `v0.1.0-beta.1` with MSI, NSIS installer, SHA-256 checksums, SPDX SBOM, provenance attestation, and honest unsigned-beta notes.
+- Publish the next beta tag (currently `v0.1.0-beta.3`) with MSI, NSIS installer, SHA-256 checksums, SPDX SBOM, provenance attestation, and honest unsigned-beta notes.
 - Pin the beta release, roadmap discussion, and two newcomer-friendly issues.
 
 ## Launch sequence

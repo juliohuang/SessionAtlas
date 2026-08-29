@@ -3513,11 +3513,14 @@ dependencies = [
 name = "sessionatlas-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dirs",
  "fs2",
+ "libc",
  "lz4_flex",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3535,6 +3538,7 @@ dependencies = [
  "dirs",
  "portable-pty",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sessionatlas-core",

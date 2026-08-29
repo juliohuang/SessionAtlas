@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "id": "aider",
+  "name": "Aider",
+  "adapterVersion": "1.0.0",
+  "command": "aider",
+  "versionArgs": ["--version"],
+  "launch": {
+    "newArgs": [],
+    "resumeArgs": ["--resume", "{sessionId}"]
+  },
+  "manager": "uv",
+  "package": "aider-chat",
+  "scanner": { "handler": "builtin.aider" },
+  "platforms": ["windows", "macos", "linux"],
+  "supportsRemote": true
+}

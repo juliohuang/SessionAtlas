@@ -13,9 +13,11 @@ use chrono::{DateTime, Utc};
 
 use crate::model::ToolSource;
 use crate::scanner::{
-    expand_tilde, missing_source, probe_directory, source_read_failure, try_normalize_project_path,
-    try_read_utc_timestamp, ScanDiagnostic, ScanDiagnosticSeverity, ScanOutcome, ScannedProject,
-    Scanner, SourceProbe, MALFORMED_SESSION_RECORD, SESSION_READ_FAILED, TIMESTAMP_FALLBACK,
+    expand_tilde, missing_source, no_follow_metadata, probe_directory, read_bounded_file_detailed,
+    source_read_failure, try_normalize_project_path, try_read_utc_timestamp, BoundedFileError,
+    BudgetError, ScanBudget, ScanContext, ScanDiagnostic, ScanDiagnosticSeverity, ScanOutcome,
+    ScannedProject, Scanner, SourceProbe, MALFORMED_SESSION_RECORD, SESSION_READ_FAILED,
+    TIMESTAMP_FALLBACK,
 };
 
 /// Whether `executable` resolves on PATH (`where` on Windows, `which`
@@ -33,9 +35,12 @@ pub(crate) fn executable_on_path(executable: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// First whitespace-separated token of a CLI command, i.e. the executable.
-fn first_command_token(command: &str) -> &str {
-    command.split_whitespace().next().unwrap_or("")
+/// Safely parsed executable token of a configured CLI command. This preserves
+/// quoted absolute paths instead of truncating them at the first space.
+fn first_command_token(command: &str) -> Option<String> {
+    crate::security::parse_safe_command(command)
+        .ok()
+        .and_then(|tokens| tokens.into_iter().next())
 }
 
 /// Generic scanner for a user-configured directory whose direct children are
@@ -43,12 +48,13 @@ fn first_command_token(command: &str) -> &str {
 pub struct CustomToolScanner {
     tool: ToolSource,
     is_command_available: Box<dyn Fn() -> bool>,
+    budget: ScanBudget,
 }
 
 impl CustomToolScanner {
     /// Scanner probing the configured `CliCommand` executable for availability.
     pub fn new(tool: ToolSource) -> Self {
-        let executable = first_command_token(&tool.cli_command).to_string();
+        let executable = first_command_token(&tool.cli_command).unwrap_or_default();
         Self::with_availability(tool, move || executable_on_path(&executable))
     }
 
@@ -58,7 +64,12 @@ impl CustomToolScanner {
         Self {
             tool,
             is_command_available: Box::new(is_available),
+            budget: ScanBudget::default(),
         }
+    }
+    pub fn with_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -92,20 +103,24 @@ impl Scanner for CustomToolScanner {
             }
             SourceProbe::Exists => {}
         }
-        let directories = match read_direct_child_directories(&data_directory) {
+        let context = self.budget.context();
+        let directories = match read_direct_child_directories(&data_directory, &context) {
             Ok(directories) => directories,
-            Err(_) => {
-                return source_read_failure(
-                    self.tool_key(),
-                    "the configured custom-tool data directory",
-                );
-            }
+            Err(error) => return ScanOutcome::failed([context.diagnostic(self.tool_key(), error)]),
         };
 
         let mut projects: Vec<ScannedProject> = Vec::new();
         let mut diagnostics: Vec<ScanDiagnostic> = Vec::new();
         for directory in directories {
-            self.parse_project(&data_directory, &directory, &mut projects, &mut diagnostics);
+            if let Err(error) = self.parse_project(
+                &data_directory,
+                &directory,
+                &context,
+                &mut projects,
+                &mut diagnostics,
+            ) {
+                return ScanOutcome::failed([context.diagnostic(self.tool_key(), error)]);
+            }
         }
         ScanOutcome::succeeded(projects, diagnostics)
     }
@@ -135,9 +150,11 @@ impl CustomToolScanner {
         &self,
         data_directory: &Path,
         directory: &Path,
+        context: &ScanContext,
         projects: &mut Vec<ScannedProject>,
         diagnostics: &mut Vec<ScanDiagnostic>,
-    ) {
+    ) -> Result<(), BudgetError> {
+        context.record()?;
         let mut project_path = normalize_path_or_raw(directory);
         let mut last_accessed = directory_last_modified(directory).unwrap_or_else(|| {
             diagnostics.push(ScanDiagnostic::new(
@@ -151,8 +168,9 @@ impl CustomToolScanner {
         let mut session_id: Option<String> = None;
 
         let metadata_path = directory.join("metadata.json");
-        if metadata_path.is_file() {
-            match std::fs::read(&metadata_path) {
+        let metadata_state = no_follow_metadata(&metadata_path);
+        if metadata_state.is_ok_and(|metadata| metadata.is_file()) {
+            match read_bounded_file_detailed(&metadata_path, context) {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(strip_utf8_bom(&bytes)) {
                     Ok(root) => {
                         if let Some(configured) = first_usable_path(&root) {
@@ -184,12 +202,13 @@ impl CustomToolScanner {
                         "A custom-tool metadata file contained malformed JSON; directory metadata was used.",
                     )),
                 },
-                Err(_) => diagnostics.push(ScanDiagnostic::new(
+                Err(BoundedFileError::Io) => diagnostics.push(ScanDiagnostic::new(
                     self.tool_key(),
                     ScanDiagnosticSeverity::Warning,
                     SESSION_READ_FAILED,
                     "A custom-tool metadata file could not be read; directory metadata was used.",
                 )),
+                Err(BoundedFileError::Budget(error)) => return Err(error),
             }
         }
 
@@ -199,15 +218,21 @@ impl CustomToolScanner {
             session_id,
             git_branch: None,
         });
+        Ok(())
     }
 }
 
 /// Direct child directories of `root`, sorted by ordinal path order.
-fn read_direct_child_directories(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+fn read_direct_child_directories(
+    root: &Path,
+    context: &ScanContext,
+) -> Result<Vec<PathBuf>, BudgetError> {
     let mut directories = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.metadata()?.is_dir() {
+    for entry in std::fs::read_dir(root).map_err(|_| BudgetError::Exceeded)? {
+        let entry = entry.map_err(|_| BudgetError::Exceeded)?;
+        context.entry(1)?;
+        let metadata = no_follow_metadata(&entry.path()).map_err(|_| BudgetError::Exceeded)?;
+        if metadata.is_dir() {
             directories.push(entry.path());
         }
     }

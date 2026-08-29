@@ -140,6 +140,20 @@ fn process_contract_search_path_uses_pathext_on_windows() {
     assert_eq!(search_path("tool", &path_var, ""), None);
 }
 
+#[cfg(windows)]
+#[test]
+fn process_contract_search_path_prefers_native_pathext_launcher_over_posix_shim() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let directory = temp.path();
+    std::fs::write(directory.join("npm"), "#!/bin/sh\n").expect("POSIX shim");
+    std::fs::write(directory.join("npm.cmd"), "@echo off\r\n").expect("native launcher");
+
+    let resolved = search_path("npm", &directory.to_string_lossy(), ".EXE;.CMD")
+        .expect("native launcher should resolve");
+
+    assert_eq!(resolved, directory.join("npm.CMD"));
+}
+
 #[test]
 fn process_contract_unknown_program_resolves_nowhere_with_empty_path() {
     assert_eq!(search_path("claude", "", ""), None);

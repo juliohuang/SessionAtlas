@@ -7,19 +7,24 @@ license = "Apache-2.0"
 repository = "https://github.com/juliohuang/SessionAtlas"
 
 [dependencies]
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 chrono = "0.4"
 walkdir = "2"
 fs2 = "0.4"
 sha2 = "0.11"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
+semver = "1"
 lz4_flex = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

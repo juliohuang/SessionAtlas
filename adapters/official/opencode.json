@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "id": "opencode",
+  "name": "OpenCode",
+  "adapterVersion": "1.0.1",
+  "command": "opencode",
+  "versionArgs": ["--version"],
+  "launch": {
+    "newArgs": [],
+    "resumeArgs": ["--session", "{sessionId}"]
+  },
+  "manager": "npm",
+  "package": "opencode-ai",
+  "scanner": { "handler": "builtin.opencode" },
+  "platforms": ["windows", "macos", "linux"],
+  "supportsRemote": true
+}

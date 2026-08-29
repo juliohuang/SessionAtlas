@@ -151,6 +151,36 @@ fn indexer_reports_zero_known_sessions_when_source_has_no_native_session_id() {
 }
 
 #[test]
+fn indexer_keeps_latest_resumable_identity_when_newer_activity_has_no_session_id() {
+    let root = tempfile::tempdir().unwrap();
+    let project_path = make_project_dir(root.path(), "sample-project");
+    let path = project_path.to_string_lossy().into_owned();
+    let older = rfc3339("2026-07-29T10:00:00Z");
+    let newer = rfc3339("2026-07-30T10:00:00Z");
+
+    for observations in [
+        vec![
+            scanned(&path, newer, None, None),
+            scanned(&path, older, Some("main-session"), None),
+        ],
+        vec![
+            scanned(&path, older, Some("main-session"), None),
+            scanned(&path, newer, None, None),
+        ],
+    ] {
+        let result = build_index(&[tool("opencode", "OpenCode", observations)]);
+        let usage = &result[0].tool_usages[0];
+        assert_eq!(usage.last_used_at, newer, "activity time remains current");
+        assert_eq!(usage.session_count, 1);
+        assert_eq!(
+            usage.last_session_id.as_deref(),
+            Some("main-session"),
+            "activity-only observations must not erase the resume target"
+        );
+    }
+}
+
+#[test]
 fn indexer_blank_session_ids_are_not_counted() {
     let root = tempfile::tempdir().unwrap();
     let project_path = make_project_dir(root.path(), "sample-project");

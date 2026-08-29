@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "id": "kimi",
+  "name": "Kimi Code",
+  "adapterVersion": "1.0.0",
+  "command": "kimi",
+  "versionArgs": ["--version"],
+  "launch": {
+    "newArgs": [],
+    "resumeArgs": ["--resume", "{sessionId}"]
+  },
+  "manager": "npm",
+  "package": "@moonshot-ai/kimi-code",
+  "scanner": { "handler": "builtin.kimi" },
+  "platforms": ["windows", "macos", "linux"],
+  "supportsRemote": true
+}

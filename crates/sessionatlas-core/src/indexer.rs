@@ -43,6 +43,7 @@ pub fn build_index(tool_scans: &[IndexedToolScan]) -> Vec<Project> {
     let mut projects: Vec<Project> = Vec::new();
     let mut project_index: HashMap<String, usize> = HashMap::new();
     let mut session_ids: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    let mut latest_sessions: HashMap<(String, String), (DateTime<Utc>, String)> = HashMap::new();
 
     for tool in tool_scans {
         for result in &tool.projects {
@@ -85,12 +86,30 @@ pub fn build_index(tool_scans: &[IndexedToolScan]) -> Vec<Project> {
                 .session_id
                 .as_deref()
                 .filter(|session_id| !session_id.trim().is_empty());
-            let known = session_ids
-                .entry((path_key, fold_case(&tool.tool_key)))
-                .or_default();
+            let usage_key = (path_key, fold_case(&tool.tool_key));
+            let known = session_ids.entry(usage_key.clone()).or_default();
             if let Some(session_id) = normalized_session_id {
                 known.insert(session_id.to_string());
+                let replace_latest = latest_sessions.get(&usage_key).is_none_or(
+                    |(current_time, current_session_id)| {
+                        is_later_observation(
+                            last_accessed_at,
+                            session_id,
+                            *current_time,
+                            current_session_id,
+                        )
+                    },
+                );
+                if replace_latest {
+                    latest_sessions.insert(
+                        usage_key.clone(),
+                        (last_accessed_at, session_id.to_string()),
+                    );
+                }
             }
+            let latest_session_id = latest_sessions
+                .get(&usage_key)
+                .map(|(_, session_id)| session_id.clone());
 
             let project = &mut projects[project_idx];
             let existing = project
@@ -99,22 +118,17 @@ pub fn build_index(tool_scans: &[IndexedToolScan]) -> Vec<Project> {
                 .find(|usage| usage.tool_key.eq_ignore_ascii_case(&tool.tool_key));
             if let Some(existing) = existing {
                 existing.session_count = known.len() as i32;
-                if is_later_observation(
-                    last_accessed_at,
-                    normalized_session_id,
-                    existing.last_used_at,
-                    existing.last_session_id.as_deref(),
-                ) {
+                if last_accessed_at > existing.last_used_at {
                     existing.last_used_at = last_accessed_at;
-                    existing.last_session_id = normalized_session_id.map(str::to_string);
                 }
+                existing.last_session_id = latest_session_id;
             } else {
                 project.tool_usages.push(ToolUsage {
                     tool_name: tool.tool_name.clone(),
                     tool_key: tool.tool_key.clone(),
                     last_used_at: last_accessed_at,
                     session_count: known.len() as i32,
-                    last_session_id: normalized_session_id.map(str::to_string),
+                    last_session_id: latest_session_id,
                 });
             }
         }
@@ -175,18 +189,18 @@ fn fold_case(value: &str) -> String {
     value.chars().flat_map(char::to_uppercase).collect()
 }
 
-/// Later-observation rule: strictly later time wins; on equal times the
-/// ordinal-greater session ID wins (`None` sorts before any value).
+/// Later resumable-session rule: strictly later time wins; on equal times the
+/// ordinal-greater native session ID wins.
 fn is_later_observation(
     candidate_time: DateTime<Utc>,
-    candidate_session_id: Option<&str>,
+    candidate_session_id: &str,
     current_time: DateTime<Utc>,
-    current_session_id: Option<&str>,
+    current_session_id: &str,
 ) -> bool {
     match candidate_time.cmp(&current_time) {
         Ordering::Greater => true,
         Ordering::Less => false,
-        Ordering::Equal => candidate_session_id.cmp(&current_session_id) == Ordering::Greater,
+        Ordering::Equal => candidate_session_id.cmp(current_session_id) == Ordering::Greater,
     }
 }
 

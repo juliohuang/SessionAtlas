@@ -1,6 +1,6 @@
 # SessionAtlas Rust migration execution progress
 
-Updated: 2026-08-15
+Updated: 2026-08-18
 
 > 迁移计划、任务依赖、每个任务的允许修改范围与验证见
 > [`rust-migration-plan.md`](./rust-migration-plan.md)。本文件只保留 R00～R14 的
@@ -49,9 +49,25 @@ Updated: 2026-08-15
   `kimi_scanner_home_resolution_follows_sessionatlas_then_kimi_code_home` 偶发失败；
   改为共享 parsing 模块级 `crate::scanner::parsing::ENV_LOCK` 后 6 轮全量 lib 测试稳定通过。
 
-## Remaining release gates（2026-08-16 后续复核与手工/真机验收）
+## R16 open-source preflight rerun (2026-08-18)
 
-1. 2026-08-16 本地 `cargo audit 0.22.2` 已扫描 542 个锁定 crate：0 个漏洞、
+- Rust format, Clippy, and all workspace tests passed: CLI 96, core 258, Tauri
+  107, for 461 total tests.
+- Frontend syntax, 22 unit tests, and 53 Playwright browser tests passed.
+- npm audit found 0 vulnerabilities. `cargo audit 0.22.2` scanned 538 locked
+  crates, found 0 vulnerabilities, and retained 17 documented upstream warnings.
+- MSI, NSIS, and release CLI builds passed. Isolated acceptance found 2
+  synthetic projects and 2 sessions with no SQLite sidecars; real data
+  sentinel hashes and sizes remained unchanged.
+- JSON/YAML parsing, relative Markdown links, `git diff --check`, and current
+  plus historical high-confidence secret scans passed.
+- Three validated security findings were remediated: automatic adapter probes
+  now reject evaluator-style argv, and Unix cache/process-output files are
+  created with mode `0600`.
+
+## Remaining release gates（2026-08-18 后续复核与手工/真机验收）
+
+1. 2026-08-18 本地 `cargo audit 0.22.2` 已扫描 538 个锁定 crate：0 个漏洞、
    17 个已分析的上游 informational warning；托管 Security workflow 仍须在交付
    commit 上通过。
 2. 托管 CI 与托管 Security workflow 未在托管执行器上运行；Windows/Ubuntu 托管 job

@@ -10,7 +10,8 @@
 
 use std::path::Path;
 
-use sessionatlas_core::launcher::{Launcher, ToolCommands, BUILT_IN_TOOL_KEYS};
+use sessionatlas_core::adapter::{adapter_root_for_config, AdapterRegistry};
+use sessionatlas_core::launcher::{Launcher, ToolCommands};
 use sessionatlas_core::model::Session;
 use sessionatlas_core::path;
 use sessionatlas_core::process::{ProcessRunner, ProgramResolver};
@@ -55,8 +56,11 @@ pub fn run_open(
         }
     };
     let config = sessionatlas_core::config::try_load(config_path).unwrap_or_default();
+    let registry = AdapterRegistry::load(&adapter_root_for_config(config_path), &config)
+        .or_else(|_| AdapterRegistry::bundled())
+        .expect("compiled official adapter manifests must be valid");
     let launcher = Launcher::new(
-        ToolCommands::from_config(&config),
+        ToolCommands::from_registry(&config, &registry),
         env.resolver,
         env.runner,
         &env.wt_probe,
@@ -127,9 +131,9 @@ pub fn run_open(
                     .iter()
                     .map(|usage| usage.tool_key.clone())
                     .collect(),
-                None => BUILT_IN_TOOL_KEYS
-                    .iter()
-                    .map(|key| key.to_string())
+                None => registry
+                    .enabled(&config)
+                    .map(|adapter| adapter.id.clone())
                     .collect(),
             };
             candidates.retain(|key| launcher.is_tool_available(key));

@@ -95,7 +95,7 @@ function groupPickerHtml(projectId) {
     .join("");
   return `<div class="group-picker">
     <span class="entry__launch-label">${escapeHtml(tr("entry.label.group"))}</span>
-    <select class="group-picker__select" data-group-picker data-project-id="${escapeHtml(projectId)}">
+    <select class="group-picker__select" data-group-picker data-project-id="${escapeHtml(String(projectId))}">
       ${opts}
     </select>
   </div>`;
@@ -114,11 +114,14 @@ const state = {
   openerPrefs: [],          // full list (built-in + custom) from list_opener_prefs
   openerPrefsLoaded: false, // true after first load (so renderLedger knows it's safe to use)
   openerPrefsError: null,   // non-null when the prefs DB is unreachable
+  webDevelopmentTools: [], // browser-based development endpoints such as DSH
+  webDevelopmentToolsLoaded: false,
+  webDevelopmentToolsError: null,
   menuOpenId: null,         // project id whose `...` popover is open, or null
   groups: [],               // [{id, name, sortOrder, memberCount}] from list_groups
   groupRevision: 0,         // optimistic-concurrency revision from prefs.db
-  assignments: {},          // {projectId: groupId} from list_group_assignments
-  sortOrders: {},           // {projectId: sortOrder} from list_sort_orders (manual order)
+  assignments: createProjectKeyedMap(), // {projectId: groupId} from list_group_assignments
+  sortOrders: createProjectKeyedMap(),  // {projectId: sortOrder} from list_sort_orders (manual order)
   viewMode: "ledger",       // "ledger" | "files" — which view occupies the left pane
   expandedId: null,         // project id whose inline session panel is open, or null
   remoteServers: [],         // [{id, label, user, host, port, identityFile, scanRoots, lastScannedAt, osFamily}] from list_remote_servers
@@ -129,16 +132,29 @@ const state = {
   sessionCleanupTrash: [],  // recoverable cleanup batches
   sessionCleanupSelected: new Set(),
   sessionCleanupLoading: false,
-  gitStatusByProject: {},   // local/remote-ref GitInfo cache by project id
+  sessionCleanupStale: false,
+  gitStatusByProject: createProjectKeyedMap(),   // local/remote-ref GitInfo cache by project id
+  gitStatusAtByProject: createProjectKeyedMap(), // monotonic cache timestamps for GitInfo TTL
   remoteScanIds: new Set(), // server ids currently scanning on background workers
   tuiMachines: {},          // {local|remote:<id>: live installed/enabled capabilities}
+  tuiCapabilityAt: {},      // monotonic timestamps for the capability TTL
   tuiLoadingKeys: new Set(),
+  tuiCheckingKeys: new Set(),
   tuiInstallingKeys: new Set(),
-  staleSources: { remote: false, tools: false, servers: false, ignores: false, groups: false, openers: false },
+  tuiUpgradingKeys: new Set(),
+  tuiAdapterBusyKeys: new Set(),
+  tuiAdapterImporting: false,
+  tuiAdapterManifestPath: "",
+  staleSources: { remote: false, tools: false, servers: false, ignores: false, groups: false, openers: false, webDevelopment: false },
   firstRunError: null,       // preserved across async preference/group renders until a retry succeeds
-  settingsView: "menu",     // "menu" | "cleanup" | "tui" | "openers" | "groups" | "remote" | "ignores" | "language"
+  settingsView: "menu",     // "menu" | "cleanup" | "tui" | "webDevelopment" | "openers" | "groups" | "remote" | "ignores" | "language"
   overviewCollapsed: readOverviewCollapsed(), // new users default to the full overview
   _dragId: null,            // project id being dragged (transient)
+  ledgerRows: [],           // grouped rows used by the bounded ledger renderer
+  ledgerHeightByKey: new Map(),
+  ledgerLayout: null,
+  ledgerRenderRevision: 0,  // invalidates a recycled window when row content changes
+  ledgerVirtualWindowSignature: null,
 };
 const reloadCoordinator = createReloadCoordinator();
 const groupMutationQueue = createMutationQueue();
@@ -273,6 +289,31 @@ async function loadOpenerPrefs() {
   renderSelectedLaunchPanel();
 }
 
+/* ── browser-based development tools ───────────────────── */
+async function loadWebDevelopmentTools() {
+  if (!HAS_TAURI) {
+    state.webDevelopmentTools = [];
+    state.webDevelopmentToolsLoaded = true;
+    state.webDevelopmentToolsError = null;
+    if (!drawer.hidden && ["menu", "webDevelopment"].includes(state.settingsView)) renderDrawerBody();
+    renderSelectedLaunchPanel();
+    return;
+  }
+  try {
+    const tools = await invoke("list_web_development_tools");
+    state.webDevelopmentTools = Array.isArray(tools) ? tools : [];
+    state.webDevelopmentToolsError = null;
+    state.staleSources.webDevelopment = false;
+  } catch (error) {
+    console.warn("list_web_development_tools failed", error);
+    state.webDevelopmentToolsError = String(error);
+    state.staleSources.webDevelopment = true;
+  }
+  state.webDevelopmentToolsLoaded = true;
+  if (!drawer.hidden && ["menu", "webDevelopment"].includes(state.settingsView)) renderDrawerBody();
+  renderSelectedLaunchPanel();
+}
+
 /* ── groups ─────────────────────────────────────────────── */
 async function loadGroups() {
   if (!HAS_TAURI) {
@@ -280,9 +321,9 @@ async function loadGroups() {
     state.groups = [
       { id: 1, name: "Active", sortOrder: 10, memberCount: 0 },
     ];
-    state.assignments = {};
-    state.sortOrders = {};
-    renderLedger();
+    state.assignments = createProjectKeyedMap();
+    state.sortOrders = createProjectKeyedMap();
+    applyFilters();
     renderSelectedLaunchPanel();
     return;
   }
@@ -294,11 +335,11 @@ async function loadGroups() {
       invoke("get_group_revision"),
     ]);
     state.groups = groups;
-    state.assignments = assignments;
+    state.assignments = createProjectKeyedMap(assignments);
     // Flatten sort rows into a {projectId: sortOrder} map. group_key is
     // redundant here — assignment is the source of truth for which bucket a
     // project renders in; this map only supplies the within-bucket order.
-    const orders = {};
+    const orders = createProjectKeyedMap();
     for (const r of sortRows) orders[r.projectId] = r.sortOrder;
     state.sortOrders = orders;
     state.groupRevision = revision;
@@ -308,7 +349,7 @@ async function loadGroups() {
     state.staleSources.groups = true;
     showActionError(tr("status.staleSources", { sources: "groups" }));
   }
-  renderLedger();
+  applyFilters();
   renderSelectedLaunchPanel();
   // Push the now-populated group / assignment state to the tray so the
   // right-click menu groups projects correctly. This runs after every
@@ -324,7 +365,7 @@ async function refreshSortOrders() {
   if (!HAS_TAURI) return;
   try {
     const rows = await invoke("list_sort_orders");
-    const orders = {};
+    const orders = createProjectKeyedMap();
     for (const r of rows) orders[r.projectId] = r.sortOrder;
     state.sortOrders = orders;
   } catch (e) { /* keep stale on failure */ }
@@ -333,7 +374,7 @@ async function refreshSortOrders() {
 async function setProjectGroup(projectId, groupId) {
   const prev = state.assignments[projectId] ?? null;
   // Optimistic update so the UI re-renders immediately.
-  const next = { ...state.assignments };
+  const next = createProjectKeyedMap(state.assignments);
   if (groupId == null) delete next[projectId];
   else next[projectId] = groupId;
   state.assignments = next;
@@ -344,7 +385,7 @@ async function setProjectGroup(projectId, groupId) {
       if (g.id === groupId) g.memberCount = (g.memberCount || 0) + 1;
     }
   }
-  renderLedger();
+  applyFilters();
   renderSelectedLaunchPanel();
   // Keep the tray menu in sync with this group edit (project just
   // moved between buckets). Mirrors what reload() does for projects.
@@ -359,7 +400,7 @@ async function setProjectGroup(projectId, groupId) {
     } catch (e) {
       console.error("assign_project_to_group failed", e);
       // Revert optimistic update on failure.
-      state.assignments = { ...state.assignments };
+      state.assignments = createProjectKeyedMap(state.assignments);
       if (prev == null) delete state.assignments[projectId];
       else state.assignments[projectId] = prev;
       for (const g of state.groups) {
@@ -367,7 +408,7 @@ async function setProjectGroup(projectId, groupId) {
         if (g.id === groupId) g.memberCount = Math.max(0, (g.memberCount || 0) - 1);
       }
       showActionError(tr("status.groupAssignFailed", { err: e }));
-      renderLedger();
+      applyFilters();
       renderSelectedLaunchPanel();
     }
   }
@@ -463,14 +504,17 @@ function visibleDialog() {
   ].find(surface => surface && !surface.hidden) || null;
 }
 
-const BUILTIN_TUI_DEMO = [
-  ["claude", "Claude Code"],
-  ["codex", "Codex CLI"],
-  ["kimi", "Kimi Code"],
-  ["opencode", "OpenCode"],
-  ["aider", "Aider"],
-  ["pi", "Pi Coding Agent"],
+const OFFLINE_ADAPTER_DEMO = [
+  ["claude", "Claude Code", "npm"],
+  ["kimi", "Kimi Code", "npm"],
+  ["codex", "Codex CLI", "npm"],
+  ["opencode", "OpenCode", "npm"],
+  ["aider", "Aider", "uv"],
+  ["pi", "Pi Coding Agent", "npm"],
 ];
+const TUI_CAPABILITY_TTL_MS = 5 * 60 * 1000;
+const TUI_PROBE_CONCURRENCY = 2;
+const SEARCH_DEBOUNCE_MS = 120;
 function tuiMachineKey(serverId) {
   return serverId == null ? "local" : `remote:${Number(serverId)}`;
 }
@@ -499,11 +543,62 @@ function disabledTuiAttrs(project, toolKey) {
   return `disabled aria-disabled="true" title="${escapeHtml(title)}"`;
 }
 
-async function refreshTuiMachine(serverId, { force = false } = {}) {
+const _tuiProbeQueue = [];
+const _tuiProbeInflight = new Map();
+let _tuiProbeActive = 0;
+
+function drainTuiProbeQueue() {
+  while (_tuiProbeActive < TUI_PROBE_CONCURRENCY && _tuiProbeQueue.length) {
+    const task = _tuiProbeQueue.shift();
+    _tuiProbeActive += 1;
+    void probeTuiMachine(task.serverId, task.force, task.deferRender)
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        _tuiProbeActive -= 1;
+        if (_tuiProbeInflight.get(task.key) === task.promise) _tuiProbeInflight.delete(task.key);
+        drainTuiProbeQueue();
+      });
+  }
+}
+
+function refreshTuiMachine(serverId, { force = false, deferRender = false } = {}) {
   const key = tuiMachineKey(serverId);
-  if (!force && (state.tuiMachines[key] || state.tuiLoadingKeys.has(key))) return;
+  const cachedAt = Number(state.tuiCapabilityAt[key] || 0);
+  if (!force && state.tuiMachines[key] && Date.now() - cachedAt < TUI_CAPABILITY_TTL_MS) {
+    return Promise.resolve(state.tuiMachines[key]);
+  }
+  const existing = _tuiProbeInflight.get(key);
+  if (existing) {
+    return existing.then(result => {
+      if (!deferRender) {
+        if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
+        applyFilters();
+        renderSelectedLaunchPanel();
+      }
+      return result;
+    });
+  }
+  let resolveTask;
+  let rejectTask;
+  const promise = new Promise((resolve, reject) => {
+    resolveTask = resolve;
+    rejectTask = reject;
+  });
+  _tuiProbeInflight.set(key, promise);
+  _tuiProbeQueue.push({ key, serverId, force, deferRender, promise, resolve: resolveTask, reject: rejectTask });
   state.tuiLoadingKeys.add(key);
   if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
+  drainTuiProbeQueue();
+  return promise;
+}
+
+async function probeTuiMachine(serverId, force, deferRender) {
+  const key = tuiMachineKey(serverId);
+  if (!force && state.tuiMachines[key] && Date.now() - Number(state.tuiCapabilityAt[key] || 0) < TUI_CAPABILITY_TTL_MS) {
+    state.tuiLoadingKeys.delete(key);
+    return state.tuiMachines[key];
+  }
+  state.tuiLoadingKeys.add(key);
   try {
     let capabilities;
     if (HAS_TAURI) {
@@ -513,9 +608,13 @@ async function refreshTuiMachine(serverId, { force = false } = {}) {
         source: serverId == null ? "local" : "remote",
         serverId: serverId ?? null,
         label: serverId == null ? "Local" : (state.remoteServerById[serverId]?.label || "Remote"),
-        tools: BUILTIN_TUI_DEMO.map(([toolKey, toolName]) => ({
+        tools: OFFLINE_ADAPTER_DEMO.map(([toolKey, toolName, installManager]) => ({
           toolKey, toolName, installed: true, version: "demo", enabled: true,
-          installAvailable: true, installManager: toolKey === "aider" ? "uv" : "npm",
+          adapterEnabled: true, adapterVersion: "1.0.0", adapterSource: "bundled",
+          adapterNewestVersion: "1.0.0", adapterUpdateAvailable: false,
+          adapterRollbackVersion: null, installAvailable: true, installManager,
+          installPackage: toolKey === "aider" ? "aider-chat" : `demo-${toolKey}`,
+          latestVersion: null, updateChecked: false, updateAvailable: false, updateCheckError: null,
         })),
       };
     }
@@ -528,20 +627,132 @@ async function refreshTuiMachine(serverId, { force = false } = {}) {
       tools: [], error: String(error),
     };
   } finally {
+    state.tuiCapabilityAt[key] = Date.now();
     state.tuiLoadingKeys.delete(key);
+    if (!deferRender) {
+      if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
+      applyFilters();
+      renderSelectedLaunchPanel();
+    }
+  }
+}
+
+async function checkTuiMachineUpdates(serverId) {
+  const key = tuiMachineKey(serverId);
+  if (state.tuiCheckingKeys.has(key)) return state.tuiMachines[key] || null;
+  if (!state.tuiMachines[key]) await refreshTuiMachine(serverId, { force: true });
+  state.tuiCheckingKeys.add(key);
+  if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
+  const label = state.tuiMachines[key]?.label
+    || (serverId == null ? tr("tui.localMachine") : state.remoteServerById[serverId]?.label)
+    || tr("tui.sourceRemote");
+  setStatus(tr("status.tuiCheckingUpdates", { machine: label }));
+  try {
+    let capabilities;
+    if (HAS_TAURI) {
+      capabilities = await invoke("check_tui_updates", { serverId: serverId ?? null });
+    } else {
+      capabilities = state.tuiMachines[key];
+      capabilities.tools = capabilities.tools.map(tool => ({
+        ...tool,
+        latestVersion: tool.version,
+        updateChecked: tool.installed,
+        updateAvailable: false,
+        updateCheckError: null,
+      }));
+    }
+    state.tuiMachines[key] = { ...capabilities, error: null };
+    state.tuiCapabilityAt[key] = Date.now();
+    const updates = capabilities.tools?.filter(tool => tool.updateAvailable).length || 0;
+    const errors = capabilities.tools?.filter(tool => tool.installed && tool.updateCheckError).length || 0;
+    setStatus(tr("status.tuiUpdatesChecked", { machine: capabilities.label || label, updates, errors }));
+    return capabilities;
+  } catch (error) {
+    showActionError(tr("status.tuiUpdateCheckFailed", { err: error }));
+    return state.tuiMachines[key] || null;
+  } finally {
+    state.tuiCheckingKeys.delete(key);
     if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
+  }
+}
+
+function refreshRemoteTuiAdaptersAfterRegistryChange() {
+  for (const server of state.remoteServers) {
+    const key = tuiMachineKey(server.id);
+    delete state.tuiCapabilityAt[key];
+    void refreshTuiMachine(Number(server.id), { force: true });
+  }
+}
+
+async function mutateLocalTuiAdapter(toolKey, command) {
+  if (!toolKey || state.tuiAdapterBusyKeys.has(toolKey)) return;
+  const machine = state.tuiMachines.local;
+  const tool = machine?.tools?.find(item => item.toolKey === toolKey);
+  if (!tool) return;
+  const activating = command === "activate_tui_adapter_update";
+  const version = activating ? tool.adapterNewestVersion : tool.adapterRollbackVersion;
+  const confirmKey = activating ? "tui.adapterActivateConfirm" : "tui.adapterRollbackConfirm";
+  if (!window.confirm(tr(confirmKey, { tool: tool.toolName, version }))) return;
+  state.tuiAdapterBusyKeys.add(toolKey);
+  renderDrawerBody();
+  setStatus(tr(activating ? "status.adapterActivating" : "status.adapterRollingBack", {
+    tool: tool.toolName, version,
+  }));
+  try {
+    if (HAS_TAURI) {
+      state.tuiMachines.local = await invoke(command, { toolKey });
+    } else {
+      tool.adapterVersion = version || tool.adapterVersion;
+      tool.adapterUpdateAvailable = !activating;
+    }
+    state.tuiCapabilityAt.local = Date.now();
+    setStatus(tr(activating ? "status.adapterActivated" : "status.adapterRolledBack", {
+      tool: tool.toolName, version,
+    }));
+    refreshRemoteTuiAdaptersAfterRegistryChange();
+  } catch (error) {
+    showActionError(tr("status.adapterActionFailed", { err: error }));
+  } finally {
+    state.tuiAdapterBusyKeys.delete(toolKey);
+    renderDrawerBody();
     applyFilters();
     renderSelectedLaunchPanel();
   }
 }
 
-function refreshAllTuiCapabilities({ force = false } = {}) {
+function refreshAllTuiCapabilities({ force = false, includeRemote = false } = {}) {
   const validKeys = new Set(["local", ...state.remoteServers.map(server => tuiMachineKey(server.id))]);
   Object.keys(state.tuiMachines).forEach(key => {
-    if (!validKeys.has(key)) delete state.tuiMachines[key];
+    if (!validKeys.has(key)) {
+      delete state.tuiMachines[key];
+      delete state.tuiCapabilityAt[key];
+    }
   });
-  void refreshTuiMachine(null, { force });
-  state.remoteServers.forEach(server => void refreshTuiMachine(Number(server.id), { force }));
+  const targets = [
+    null,
+    ...(includeRemote ? state.remoteServers.map(server => Number(server.id)) : []),
+  ];
+  let cursor = 0;
+  let active = 0;
+  return new Promise(resolve => {
+    const schedule = () => {
+      while (active < TUI_PROBE_CONCURRENCY && cursor < targets.length) {
+        const serverId = targets[cursor++];
+        active += 1;
+        void refreshTuiMachine(serverId, { force, deferRender: true }).finally(() => {
+          active -= 1;
+          schedule();
+        });
+      }
+      if (active === 0 && cursor >= targets.length) {
+        if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
+        applyFilters();
+        renderSelectedLaunchPanel();
+        resolve();
+      }
+    };
+    schedule();
+  });
 }
 
 function dialogFocusables(surface) {
@@ -723,6 +934,21 @@ function buildLedgerModel() {
 }
 
 function renderLedger(model = buildLedgerModel()) {
+  state.ledgerRenderRevision += 1;
+  state.filtered = model.ordered;
+  state.matchingCount = model.matching.length;
+  ledgerRenderContext = { activeTabs: model.activeTabs };
+  state.ledgerRows = [];
+  for (const section of model.sections) {
+    if (section.key != null) {
+      state.ledgerRows.push({ type: "group", key: section.key, name: section.name, count: section.items.length });
+    }
+    state.ledgerRows.push(...section.items.map(project => ({ type: "project", project })));
+  }
+  // Scrolling is allowed to reuse the existing bounded window, but any
+  // content render must invalidate that reuse. This keeps controls such as
+  // the expanded queue textarea alive during a scroll while still rebuilding
+  // when filters, groups, Git badges, or localized strings change.
   if (state.firstRunError !== null) {
     ledger.innerHTML = `
       <div class="ledger__empty">
@@ -737,10 +963,16 @@ function renderLedger(model = buildLedgerModel()) {
     });
     return;
   }
-  state.filtered = model.ordered;
-  state.matchingCount = model.matching.length;
-  const visible = model.matching;
-  if (!visible.length) {
+  if (!state.all.length) state.ledgerRows = [];
+  // `visible` = projects matching tool + recency, IGNORING group collapse.
+  // We need the collapse-inclusive set here so a collapsed group still
+  // renders its header (with count). Otherwise, when every matching project
+  // sits in a collapsed group, the ledger would fall through to the
+  // "Archive empty" card and the user would have no header to click to
+  // re-expand — the list would look empty even though data is present.
+  // `state.filtered` (the nav set) excludes collapsed; this set does not.
+  const visible = state.ledgerRows.some(row => row.type === "project");
+  if (!visible) {
     const marker = "__SESSIONATLAS_EMPTY_QUERY__";
     const catalogEmpty = !state.query && state.all.length === 0;
     const title = state.query
@@ -760,17 +992,201 @@ function renderLedger(model = buildLedgerModel()) {
     document.getElementById("emptyScan")?.addEventListener("click", () => runLocalScan());
     return;
   }
-  const renderContext = { activeTabs: model.activeTabs };
-  const parts = [];
-  for (const section of model.sections) {
-    if (section.key != null) {
-      parts.push(groupHeaderHtml(section.name, section.items.length, section.key));
-      if (isGroupCollapsed(section.key)) continue;
-    }
-    parts.push(section.items.map(project => entryHtml(project, renderContext)).join(""));
-  }
+  // Render: real groups in their defined order, then "未分组" last.
+  // Collapsed groups render only their header (projects hidden) — but
+  // they DO render a header, so collapsing a group never makes it vanish.
   ledger.classList.toggle("is-large", model.ordered.length > 200);
-  ledger.innerHTML = parts.join("");
+  renderVirtualLedger();
+}
+
+// Keep the cold estimate close to the measured compact CSS contract at the
+// desktop ledger width (about 80px including the contained entry margins and
+// border). Visited rows are still measured, but a realistic estimate prevents
+// a long untouched tail from inventing a phantom scrollbar before it is
+// visited.
+const LEDGER_GROUP_HEIGHT = 32;
+const LEDGER_PROJECT_HEIGHT = 80;
+const LEDGER_EXPANDED_HEIGHT = 320;
+const LEDGER_OVERSCAN_PX = 480;
+let _ledgerRenderFrame = null;
+let ledgerRenderContext = { activeTabs: new Map() };
+
+function ledgerVisibleRows() {
+  if (state.projectOrder !== "grouped") return state.ledgerRows;
+  return state.ledgerRows.filter(row =>
+    row.type === "group" || !isGroupCollapsed(groupKeyOf(row.project)));
+}
+
+function ledgerRowKey(row) {
+  return row.type === "group" ? `group:${row.key}` : `project:${row.project.id}`;
+}
+
+function estimatedLedgerRowHeight(row) {
+  const key = ledgerRowKey(row);
+  const measured = Number(state.ledgerHeightByKey.get(key));
+  if (measured > 0) return measured;
+  return row.type === "group"
+    ? LEDGER_GROUP_HEIGHT
+    : (row.project.id === state.expandedId ? LEDGER_EXPANDED_HEIGHT : LEDGER_PROJECT_HEIGHT);
+}
+
+function ledgerLayoutFor(rows) {
+  const offsets = [];
+  const heights = [];
+  let totalHeight = 0;
+  for (const row of rows) {
+    offsets.push(totalHeight);
+    const height = estimatedLedgerRowHeight(row);
+    heights.push(height);
+    totalHeight += height;
+  }
+  return { rows, offsets, heights, totalHeight };
+}
+
+function virtualRowHtml(row) {
+  const content = row.type === "group"
+    ? groupHeaderHtml(row.name, row.count, row.key)
+    : entryHtml(row.project, ledgerRenderContext);
+  // A flow-root wrapper contains the entry/group's vertical margins. Without
+  // it, block margin collapsing makes the measured height smaller than the
+  // distance to the next row and the virtual offsets drift as the list grows.
+  return `<div class="ledger__virtual-row">${content}</div>`;
+}
+
+function measureVirtualRows(window, layout, start, previousScrollTop) {
+  const oldLayout = state.ledgerLayout;
+  const viewportHeight = Math.max(ledger.clientHeight || 0, 1);
+  const wasAtBottom = Boolean(oldLayout)
+    && previousScrollTop + viewportHeight >= oldLayout.totalHeight - 1;
+  const oldAnchorIndex = oldLayout
+    ? oldLayout.offsets.findIndex((offset, index) => offset + oldLayout.heights[index] > previousScrollTop)
+    : -1;
+  const oldAnchorKey = oldAnchorIndex >= 0 ? ledgerRowKey(oldLayout.rows[oldAnchorIndex]) : null;
+  const oldAnchorOffset = oldAnchorIndex >= 0 ? oldLayout.offsets[oldAnchorIndex] : 0;
+  let changed = false;
+  [...window.children].forEach((element, index) => {
+    const row = layout.rows[start + index];
+    if (!row) return;
+    const measured = element.getBoundingClientRect().height;
+    if (!(measured > 0)) return;
+    const key = ledgerRowKey(row);
+    const previous = state.ledgerHeightByKey.get(key);
+    if (!previous || Math.abs(previous - measured) > 0.5) {
+      state.ledgerHeightByKey.set(key, measured);
+      changed = true;
+    }
+  });
+  if (!changed) return false;
+  const updated = ledgerLayoutFor(layout.rows);
+  state.ledgerLayout = updated;
+  if (wasAtBottom) {
+    // Grow the spacer before assigning the corrected bottom offset. Otherwise
+    // the browser clamps scrollTop to the old, shorter spacer and the next
+    // measurement pass no longer recognizes that the user was at the bottom.
+    if (window.parentElement) window.parentElement.style.height = `${updated.totalHeight}px`;
+    ledger.scrollTop = Math.max(0, updated.totalHeight - viewportHeight);
+  } else if (oldAnchorKey) {
+    const newAnchorIndex = updated.rows.findIndex(row => ledgerRowKey(row) === oldAnchorKey);
+    if (newAnchorIndex >= 0) {
+      const delta = updated.offsets[newAnchorIndex] - oldAnchorOffset;
+      if (Math.abs(delta) > 0.5) ledger.scrollTop = Math.max(0, previousScrollTop + delta);
+    }
+  }
+  return true;
+}
+
+function captureActiveLedgerEdit(window) {
+  const active = document.activeElement;
+  if (!active || !window.contains(active) || !active.matches("[data-queue-input]")) return null;
+  const projectId = active.closest("[data-project-id]")?.dataset.projectId;
+  if (!projectId) return null;
+  return {
+    projectId,
+    value: active.value,
+    selectionStart: active.selectionStart,
+    selectionEnd: active.selectionEnd,
+  };
+}
+
+function restoreActiveLedgerEdit(window, edit) {
+  if (!edit) return;
+  const input = window.querySelector(`${projectEntrySelector(edit.projectId)} [data-queue-input]`);
+  if (!input) return;
+  input.value = edit.value;
+  input.focus({ preventScroll: true });
+  if (edit.selectionStart != null && edit.selectionEnd != null) {
+    input.setSelectionRange(edit.selectionStart, edit.selectionEnd);
+  }
+}
+
+function renderVirtualLedger() {
+  // Dragging owns the current row nodes. Replacing the virtual window while
+  // the pointer is moving would cancel the native drag and lose indicators.
+  if (state._dragId) return;
+  const rows = ledgerVisibleRows();
+  if (!rows.length) return;
+  const previousScrollTop = ledger.scrollTop;
+  const layout = ledgerLayoutFor(rows);
+  const { offsets, heights, totalHeight } = layout;
+  const viewportHeight = Math.max(ledger.clientHeight || 600, 1);
+  const isAtBottom = previousScrollTop + viewportHeight >= ledger.scrollHeight - 1;
+  const top = Math.max(previousScrollTop - LEDGER_OVERSCAN_PX, 0);
+  const bottom = previousScrollTop + viewportHeight + LEDGER_OVERSCAN_PX;
+  let start = 0;
+  while (start < offsets.length && offsets[start] + heights[start] < top) start += 1;
+  let end = start;
+  if (isAtBottom) {
+    // The cold estimate may be corrected after the tail is first measured.
+    // Include the logical last row immediately when the user reaches the DOM
+    // bottom so that the correction cannot strand it just beyond the window.
+    end = rows.length;
+  } else {
+    while (end < rows.length && offsets[end] < bottom) end += 1;
+  }
+  const html = rows.slice(start, end).map(virtualRowHtml).join("");
+  const windowSignature = JSON.stringify([
+    state.ledgerRenderRevision,
+    start,
+    end,
+    rows.slice(start, end).map(ledgerRowKey),
+  ]);
+  const spacer = ledger.querySelector(".ledger__virtual-spacer");
+  const window = spacer?.querySelector(".ledger__virtual-window");
+  if (spacer && window) {
+    // Keep the scroll container itself intact while scrolling. Replacing its
+    // innerHTML would reset scrollTop and can schedule an endless scroll
+    // feedback loop in Chromium/WebView2.
+    spacer.style.height = `${totalHeight}px`;
+    window.style.transform = `translateY(${offsets[start] || 0}px)`;
+    // Keep the current nodes when the bounded range is unchanged. In
+    // particular, this preserves an expanded row's textarea value, selection
+    // and focus while a nearby scroll event merely updates layout metrics.
+    if (state.ledgerVirtualWindowSignature !== windowSignature) {
+      const activeEdit = captureActiveLedgerEdit(window);
+      window.innerHTML = html;
+      restoreActiveLedgerEdit(window, activeEdit);
+      state.ledgerVirtualWindowSignature = windowSignature;
+    }
+  } else {
+    ledger.innerHTML = `<div class="ledger__virtual-spacer" style="height:${totalHeight}px"><div class="ledger__virtual-window" style="transform:translateY(${offsets[start] || 0}px)">${html}</div></div>`;
+    state.ledgerVirtualWindowSignature = windowSignature;
+  }
+  const renderedWindow = ledger.querySelector(".ledger__virtual-window");
+  if (renderedWindow && measureVirtualRows(renderedWindow, layout, start, previousScrollTop)) {
+    requestAnimationFrame(renderVirtualLedger);
+  } else {
+    state.ledgerLayout = layout;
+  }
+}
+
+function wireLedgerVirtualization() {
+  ledger.addEventListener("scroll", () => {
+    if (_ledgerRenderFrame) return;
+    _ledgerRenderFrame = requestAnimationFrame(() => {
+      _ledgerRenderFrame = null;
+      renderVirtualLedger();
+    });
+  }, { passive: true });
 }
 
 function normalizeOsFamily(value) {
@@ -859,7 +1275,26 @@ function projectGitSyncBadgeHtml(project) {
   if (Number(info.behind) > 0) {
     badges.push(`<span class="entry__git-state entry__git-state--behind" title="${escapeHtml(tr("git.behindTitle", { count: info.behind }))}">${escapeHtml(tr("git.notLatest", { count: info.behind }))}</span>`);
   }
-  return badges.join("");
+  return badges.length ? `<span class="entry__git-sync">${badges.join("")}</span>` : "";
+}
+
+function usageHasResumeTarget(usage) {
+  return Boolean(String(usage?.lastSessionId || "").trim());
+}
+
+function activityOnlyLabelKey(usage, scope = "entry") {
+  const suffix = usage?.toolKey === "opencode"
+    ? "auxiliaryActivity"
+    : "activityOnly";
+  return `${scope}.${suffix}`;
+}
+
+// Activity-only tool records stay visible, but a project-level launch should
+// prefer a real main-session target from any tool. This keeps a newer
+// delegated OpenCode run from shadowing the user's resumable Codex session.
+function preferredProjectUsage(project) {
+  const usages = project?.toolUsages || [];
+  return usages.find(usageHasResumeTarget) || usages[0] || null;
 }
 
 function entryHtml(p, renderContext) {
@@ -897,13 +1332,23 @@ function entryHtml(p, renderContext) {
     : "";
   const isMenuOpen = state.menuOpenId === p.id;
   const isExpanded = state.expandedId === p.id;
+  // Per-tool session panel — one card per recorded tool usage. The Resume
+  // pill passes the specific toolKey (and session id, embedded in the
+  // data-sid attribute) through to openTerminalTab so the auto-launch
+  // command uses the trusted backend's tool-specific resume syntax.
+  // Do not build session cards, tool buttons, or the queue textarea for a
+  // collapsed row. The virtual renderer only needs the compact article until
+  // the user explicitly expands it.
   const expandedPanel = isExpanded ? entryExpandedPanelHtml(p) : "";
   const expandLabel = isExpanded ? tr("entry.collapseSessions") : tr("entry.expandSessions");
   const draggable = state.projectOrder === "grouped";
   return `
-    <article class="entry ${state.selectedId===p.id?"is-selected":""} ${isMenuOpen?"is-menu-open":""} ${hasSession?"has-session":""} ${isExpanded?"is-expanded":""} ${p.pathMissing?"is-missing":""}" data-id="${p.id}" draggable="${draggable}">
+    <article class="entry ${state.selectedId===p.id?"is-selected":""} ${isMenuOpen?"is-menu-open":""} ${hasSession?"has-session":""} ${isExpanded?"is-expanded":""} ${p.pathMissing?"is-missing":""}" data-id="${escapeHtml(String(p.id))}" draggable="${draggable}">
       <div class="entry__body">
-        <button class="entry__expand" data-expand-toggle draggable="false" aria-label="${escapeHtml(expandLabel)}" title="${escapeHtml(expandLabel)}">${isExpanded?"▾":"▸"}</button>
+        <button type="button" class="entry__expand" data-expand-toggle draggable="false"
+          aria-expanded="${isExpanded}" aria-label="${escapeHtml(expandLabel)}" title="${escapeHtml(expandLabel)}">
+          <span class="entry__expand-icon" aria-hidden="true">▸</span>
+        </button>
         <span class="entry__folder" aria-hidden="true">${folderIconSvg()}</span>
         <div class="entry__identity">
           <div class="entry__name">${escapeHtml(p.name)}</div>
@@ -930,20 +1375,27 @@ function entryExpandedPanelHtml(p) {
   const sessionCards = (p.toolUsages || []).map(u => {
     const sid = u.lastSessionId || "";
     const shortSid = sid ? sid.slice(0, 8) : "";
+    const canResume = usageHasResumeTarget(u);
+    const sessionSummary = canResume
+      ? tr("entry.sessionsCount", { count: u.sessionCount })
+      : tr(activityOnlyLabelKey(u));
+    const actionLabel = canResume ? tr("entry.resume") : tr("entry.newSession");
+    const activityOnlyClass = canResume ? "" : " session-card--activity-only";
+    const actionClass = canResume ? "" : " launch-pill--ghost";
     return `
-      <div class="session-card">
+      <div class="session-card${activityOnlyClass}">
         <i class="session-card__dot ${toolDotClass(u.toolKey)}" style="background:${toolColor(u.toolKey)}"></i>
         <div class="session-card__info">
           <div class="session-card__name">${escapeHtml(u.toolName)}</div>
           <div class="session-card__meta">
-            <span>${escapeHtml(tr("entry.sessionsCount", { count: u.sessionCount }))}</span>
+            <span>${escapeHtml(sessionSummary)}</span>
             <span class="session-card__sep">·</span>
             <span>${escapeHtml(tr("entry.lastPrefix", { time: relTime(u.lastUsedAt) }))}</span>
             ${shortSid ? `<span class="session-card__sep">·</span><span class="session-card__sid" title="${escapeHtml(sid)}">${escapeHtml(shortSid)}</span>` : ""}
           </div>
         </div>
         <div class="session-card__actions">
-          <button class="launch-pill" data-launch-tool="${escapeHtml(u.toolKey)}" data-launch-sid="${escapeHtml(sid)}" draggable="false" ${disabledTuiAttrs(p, u.toolKey)}>${escapeHtml(tr("entry.resume"))}</button>
+          <button class="launch-pill${actionClass}" data-launch-tool="${escapeHtml(u.toolKey)}" data-launch-sid="${escapeHtml(sid)}" draggable="false" ${disabledTuiAttrs(p, u.toolKey)}>${escapeHtml(actionLabel)}</button>
         </div>
       </div>`;
   }).join("");
@@ -968,7 +1420,7 @@ function entryExpandedPanelHtml(p) {
     ? state.tabs.find(t => t.isQueue && t.project?.id === p.id)
     : null;
   const queuePanel = hasClaude ? `
-      <div class="entry__expanded__queue" data-queue-panel data-project-id="${escapeHtml(p.id)}">
+      <div class="entry__expanded__queue" data-queue-panel data-project-id="${escapeHtml(String(p.id))}">
         <span class="entry__expanded__queue-label">${escapeHtml(tr("queue.panelLabel"))}</span>
         <textarea class="entry__expanded__queue-input" data-queue-input rows="3"
           placeholder="${escapeHtml(tr("queue.placeholder"))}"></textarea>
@@ -994,6 +1446,19 @@ function entryExpandedPanelHtml(p) {
     </div>`;
 }
 
+function webDevelopmentLaunchPillsHtml() {
+  return state.webDevelopmentTools
+    .filter(tool => tool.enabled)
+    .map(tool => {
+      let host = tr("settings.webDevelopment.webBadge");
+      try { host = new URL(tool.connectionUrl).host || host; } catch {}
+      return `<button class="launch-pill launch-pill--web"
+                data-web-development-launch="${escapeHtml(String(tool.id))}">
+                ${escapeHtml(tool.label)}<small>${escapeHtml(host)}</small>
+              </button>`;
+    }).join("");
+}
+
 function entryMenuHtml(p, isOpen) {
   // Path + tags + branch + AI pills + external opener pills, all in one
   // popover. Hidden by default; toggled by the "..." button.
@@ -1006,7 +1471,7 @@ function entryMenuHtml(p, isOpen) {
     ? `<span class="tag tag--branch">⎇ ${escapeHtml(p.gitBranch)}</span>` : "";
 
   const pills = usages.map(u =>
-    `<button class="launch-pill" data-project-id="${p.id}" data-tool="${escapeHtml(u.toolKey)}" ${disabledTuiAttrs(p, u.toolKey)}>
+    `<button class="launch-pill" data-project-id="${escapeHtml(String(p.id))}" data-tool="${escapeHtml(u.toolKey)}" ${disabledTuiAttrs(p, u.toolKey)}>
        <i class="dot ${toolDotClass(u.toolKey)}" style="background:${toolColor(u.toolKey)}"></i>
        ${escapeHtml(u.toolName)}<small>${u.sessionCount} ${escapeHtml(sessAbbr)}</small>
      </button>`).join("");
@@ -1016,10 +1481,11 @@ function entryMenuHtml(p, isOpen) {
   const openerPills = openers.map(o => {
     const hint = (o.command || "").replace(/\{path\}/g, "").trim() || openHint;
     return `<button class="launch-pill launch-pill--ext"
-              data-project-id="${p.id}" data-opener-id="${escapeHtml(String(o.id))}">
+              data-project-id="${escapeHtml(String(p.id))}" data-opener-id="${escapeHtml(String(o.id))}">
               ${escapeHtml(o.label)}<small>${escapeHtml(hint)}</small>
-            </button>`;
+    </button>`;
   }).join("");
+  const webDevelopmentPills = webDevelopmentLaunchPillsHtml();
 
   return `
     ${groupPickerHtml(p.id)}
@@ -1051,11 +1517,16 @@ function entryMenuHtml(p, isOpen) {
     <div class="entry__launch">
       <span class="entry__launch-label">${escapeHtml(tr("entry.label.openSession"))}</span>
       ${pills || `<span style="color:var(--bone-mute);font-size:12px">${escapeHtml(tr("entry.noInstruments"))}</span>`}
-      <button class="launch-pill launch-pill--new" data-project-id="${p.id}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
+      <button class="launch-pill launch-pill--new" data-project-id="${escapeHtml(String(p.id))}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
       ${openers.length ? `
         <div class="entry__openers">
           <span class="entry__launch-label entry__launch-label--ember">${escapeHtml(tr("entry.label.openWith"))}</span>
           ${openerPills}
+        </div>` : ""}
+      ${webDevelopmentPills ? `
+        <div class="entry__openers entry__web-development">
+          <span class="entry__launch-label">${escapeHtml(tr("entry.label.webDevelopment"))}</span>
+          ${webDevelopmentPills}
         </div>` : ""}
     </div>`;
 }
@@ -1173,10 +1644,12 @@ function renderCommonCommands() {
   const aside = document.getElementById("termsCommands");
   if (!aside) return;
   const toolKey = activeToolKey();
-  // Default to shell list when no tab is active so the sidebar still shows
-  // useful shell-style commands (and is disabled, see updateCommonCommandsEnabled).
-  const preset = COMMON_COMMANDS_BY_TOOL[toolKey]
-              || COMMON_COMMANDS_BY_TOOL.shell;
+  // An extension adapter must never inherit shell shortcuts inside its TUI.
+  // Official tools keep curated presentation-only presets; unknown adapters
+  // get an empty strip until a future adapter API explicitly models shortcuts.
+  const preset = toolKey
+    ? (COMMON_COMMANDS_BY_TOOL[toolKey] || { title: toolKey.toUpperCase(), items: [] })
+    : COMMON_COMMANDS_BY_TOOL.shell;
   // Re-render the body; keep the title node so we can update its text cheaply.
   // Prepend a monogram tile when we're in a tool-specific mode (claude,
   // codex, etc.); shell mode keeps the bare text "SHELL".
@@ -1850,8 +2323,27 @@ function closeContextMenu() {
 // Toggle the inline session panel for a project entry. Only one entry can
 // be expanded at a time — opening a different one collapses the previous.
 function toggleEntryExpand(projectId) {
+  // A disclosure click can follow a tiny pointer movement. If the row's
+  // native drag gesture was armed first, renderVirtualLedger() deliberately
+  // refuses to replace rows and the expansion appears to do nothing. Clear
+  // any transient drag state before changing the disclosure state.
+  state._dragId = null;
+  ledger.querySelectorAll(".is-dragging")
+    .forEach(element => element.classList.remove("is-dragging"));
+  clearDropIndicators();
+  const previousId = state.expandedId;
   state.expandedId = state.expandedId === projectId ? null : projectId;
-  renderLedger();
+  if (previousId) state.ledgerHeightByKey.delete(`project:${previousId}`);
+  state.ledgerHeightByKey.delete(`project:${projectId}`);
+  state.ledgerLayout = null;
+  applyFilters();
+  // applyFilters() recycles the virtual row. Restore focus to the replacement
+  // control so keyboard users can immediately collapse it again with Space
+  // or Enter and mouse users retain a clear visual state.
+  requestAnimationFrame(() => {
+    const selector = `${projectEntrySelector(projectId)} [data-expand-toggle]`;
+    ledger.querySelector(selector)?.focus({ preventScroll: true });
+  });
 }
 
 // Compute the line range of the user's current selection inside the
@@ -2162,8 +2654,8 @@ function renderedGroupOrder(groupKey) {
 // cross-group positional move). Optimistic: mutate sortOrders + assignments
 // and re-render immediately, then reconcile from the server on success.
 async function setGroupOrder(groupKey, orderedIds) {
-  const prevOrders = { ...state.sortOrders };
-  const prevAssignments = { ...state.assignments };
+  const prevOrders = createProjectKeyedMap(state.sortOrders);
+  const prevAssignments = createProjectKeyedMap(state.assignments);
   // Optimistic: assign 10/20/30… so the bucket re-sorts to the new order.
   orderedIds.forEach((id, i) => { state.sortOrders[id] = (i + 1) * 10; });
   if (groupKey === "ungrouped") {
@@ -2172,7 +2664,7 @@ async function setGroupOrder(groupKey, orderedIds) {
     const gid = Number(groupKey);
     orderedIds.forEach(id => { state.assignments[id] = gid; });
   }
-  renderLedger();
+  applyFilters();
   if (!HAS_TAURI) return;
   try {
     await invoke("set_group_order", { groupKey, orderedIds });
@@ -2256,6 +2748,16 @@ function wireDrag() {
   ledger.addEventListener("dragstart", (e) => {
     if (state.projectOrder !== "grouped") {
       e.preventDefault();
+      state._dragId = null;
+      clearDropIndicators();
+      return;
+    }
+    // Rows are draggable for manual ordering, but their controls must stay
+    // normal controls. WebView2 can otherwise promote a slightly imprecise
+    // click on the disclosure chevron into a row drag and suppress `click`.
+    if (e.target.closest("button, a, input, textarea, select, [contenteditable='true'], [data-queue-panel]")) {
+      e.preventDefault();
+      state._dragId = null;
       return;
     }
     const entry = e.target.closest(".entry");
@@ -2300,17 +2802,19 @@ function wireDrag() {
     ledger.querySelectorAll(".is-dragging")
       .forEach(e => e.classList.remove("is-dragging"));
     clearDropIndicators();
+    renderVirtualLedger();
   });
 }
 
 /* ── terminal tabs ──────────────────────────────────────── */
-// Open the "default" tool for a project — the one used most recently.
+// Open the "default" tool for a project — first prefer a real resumable main
+// session, then fall back to the most-recent activity-only tool.
 // If a tab for the same project+tool is already open, just focus it
 // instead of creating a duplicate. Projects with no recorded usage
 // fall back to a plain shell.
 function openProjectDefault(project) {
   if (!project) return;
-  const topUsage = (project.toolUsages || [])[0];
+  const topUsage = preferredProjectUsage(project);
   const toolKey = topUsage?.toolKey || "shell";
   const existing = findOpenTerminalTab(state.tabs, project.id, toolKey);
   if (existing) {
@@ -2628,21 +3132,38 @@ async function addFileTab(project, relPath, name) {
   }
 }
 
+function normalizeWebConnectionUrl(value) {
+  const candidate = String(value ?? "").trim().replace(/[.,;:!?)\]}>]+$/, "");
+  if (!candidate || /[\u0000-\u001f\u007f]/.test(candidate)) return null;
+  try {
+    const parsed = new URL(candidate);
+    if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) return null;
+    if (parsed.username || parsed.password) return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
 // Open a URL as an in-app browser tab. Mirrors addFileTab's structure:
 // a `.web-pane` overlay in termsViewport with an iframe. Dedupes by URL
 // so clicking the same link twice focuses the existing tab.
-function openWebTab(url) {
-  // Normalize: trim trailing punctuation that often ends up glued to a
-  // URL in chat output ("…see https://example.com."). Stop at common
-  // sentence terminators so we don't carry punctuation into the iframe.
-  const cleaned = String(url).replace(/[.,;:!?)\]}>]+$/, "");
+function openWebTab(url, titleOverride = "") {
+  const cleaned = normalizeWebConnectionUrl(url);
+  if (!cleaned) {
+    showActionError(tr("status.webConnectionInvalid"));
+    return null;
+  }
   // Dedup
   const existing = state.tabs.find(t => t.kind === "web" && t.url === cleaned);
   if (existing) { switchTab(existing.tabId); return existing; }
   const tabId = `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-  let title;
-  try { title = new URL(cleaned).hostname || cleaned; }
-  catch { title = cleaned.slice(0, 40); }
+  const configuredTitle = String(titleOverride ?? "").trim();
+  let title = configuredTitle;
+  if (!title) {
+    try { title = new URL(cleaned).hostname || cleaned; }
+    catch { title = cleaned.slice(0, 40); }
+  }
 
   const pane = document.createElement("div");
   pane.className = "web-pane";
@@ -2766,6 +3287,7 @@ function refitTerminalAfterComposition(tab) {
   if (tab.dead || tab.composing || state.activeTabId !== tab.tabId) return;
   try {
     tab.fit.fit();
+    tab._lastResize = `${tab.term.cols}x${tab.term.rows}`;
     invoke("pty_resize", {
       id: tab.ptyId,
       cols: tab.term.cols,
@@ -2824,6 +3346,7 @@ function switchTab(tabId) {
         // rendering into a tiny top-left corner. Re-sync the PTY to the
         // xterm size now that the pane is visible.
         invoke("pty_resize", { id: t.ptyId, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+        t._lastResize = `${t.term.cols}x${t.term.rows}`;
         t.term.focus();
       } catch {}
     }
@@ -2928,6 +3451,9 @@ function renderSelectedLaunchPanel() {
   const lastActive = project.lastAccessedAt ? relTime(project.lastAccessedAt) : "—";
   const activityRows = usages.map(u => {
     const usageTime = u.lastUsedAt ? relTime(u.lastUsedAt) : "—";
+    const activityMeta = usageHasResumeTarget(u)
+      ? tr("overview.activityMeta", { time: usageTime, count: u.sessionCount || 0 })
+      : tr(activityOnlyLabelKey(u, "overview"), { time: usageTime });
     return `
       <div class="overview__activity-row">
         <span class="overview__tool-mark" style="--tool-color:${toolColor(u.toolKey)}">
@@ -2935,7 +3461,7 @@ function renderSelectedLaunchPanel() {
         </span>
         <span class="overview__activity-copy">
           <strong>${escapeHtml(u.toolName)}</strong>
-          <small>${escapeHtml(tr("overview.activityMeta", { time: usageTime, count: u.sessionCount || 0 }))}</small>
+          <small>${escapeHtml(activityMeta)}</small>
         </span>
       </div>`;
   }).join("");
@@ -2948,7 +3474,7 @@ function renderSelectedLaunchPanel() {
         t.kind === "pty" && t.project?.id === project.id && t.usage?.toolKey === u.toolKey);
       const actionAttrs = openTab
         ? `data-switch-tab="${escapeHtml(String(openTab.tabId))}"`
-        : `data-project-id="${escapeHtml(project.id)}" data-tool="${escapeHtml(u.toolKey)}"`;
+        : `data-project-id="${escapeHtml(String(project.id))}" data-tool="${escapeHtml(u.toolKey)}"`;
       const disabledAttrs = openTab ? "" : disabledTuiAttrs(project, u.toolKey);
       const actionLabel = openTab ? tr("overview.openTerminal") : tr("entry.resume");
       const rawId = String(u.lastSessionId);
@@ -2968,10 +3494,11 @@ function renderSelectedLaunchPanel() {
   const openerPills = openers.map(o => {
     const hint = (o.command || "").replace(/\{path\}/g, "").trim() || openHint;
     return `<button class="launch-pill launch-pill--ext"
-              data-project-id="${escapeHtml(project.id)}" data-opener-id="${escapeHtml(String(o.id))}">
+              data-project-id="${escapeHtml(String(project.id))}" data-opener-id="${escapeHtml(String(o.id))}">
               ${escapeHtml(o.label)}<small>${escapeHtml(hint)}</small>
             </button>`;
   }).join("");
+  const webDevelopmentPills = webDevelopmentLaunchPillsHtml();
   const otherTabs = state.tabs.map(t => {
     const dotKey = t.usage?.toolKey || "shell";
     // t.project is null for web tabs — fall back to the tab title so the
@@ -3004,7 +3531,7 @@ function renderSelectedLaunchPanel() {
 
     <div class="overview__section overview__group">
       <span class="overview__section-title">${escapeHtml(tr("entry.label.group"))}</span>
-      <select class="group-picker__select" data-group-picker data-project-id="${escapeHtml(project.id)}">
+      <select class="group-picker__select" data-group-picker data-project-id="${escapeHtml(String(project.id))}">
         <option value="">${escapeHtml(tr("group.ungrouped"))}</option>
         ${state.groups.map(g => `<option value="${g.id}" ${state.assignments[project.id] === g.id ? "selected" : ""}>${escapeHtml(g.name)}</option>`).join("")}
       </select>
@@ -3032,11 +3559,12 @@ function renderSelectedLaunchPanel() {
     <div class="overview__section">
       <span class="overview__section-title">${escapeHtml(tr("overview.quickActions"))}</span>
       <div class="overview__actions">
-        <button class="launch-pill launch-pill--new" data-project-id="${escapeHtml(project.id)}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
+        <button class="launch-pill launch-pill--new" data-project-id="${escapeHtml(String(project.id))}" data-tool="shell">${escapeHtml(tr("entry.shellNew"))}</button>
         <button class="launch-pill" data-overview-files>${escapeHtml(tr("overview.files"))}</button>
         <button class="launch-pill" data-overview-settings>${escapeHtml(tr("overview.settings"))}</button>
         <button class="launch-pill launch-pill--danger" data-ignore-project>${escapeHtml(tr("entry.ignoreTree"))}</button>
         ${openerPills}
+        ${webDevelopmentPills}
       </div>
     </div>
 
@@ -3083,6 +3611,14 @@ function wireLaunchPills(container) {
       const openerId = el.dataset.openerId;
       const p = state.all.find(x => x.id === projectId);
       if (p) fireOpener(openerId, p.path, el.textContent.trim());
+    });
+  });
+  container.querySelectorAll("[data-web-development-launch]").forEach(el => {
+    el.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = Number(el.dataset.webDevelopmentLaunch);
+      const tool = state.webDevelopmentTools.find(item => Number(item.id) === id && item.enabled);
+      if (tool) openWebTab(tool.connectionUrl, tool.label);
     });
   });
   // "Other open sessions" cards in the right-pane panel. data-switch-tab
@@ -3376,7 +3912,7 @@ async function syncTrayProjects() {
   const groups = state.groups.map(g => ({ id: g.id, name: g.name }));
   // state.assignments is { projectId: groupId } — flatten into the
   // {projectId: groupId} shape the backend expects.
-  const assignments = { ...state.assignments };
+  const assignments = createProjectKeyedMap(state.assignments);
   try {
     await invoke("update_tray_projects", { projects, groups, assignments });
   } catch (e) { /* tray might not exist in some contexts */ }
@@ -3397,14 +3933,23 @@ function wireTrayEvents() {
 
 function wireResize() {
   if (typeof ResizeObserver === "undefined") return;
-  const ro = new ResizeObserver(() => {
-    const tab = state.tabs.find(t => t.ptyId === state.activeTabId);
-    if (!tab || tab.composing) return;
-    try {
-      tab.fit.fit();
-      invoke("pty_resize", { id: tab.ptyId, cols: tab.term.cols, rows: tab.term.rows }).catch(()=>{});
-    } catch {}
-  });
+  let frame = 0;
+  const schedule = () => {
+    if (frame) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      const tab = state.tabs.find(t => t.tabId === state.activeTabId && t.kind === "pty");
+      if (!tab || tab.composing || tab.dead) return;
+      try {
+        tab.fit.fit();
+        const size = `${tab.term.cols}x${tab.term.rows}`;
+        if (tab._lastResize === size) return;
+        tab._lastResize = size;
+        invoke("pty_resize", { id: tab.ptyId, cols: tab.term.cols, rows: tab.term.rows }).catch(()=>{});
+      } catch {}
+    });
+  };
+  const ro = new ResizeObserver(schedule);
   ro.observe(termsViewport);
 }
 
@@ -3572,6 +4117,7 @@ const drawerBody = document.getElementById("drawerBody");
 function openSettings() {
   if (!drawer.hidden) return; // already open; don't double-bind listeners
   if (HAS_TAURI && !state.openerPrefsLoaded) loadOpenerPrefs();
+  if (!state.webDevelopmentToolsLoaded) loadWebDevelopmentTools();
   state.settingsView = "menu";
   renderDrawerBody();
   drawer.hidden = false;
@@ -3587,7 +4133,10 @@ function closeSettings() {
   document.removeEventListener("keydown", escCloseDrawer);
   document.removeEventListener("click", backdropCloseDrawer);
   // Reconcile with whatever the user changed in the drawer.
-  if (HAS_TAURI) loadOpenerPrefs();
+  if (HAS_TAURI) {
+    loadOpenerPrefs();
+    loadWebDevelopmentTools();
+  }
 }
 function escCloseDrawer(e) {
   if (e.key !== "Escape") return;
@@ -3628,8 +4177,9 @@ function renderDrawerHead() {
 function setSettingsView(view) {
   state.settingsView = view;
   renderDrawerBody();
-  if (view === "tui") refreshAllTuiCapabilities();
+  if (view === "tui") void refreshAllTuiCapabilities({ includeRemote: true });
   if (view === "cleanup") void refreshSessionCleanup();
+  if (view === "webDevelopment" && !state.webDevelopmentToolsLoaded) void loadWebDevelopmentTools();
   focusDialogStart(drawer, view === "menu" ? "[data-settings-view]" : "#drawerBackBtn");
 }
 
@@ -3647,6 +4197,11 @@ const SETTINGS_VIEWS = {
     titleKey: "settings.tui.title",
     blurbKey: "settings.tui.blurb",
     body: renderTuiViewBody,
+  },
+  webDevelopment: {
+    titleKey: "settings.webDevelopment.title",
+    blurbKey: "settings.webDevelopment.blurb",
+    body: renderWebDevelopmentViewBody,
   },
   remote: {
     titleKey: "settings.remote.title",
@@ -3674,7 +4229,7 @@ const SETTINGS_VIEWS = {
     body: renderLanguageViewBody,
   },
 };
-const SETTINGS_ORDER = ["language", "cleanup", "tui", "remote", "ignores", "groups", "openers"];
+const SETTINGS_ORDER = ["language", "cleanup", "tui", "webDevelopment", "remote", "ignores", "groups", "openers"];
 
 // Localized title/blurb for a settings view (used by the menu + header).
 function settingsTitleFor(view) {
@@ -3708,6 +4263,7 @@ function renderSettingsMenuBody() {
 function settingsCountFor(view) {
   switch (view) {
     case "tui": return String(1 + state.remoteServers.length);
+    case "webDevelopment": return String(state.webDevelopmentTools.length);
     case "remote": return String(state.remoteServers.length);
     case "ignores": return String(state.projectIgnores.length);
     case "groups": return String(state.groups.length);
@@ -3744,9 +4300,35 @@ function renderTuiViewBody() {
       osFamily: server.osFamily,
     })),
   ];
-  return `<div class="tui-intro">${escapeHtml(tr("tui.intro"))}</div>${machines.map(machine => {
+  const adapterForm = `<form id="tuiAdapterForm" class="tui-adapter-form">
+    <div class="tui-adapter-form__copy">
+      <strong>${escapeHtml(tr("tui.adapterInstallTitle"))}</strong>
+      <span>${escapeHtml(tr("tui.adapterInstallHint"))}</span>
+    </div>
+    <input class="custom-form__input" name="manifestPath" data-tui-adapter-path
+           value="${escapeHtml(state.tuiAdapterManifestPath)}"
+           placeholder="${escapeHtml(tr("tui.adapterPathPlaceholder"))}"
+           aria-label="${escapeHtml(tr("tui.adapterPathAria"))}"
+           ${state.tuiAdapterImporting ? "disabled" : ""} />
+    <button class="scan-btn" type="submit" ${state.tuiAdapterImporting ? "disabled" : ""}>
+      ${escapeHtml(tr(state.tuiAdapterImporting ? "tui.adapterImporting" : "tui.adapterImport"))}
+    </button>
+  </form>`;
+  const adapterDiagnostics = state.tuiMachines.local?.adapterDiagnostics || [];
+  const adapterWarnings = adapterDiagnostics.length
+    ? `<div class="tui-adapter-diagnostics" role="status">
+        <strong>${escapeHtml(tr("tui.adapterDiagnostics"))}</strong>
+        ${adapterDiagnostics.map(message => `<span>${escapeHtml(message)}</span>`).join("")}
+      </div>`
+    : "";
+  return `<div class="tui-intro">${escapeHtml(tr("tui.intro"))}</div>${adapterForm}${adapterWarnings}${machines.map(machine => {
     const capabilities = state.tuiMachines[machine.key];
     const loading = state.tuiLoadingKeys.has(machine.key);
+    const checking = state.tuiCheckingKeys.has(machine.key);
+    const mutating = [...state.tuiInstallingKeys, ...state.tuiUpgradingKeys]
+      .some(key => key.startsWith(`${machine.key}:`))
+      || state.tuiAdapterImporting
+      || state.tuiAdapterBusyKeys.size > 0;
     const scopeValue = machine.serverId == null ? "" : String(machine.serverId);
     let body;
     if (loading && !capabilities) {
@@ -3757,26 +4339,78 @@ function renderTuiViewBody() {
       body = capabilities.tools.map(tool => {
         const installKey = `${machine.key}:${tool.toolKey}`;
         const installing = state.tuiInstallingKeys.has(installKey);
+        const upgrading = state.tuiUpgradingKeys.has(installKey);
+        const adapterBusy = state.tuiAdapterBusyKeys.has(tool.toolKey);
+        const busy = installing || upgrading || adapterBusy || checking || state.tuiAdapterImporting;
+        const supported = tool.supported !== false;
         const version = tool.version || tr("tui.versionUnknown");
-        const status = tool.installed ? tr("tui.installed") : tr("tui.notInstalled");
-        const installTitle = tool.installAvailable
-          ? tr("tui.installWith", { manager: tool.installManager })
-          : tr("tui.managerMissing", { manager: tool.installManager });
+        const status = !supported
+          ? tr("tui.unsupported")
+          : tool.installed ? tr("tui.installed") : tr("tui.notInstalled");
+        const installTitle = !supported
+          ? (tool.supportError || tr("tui.unsupported"))
+          : tool.installAvailable
+            ? tr("tui.installWith", { manager: tool.installManager, package: tool.installPackage })
+            : tool.installManager
+              ? tr("tui.managerMissing", { manager: tool.installManager })
+              : tr("tui.manualInstallHint");
+        const upgradeTitle = tool.installAvailable
+          ? tr("tui.upgradeWith", { manager: tool.installManager, package: tool.installPackage })
+          : tool.installManager
+            ? tr("tui.managerMissing", { manager: tool.installManager })
+            : tr("tui.manualInstallHint");
+        const adapterSource = tr(tool.adapterSource === "local"
+          ? "tui.adapterSourceLocal"
+          : "tui.adapterSourceBundled");
+        const adapterMeta = tr("tui.adapterMeta", {
+          version: tool.adapterVersion || tr("tui.versionUnknown"),
+          source: adapterSource,
+        });
+        let updateStatus = "";
+        if (tool.installed) {
+          if (checking) {
+            updateStatus = `<small class="tui-row__update is-checking">${escapeHtml(tr("tui.checkingUpdate"))}</small>`;
+          } else if (!tool.updateChecked) {
+            updateStatus = `<small class="tui-row__update">${escapeHtml(tr("tui.updateUnchecked"))}</small>`;
+          } else if (tool.updateCheckError) {
+            updateStatus = `<small class="tui-row__update is-error" title="${escapeHtml(tool.updateCheckError)}">${escapeHtml(tr("tui.updateCheckFailed"))}</small>`;
+          } else if (tool.updateAvailable) {
+            updateStatus = `<small class="tui-row__update is-update">${escapeHtml(tr("tui.updateAvailable", { version: tool.latestVersion || tr("tui.versionUnknown") }))}</small>`;
+          } else {
+            updateStatus = `<small class="tui-row__update is-current">${escapeHtml(tr("tui.upToDate", { version: tool.latestVersion || version }))}</small>`;
+          }
+        }
         return `<div class="tui-row" data-tui-tool="${escapeHtml(tool.toolKey)}">
           <span class="tui-row__icon">${toolIcon(tool.toolKey)}</span>
           <span class="tui-row__main">
             <strong>${escapeHtml(tool.toolName)}</strong>
-            <small class="${tool.installed ? "is-installed" : "is-missing"}">${escapeHtml(status)}${tool.installed ? ` · ${escapeHtml(version)}` : ""}</small>
+            <small class="${tool.installed ? "is-installed" : "is-missing"}" title="${escapeHtml(tool.supportError || "")}">${escapeHtml(status)}${tool.installed ? ` · ${escapeHtml(version)}` : ""}</small>
+            <small class="tui-row__adapter">${escapeHtml(adapterMeta)}</small>
+            ${updateStatus}
           </span>
-          ${tool.installed
-            ? `<label class="tui-row__toggle" title="${escapeHtml(tr("tui.enableTitle"))}">
-                <input type="checkbox" data-tui-toggle data-server-id="${scopeValue}" ${tool.enabled ? "checked" : ""} ${installing ? "disabled" : ""} />
-                <span>${escapeHtml(tr("tui.enabled"))}</span>
-              </label>`
-            : `<button class="tui-row__install" data-tui-install data-server-id="${scopeValue}"
-                       title="${escapeHtml(installTitle)}" ${!tool.installAvailable || installing ? "disabled" : ""}>
-                ${escapeHtml(tr(installing ? "tui.installing" : "tui.install"))}
-              </button>`}
+          <span class="tui-row__actions">
+            ${machine.serverId == null && tool.adapterUpdateAvailable ? `<button class="tui-row__adapter-action" data-tui-adapter-activate
+              title="${escapeHtml(tr("tui.adapterActivateTitle", { version: tool.adapterNewestVersion }))}" ${busy ? "disabled" : ""}>
+              ${escapeHtml(tr(adapterBusy ? "tui.adapterWorking" : "tui.adapterActivate", { version: tool.adapterNewestVersion }))}
+            </button>` : ""}
+            ${machine.serverId == null && tool.adapterRollbackVersion ? `<button class="tui-row__adapter-action" data-tui-adapter-rollback
+              title="${escapeHtml(tr("tui.adapterRollbackTitle", { version: tool.adapterRollbackVersion }))}" ${busy ? "disabled" : ""}>
+              ${escapeHtml(tr(adapterBusy ? "tui.adapterWorking" : "tui.adapterRollback", { version: tool.adapterRollbackVersion }))}
+            </button>` : ""}
+            ${tool.installed && tool.updateAvailable ? `<button class="tui-row__upgrade" data-tui-upgrade data-server-id="${scopeValue}"
+              title="${escapeHtml(upgradeTitle)}" ${!tool.installAvailable || busy ? "disabled" : ""}>
+              ${escapeHtml(tr(upgrading ? "tui.upgrading" : "tui.upgrade"))}
+            </button>` : ""}
+            ${!tool.installed ? `<button class="tui-row__install" data-tui-install data-server-id="${scopeValue}"
+              title="${escapeHtml(installTitle)}" ${!supported || !tool.installAvailable || busy ? "disabled" : ""}>
+              ${escapeHtml(tr(installing ? "tui.installing" : tool.installAvailable ? "tui.install" : "tui.manualInstall"))}
+            </button>` : ""}
+            <label class="tui-row__toggle" title="${escapeHtml(!supported ? (tool.supportError || tr("tui.unsupported")) : tr(tool.installed ? "tui.enableTitle" : "tui.enableNeedsInstall"))}">
+              <input type="checkbox" data-tui-toggle data-server-id="${scopeValue}"
+                     ${tool.enabled ? "checked" : ""} ${!supported || !tool.installed || busy ? "disabled" : ""} />
+              <span>${escapeHtml(tr("tui.enabled"))}</span>
+            </label>
+          </span>
         </div>`;
       }).join("");
     } else {
@@ -3791,7 +4425,16 @@ function renderTuiViewBody() {
             <small>${escapeHtml(tr(machine.source === "local" ? "tui.sourceLocal" : "tui.sourceRemote"))}</small>
           </div>
         </div>
-        <button class="tui-machine__refresh" data-tui-refresh data-server-id="${scopeValue}" ${loading ? "disabled" : ""}>${escapeHtml(tr(loading ? "tui.detectingShort" : "tui.refresh"))}</button>
+        <div class="tui-machine__actions">
+          <button class="tui-machine__check" data-tui-check-updates data-server-id="${scopeValue}"
+                  ${loading || checking || mutating || !capabilities?.tools?.length ? "disabled" : ""}>
+            ${escapeHtml(tr(checking ? "tui.checkingUpdatesShort" : "tui.checkUpdates"))}
+          </button>
+          <button class="tui-machine__refresh" data-tui-refresh data-server-id="${scopeValue}"
+                  ${loading || checking || mutating ? "disabled" : ""}>
+            ${escapeHtml(tr(loading ? "tui.detectingShort" : "tui.refresh"))}
+          </button>
+        </div>
       </div>
       <div class="tui-machine__tools">${body}</div>
     </section>`;
@@ -3921,6 +4564,11 @@ async function scanRemoteServerInBackground(serverId, { initial = false, probe =
   setStatus(tr(initial ? "status.serverAddedScanningBackground" : "status.scanningBackground", {
     name: initialName,
   }));
+  // Project discovery and installed-TUI detection are independent SSH reads.
+  // Start both together so a newly-added server is fully usable after its
+  // first background scan instead of waiting for the user to visit TUI
+  // settings or select a remote project.
+  void refreshTuiMachine(id, { force: true, deferRender: true });
 
   try {
     const count = await invoke("scan_remote_server", { serverId: id });
@@ -4053,6 +4701,59 @@ function renderGroupsViewBody() {
     </form>`;
 }
 
+// Sub-page: browser-based development tools. These endpoints are separate
+// from TUI adapters because they do not execute a local binary; opening one
+// creates a sandboxed web tab after both backend and frontend URL checks.
+function renderWebDevelopmentViewBody() {
+  if (!state.webDevelopmentToolsLoaded) {
+    return `<div class="drawer__empty">${escapeHtml(tr("common.loading"))}</div>`;
+  }
+  const error = state.webDevelopmentToolsError
+    ? `<div class="web-development__error" role="alert">${escapeHtml(tr("settings.webDevelopment.loadFailed", { error: state.webDevelopmentToolsError }))}</div>`
+    : "";
+  const rows = state.webDevelopmentTools.length
+    ? `<div class="drawer__section">
+        <div class="drawer__section__label">${escapeHtml(tr("settings.webDevelopment.configured"))}</div>
+        ${state.webDevelopmentTools.map(tool => `
+          <form class="web-tool-row" data-web-development-form data-web-development-id="${escapeHtml(String(tool.id))}">
+            <label class="web-tool-row__toggle">
+              <input type="checkbox" data-web-development-toggle ${tool.enabled ? "checked" : ""} />
+              <span class="web-tool-row__mark" aria-hidden="true">WB</span>
+              <span>${escapeHtml(tool.label)}</span>
+            </label>
+            <label class="web-tool-row__field">
+              <span>${escapeHtml(tr("settings.webDevelopment.name"))}</span>
+              <input class="custom-form__input" name="label" value="${escapeHtml(tool.label)}"
+                     maxlength="128" required autocomplete="off" />
+            </label>
+            <label class="web-tool-row__field web-tool-row__field--url">
+              <span>${escapeHtml(tr("settings.webDevelopment.connectionUrl"))}</span>
+              <input class="custom-form__input" name="connectionUrl" type="url"
+                     value="${escapeHtml(tool.connectionUrl)}" required autocomplete="off" spellcheck="false" />
+            </label>
+            <div class="web-tool-row__actions">
+              <button type="button" data-web-development-open>${escapeHtml(tr("settings.webDevelopment.open"))}</button>
+              <button type="submit">${escapeHtml(tr("settings.webDevelopment.save"))}</button>
+              <button type="button" class="web-tool-row__delete" data-web-development-delete>${escapeHtml(tr("common.delete"))}</button>
+            </div>
+          </form>`).join("")}
+      </div>`
+    : `<div class="drawer__empty">${escapeHtml(tr("settings.webDevelopment.none"))}</div>`;
+  return `${error}
+    <div class="web-development__intro">${escapeHtml(tr("settings.webDevelopment.intro"))}</div>
+    ${rows}
+    <form id="webDevelopmentNewForm" class="custom-form drawer__form" data-web-development-form data-web-development-id="">
+      <span class="entry__launch-label">${escapeHtml(tr("settings.webDevelopment.add"))}</span>
+      <input class="custom-form__input" name="label" maxlength="128" required
+             placeholder="${escapeHtml(tr("settings.webDevelopment.namePlaceholder"))}" autocomplete="off" />
+      <input class="custom-form__input custom-form__input--wide" name="connectionUrl" type="url" required
+             placeholder="${escapeHtml(tr("settings.webDevelopment.urlPlaceholder"))}"
+             autocomplete="off" spellcheck="false" />
+      <button class="scan-btn" type="submit">${escapeHtml(tr("form.submit.add"))}</button>
+      <span class="web-development__hint">${escapeHtml(tr("settings.webDevelopment.urlHint"))}</span>
+    </form>`;
+}
+
 // Sub-page: openers list + "Add custom opener" form.
 function renderOpenersViewBody() {
   const list = (!state.openerPrefs || !state.openerPrefs.length)
@@ -4108,8 +4809,19 @@ function renderLanguageViewBody() {
   </div>`;
 }
 
-async function refreshSessionCleanup() {
+async function refreshSessionCleanup({ force = false } = {}) {
   if (state.sessionCleanupLoading) return;
+  if (state.sessionCleanup && !force && !state.sessionCleanupStale) {
+    if (HAS_TAURI) {
+      try {
+        state.sessionCleanupTrash = await invoke("list_session_trash");
+        if (!drawer.hidden && state.settingsView === "cleanup") renderDrawerBody();
+      } catch (error) {
+        showActionError(tr("cleanup.analysisFailed", { err: error }));
+      }
+    }
+    return;
+  }
   state.sessionCleanupLoading = true;
   if (!drawer.hidden && state.settingsView === "cleanup") renderDrawerBody();
   try {
@@ -4120,6 +4832,7 @@ async function refreshSessionCleanup() {
       ]);
       state.sessionCleanup = analysis;
       state.sessionCleanupTrash = trash;
+      state.sessionCleanupStale = false;
     } else {
       state.sessionCleanup = {
         scannedAt: new Date().toISOString(),
@@ -4130,6 +4843,7 @@ async function refreshSessionCleanup() {
         ],
       };
       state.sessionCleanupTrash = [];
+      state.sessionCleanupStale = false;
     }
     state.sessionCleanupSelected = new Set(
       [...state.sessionCleanupSelected].filter(key =>
@@ -4255,7 +4969,10 @@ function wireDrawerDelegation() {
           });
         } else {
           const tool = state.tuiMachines[key]?.tools?.find(item => item.toolKey === toolKey);
-          if (tool) tool.enabled = cb.checked;
+          if (tool) {
+            tool.adapterEnabled = cb.checked;
+            tool.enabled = tool.installed && cb.checked;
+          }
         }
         setStatus(tr(cb.checked ? "status.tuiEnabled" : "status.tuiDisabled", { tool: toolKey }));
         renderDrawerBody();
@@ -4266,6 +4983,30 @@ function wireDrawerDelegation() {
         cb.disabled = false;
         showActionError(tr("status.tuiToggleFailed", { err: error }));
       }
+      return;
+    }
+    if (cb?.matches?.("[data-web-development-toggle]")) {
+      const row = cb.closest("[data-web-development-id]");
+      const id = Number(row?.dataset.webDevelopmentId);
+      const tool = state.webDevelopmentTools.find(item => Number(item.id) === id);
+      if (!tool) return;
+      const previous = tool.enabled;
+      const checked = cb.checked;
+      tool.enabled = checked;
+      renderSelectedLaunchPanel();
+      await settingsMutationQueue.run(`web-development-enabled:${id}`, async () => {
+        try {
+          if (HAS_TAURI) {
+            await invoke("set_web_development_tool_enabled", { toolId: id, enabled: checked });
+          }
+          setStatus(tr("status.webDevelopmentEnabled", { name: tool.label }));
+        } catch (error) {
+          tool.enabled = previous;
+          cb.checked = previous;
+          renderSelectedLaunchPanel();
+          showActionError(tr("status.webDevelopmentSaveFailed", { err: error }));
+        }
+      });
       return;
     }
     if (!cb?.matches?.("[data-opener-toggle]")) return;
@@ -4288,6 +5029,10 @@ function wireDrawerDelegation() {
   });
   drawerBody.addEventListener("input", (e) => {
     const inp = e.target;
+    if (inp?.matches?.("[data-tui-adapter-path]")) {
+      state.tuiAdapterManifestPath = inp.value;
+      return;
+    }
     if (inp?.matches?.('#serverForm [name="sshCommand"]')) {
       resetServerFormFeedback(inp.form);
       return;
@@ -4327,6 +5072,7 @@ function wireDrawerDelegation() {
             const g = state.groups.find(x => String(x.id) === String(id));
             if (g) g.name = draft;
             inp.classList.remove("is-unsaved");
+            applyFilters();
           } catch (error) {
             inp.classList.add("is-unsaved");
             showActionError(error);
@@ -4348,7 +5094,7 @@ function wireDrawerDelegation() {
             const server = state.remoteServers.find(item => Number(item.id) === id);
             if (server) server.label = draft.trim();
             inp.classList.remove("is-unsaved");
-            renderLedger();
+            applyFilters();
             renderSelectedLaunchPanel();
           } catch (error) {
             inp.classList.add("is-unsaved");
@@ -4360,7 +5106,7 @@ function wireDrawerDelegation() {
   });
   drawerBody.addEventListener("click", async (e) => {
     if (e.target.closest("[data-cleanup-refresh]")) {
-      void refreshSessionCleanup();
+      void refreshSessionCleanup({ force: true });
       return;
     }
     if (e.target.closest("[data-cleanup-select-likely]")) {
@@ -4375,11 +5121,17 @@ function wireDrawerDelegation() {
       const keys = [...state.sessionCleanupSelected];
       if (!keys.length || !window.confirm(tr("cleanup.confirm", { count: keys.length }))) return;
       try {
-        if (HAS_TAURI) await invoke("quarantine_session_candidates", { keys });
-        state.sessionCleanup = null;
+        if (HAS_TAURI) {
+          const snapshotId = state.sessionCleanup?.snapshotId;
+          if (!snapshotId) throw new Error("session analysis is stale; analyze again");
+          await invoke("quarantine_session_candidates", { snapshotId, keys });
+        }
+        state.sessionCleanup.candidates = state.sessionCleanup.candidates.filter(item => !state.sessionCleanupSelected.has(item.key));
+        state.sessionCleanupStale = true;
         state.sessionCleanupSelected.clear();
         setStatus(tr("cleanup.moved", { count: keys.length }));
-        await refreshSessionCleanup();
+        if (HAS_TAURI) state.sessionCleanupTrash = await invoke("list_session_trash");
+        renderDrawerBody();
         if (HAS_TAURI) void reload();
       } catch (error) {
         showActionError(tr("cleanup.moveFailed", { err: error }));
@@ -4393,13 +5145,32 @@ function wireDrawerDelegation() {
         const count = HAS_TAURI
           ? await invoke("restore_session_trash", { batchId: restore.dataset.cleanupRestore })
           : 1;
-        state.sessionCleanup = null;
+        state.sessionCleanupStale = true;
         setStatus(tr("cleanup.restored", { count }));
-        await refreshSessionCleanup();
+        if (HAS_TAURI) state.sessionCleanupTrash = await invoke("list_session_trash");
+        renderDrawerBody();
         if (HAS_TAURI) void reload();
       } catch (error) {
         showActionError(tr("cleanup.restoreFailed", { err: error }));
       }
+      return;
+    }
+    const adapterActivate = e.target.closest("[data-tui-adapter-activate]");
+    if (adapterActivate) {
+      const toolKey = adapterActivate.closest("[data-tui-tool]")?.dataset.tuiTool;
+      void mutateLocalTuiAdapter(toolKey, "activate_tui_adapter_update");
+      return;
+    }
+    const adapterRollback = e.target.closest("[data-tui-adapter-rollback]");
+    if (adapterRollback) {
+      const toolKey = adapterRollback.closest("[data-tui-tool]")?.dataset.tuiTool;
+      void mutateLocalTuiAdapter(toolKey, "rollback_tui_adapter");
+      return;
+    }
+    const tuiCheckUpdates = e.target.closest("[data-tui-check-updates]");
+    if (tuiCheckUpdates) {
+      const serverId = tuiCheckUpdates.dataset.serverId === "" ? null : Number(tuiCheckUpdates.dataset.serverId);
+      void checkTuiMachineUpdates(serverId);
       return;
     }
     const tuiRefresh = e.target.closest("[data-tui-refresh]");
@@ -4417,7 +5188,12 @@ function wireDrawerDelegation() {
       const machine = state.tuiMachines[machineKey];
       const tool = machine?.tools?.find(item => item.toolKey === toolKey);
       if (!tool) return;
-      if (!window.confirm(tr("tui.installConfirm", { tool: tool.toolName, machine: machine.label || tr("tui.localMachine") }))) return;
+      if (!window.confirm(tr("tui.installConfirm", {
+        tool: tool.toolName,
+        package: tool.installPackage,
+        manager: tool.installManager,
+        machine: machine.label || tr("tui.localMachine"),
+      }))) return;
       const installKey = `${machineKey}:${toolKey}`;
       state.tuiInstallingKeys.add(installKey);
       renderDrawerBody();
@@ -4427,6 +5203,7 @@ function wireDrawerDelegation() {
           state.tuiMachines[machineKey] = await invoke("install_tui", { serverId, toolKey });
         } else {
           tool.installed = true;
+          tool.adapterEnabled = true;
           tool.enabled = true;
           tool.version = "demo";
         }
@@ -4441,6 +5218,70 @@ function wireDrawerDelegation() {
       }
       return;
     }
+    const tuiUpgrade = e.target.closest("[data-tui-upgrade]");
+    if (tuiUpgrade) {
+      const row = tuiUpgrade.closest("[data-tui-tool]");
+      const toolKey = row?.dataset.tuiTool;
+      const serverId = tuiUpgrade.dataset.serverId === "" ? null : Number(tuiUpgrade.dataset.serverId);
+      const machineKey = tuiMachineKey(serverId);
+      const machine = state.tuiMachines[machineKey];
+      const tool = machine?.tools?.find(item => item.toolKey === toolKey);
+      if (!tool?.installed || !tool.updateAvailable) return;
+      if (!window.confirm(tr("tui.upgradeConfirm", {
+        tool: tool.toolName,
+        machine: machine.label || tr("tui.localMachine"),
+        version: tool.latestVersion || tr("tui.versionUnknown"),
+        package: tool.installPackage,
+        manager: tool.installManager,
+      }))) return;
+      const upgradeKey = `${machineKey}:${toolKey}`;
+      state.tuiUpgradingKeys.add(upgradeKey);
+      renderDrawerBody();
+      setStatus(tr("status.tuiUpgrading", { tool: tool.toolName, machine: machine.label }));
+      try {
+        if (HAS_TAURI) {
+          state.tuiMachines[machineKey] = await invoke("upgrade_tui", { serverId, toolKey });
+        } else {
+          tool.version = tool.latestVersion || tool.version;
+          tool.updateAvailable = false;
+        }
+        state.tuiCapabilityAt[machineKey] = Date.now();
+        setStatus(tr("status.tuiUpgraded", { tool: tool.toolName, machine: machine.label }));
+      } catch (error) {
+        showActionError(tr("status.tuiUpgradeFailed", { err: error }));
+      } finally {
+        state.tuiUpgradingKeys.delete(upgradeKey);
+        renderDrawerBody();
+        applyFilters();
+        renderSelectedLaunchPanel();
+      }
+      return;
+    }
+    const webDevelopmentOpen = e.target.closest("[data-web-development-open]");
+    if (webDevelopmentOpen) {
+      const id = Number(webDevelopmentOpen.closest("[data-web-development-id]")?.dataset.webDevelopmentId);
+      const tool = state.webDevelopmentTools.find(item => Number(item.id) === id);
+      if (!tool) return;
+      closeSettings();
+      openWebTab(tool.connectionUrl, tool.label);
+      return;
+    }
+    const webDevelopmentDelete = e.target.closest("[data-web-development-delete]");
+    if (webDevelopmentDelete) {
+      const id = Number(webDevelopmentDelete.closest("[data-web-development-id]")?.dataset.webDevelopmentId);
+      const tool = state.webDevelopmentTools.find(item => Number(item.id) === id);
+      if (!tool || !window.confirm(tr("settings.webDevelopment.deleteConfirm", { name: tool.label }))) return;
+      try {
+        if (HAS_TAURI) await invoke("delete_web_development_tool", { toolId: id });
+        state.webDevelopmentTools = state.webDevelopmentTools.filter(item => Number(item.id) !== id);
+        renderDrawerBody();
+        renderSelectedLaunchPanel();
+        setStatus(tr("status.webDevelopmentDeleted", { name: tool.label }));
+      } catch (error) {
+        showActionError(tr("status.webDevelopmentDeleteFailed", { err: error }));
+      }
+      return;
+    }
     const openerBtn = e.target.closest("[data-opener-del]");
     if (openerBtn) {
       const id = openerBtn.closest(".opener-row").dataset.id;
@@ -4452,7 +5293,7 @@ function wireDrawerDelegation() {
       }
       await loadOpenerPrefs();
       renderDrawerBody();
-      renderLedger();
+      applyFilters();
       return;
     }
     const ignoreBtn = e.target.closest("[data-ignore-del]");
@@ -4537,7 +5378,89 @@ function wireDrawerBackButton() {
 // by the closest <form>'s id to the right submit handler.
 async function submitDrawerForm(form, e) {
   const fd = new FormData(form);
+  if (form.matches("[data-web-development-form]")) {
+    const rawId = form.dataset.webDevelopmentId || "";
+    const toolId = rawId ? Number(rawId) : null;
+    const label = (fd.get("label") || "").toString().trim();
+    const rawUrl = (fd.get("connectionUrl") || "").toString().trim();
+    const connectionUrl = normalizeWebConnectionUrl(rawUrl);
+    if (!label) {
+      setStatus(tr("status.webDevelopmentNameRequired"));
+      form.querySelector('[name="label"]')?.focus();
+      return;
+    }
+    if (!connectionUrl) {
+      setStatus(tr("status.webConnectionInvalid"));
+      form.querySelector('[name="connectionUrl"]')?.focus();
+      return;
+    }
+    const existing = toolId == null
+      ? null
+      : state.webDevelopmentTools.find(item => Number(item.id) === toolId);
+    try {
+      let saved;
+      if (HAS_TAURI) {
+        saved = await invoke("upsert_web_development_tool", {
+          toolId,
+          label,
+          connectionUrl,
+          enabled: existing?.enabled ?? true,
+        });
+      } else {
+        saved = {
+          id: toolId ?? `demo-web-${Date.now()}`,
+          label,
+          connectionUrl,
+          enabled: existing?.enabled ?? true,
+          sortOrder: existing?.sortOrder ?? (state.webDevelopmentTools.length + 1) * 10,
+        };
+      }
+      state.webDevelopmentTools = [
+        ...state.webDevelopmentTools.filter(item => String(item.id) !== String(saved.id)),
+        saved,
+      ].sort((left, right) => Number(left.sortOrder) - Number(right.sortOrder));
+      if (toolId == null) form.reset();
+      renderDrawerBody();
+      renderSelectedLaunchPanel();
+      setStatus(tr("status.webDevelopmentSaved", { name: saved.label }));
+    } catch (error) {
+      showActionError(tr("status.webDevelopmentSaveFailed", { err: error }));
+    }
+    return;
+  }
   switch (form.id) {
+    case "tuiAdapterForm": {
+      const manifestPath = (fd.get("manifestPath") || "").toString().trim();
+      state.tuiAdapterManifestPath = manifestPath;
+      if (!manifestPath) {
+        setStatus(tr("status.adapterPathRequired"));
+        form.querySelector('[name="manifestPath"]')?.focus();
+        return;
+      }
+      if (!HAS_TAURI) {
+        setStatus(tr("status.adapterDesktopOnly"));
+        return;
+      }
+      if (!window.confirm(tr("tui.adapterImportConfirm", { path: manifestPath }))) return;
+      state.tuiAdapterImporting = true;
+      renderDrawerBody();
+      setStatus(tr("status.adapterImporting"));
+      try {
+        state.tuiMachines.local = await invoke("install_tui_adapter", { manifestPath });
+        state.tuiCapabilityAt.local = Date.now();
+        state.tuiAdapterManifestPath = "";
+        setStatus(tr("status.adapterImported"));
+        refreshRemoteTuiAdaptersAfterRegistryChange();
+      } catch (error) {
+        showActionError(tr("status.adapterImportFailed", { err: error }));
+      } finally {
+        state.tuiAdapterImporting = false;
+        renderDrawerBody();
+        applyFilters();
+        renderSelectedLaunchPanel();
+      }
+      break;
+    }
     case "customForm": {
       const label = (fd.get("label") || "").toString().trim();
       const command = (fd.get("command") || "").toString().trim();
@@ -4680,10 +5603,42 @@ function sortBucket(items) {
   return sortProjects(items, state.sortOrders);
 }
 
+function buildLedgerRows(matching, { includeCollapsed = true } = {}) {
+  const buckets = new Map();
+  for (const project of matching) {
+    const key = groupKeyOf(project);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(project);
+  }
+  const rows = [];
+  for (const group of state.groups) {
+    const items = buckets.get(String(group.id));
+    if (!items?.length) continue;
+    sortBucket(items);
+    rows.push({ type: "group", key: String(group.id), name: group.name, count: items.length });
+    if (includeCollapsed || !isGroupCollapsed(String(group.id))) {
+      rows.push(...items.map(project => ({ type: "project", project })));
+    }
+  }
+  const ungrouped = buckets.get("ungrouped");
+  if (ungrouped?.length) {
+    sortBucket(ungrouped);
+    rows.push({ type: "group", key: "ungrouped", name: tr("group.ungrouped"), count: ungrouped.length });
+    if (includeCollapsed || !isGroupCollapsed("ungrouped")) {
+      rows.push(...ungrouped.map(project => ({ type: "project", project })));
+    }
+  }
+  return rows;
+}
+
 function applyFilters() {
   const model = buildLedgerModel();
   state.filtered = model.ordered;
   state.matchingCount = model.matching.length;
+  // Build `filtered` in render order: real groups in their defined order,
+  // then 未分组; within each group apply sortBucket; skip collapsed groups
+  // (the cursor must skip them). This keeps ↑↓ nav aligned with what's
+  // visually top-to-bottom in the ledger, including under manual order.
   const idx = state.filtered.findIndex(p => p.id === state.selectedId);
   state.cursor = state.filtered.length ? (idx >= 0 ? idx : 0) : -1;
   renderCount();
@@ -4726,7 +5681,7 @@ async function reload() {
       state.remoteServers = serversResult.value || [];
       state.remoteServerById = Object.fromEntries(state.remoteServers.map(s => [s.id, s]));
       state.staleSources.servers = false;
-      refreshAllTuiCapabilities();
+      void refreshAllTuiCapabilities({ includeRemote: state.settingsView === "tui" });
     } else {
       state.staleSources.servers = true;
     }
@@ -4787,8 +5742,8 @@ async function reload() {
 // rebuild. Lets `↑↓` nav and row-click feel instant on large archives.
 function updateSelectionHighlight(prevId, newId) {
   if (prevId === newId) return;
-  const prev = prevId ? ledger.querySelector(`.entry[data-id="${prevId}"]`) : null;
-  const next = newId ? ledger.querySelector(`.entry[data-id="${newId}"]`) : null;
+  const prev = prevId ? ledger.querySelector(projectEntrySelector(prevId)) : null;
+  const next = newId ? ledger.querySelector(projectEntrySelector(newId)) : null;
   prev?.classList.remove("is-selected");
   next?.classList.add("is-selected");
 }
@@ -4796,6 +5751,18 @@ function select(id) {
   const prev = state.selectedId;
   state.selectedId = id;
   state.cursor = state.filtered.findIndex(p => p.id === id);
+  const selectedProject = state.all.find(project => project.id === id);
+  // Capability probing is lazy for remote machines: selecting a remote
+  // project is the first point at which its launch buttons need an answer.
+  // The probe itself is single-flight and TTL-cached, so keyboard navigation
+  // cannot create a network burst.
+  if (selectedProject) {
+    void refreshTuiMachine(
+      selectedProject.source === "remote" && selectedProject.remoteServerId != null
+        ? Number(selectedProject.remoteServerId)
+        : null,
+    );
+  }
   updateSelectionHighlight(prev, id);
   // Right pane reacts: if a tab for this project is open, switch to it;
   // otherwise show the launch panel so the user can pick a tool or jump
@@ -4829,7 +5796,17 @@ function moveCursor(delta) {
   if (!state.filtered.length) return;
   state.cursor = (state.cursor + delta + state.filtered.length) % state.filtered.length;
   select(state.filtered[state.cursor].id);
-  const el = ledger.querySelector(`.entry[data-id="${state.filtered[state.cursor].id}"]`);
+  let el = ledger.querySelector(projectEntrySelector(state.filtered[state.cursor].id));
+  if (!el) {
+    const targetId = state.filtered[state.cursor].id;
+    const layoutIndex = state.ledgerLayout?.rows.findIndex(row =>
+      row.type === "project" && row.project.id === targetId,
+    );
+    const targetOffset = layoutIndex >= 0 ? state.ledgerLayout.offsets[layoutIndex] : 0;
+    ledger.scrollTop = Math.max(0, targetOffset);
+    renderVirtualLedger();
+    el = ledger.querySelector(projectEntrySelector(targetId));
+  }
   el?.scrollIntoView({ block: "nearest" });
 }
 
@@ -4872,58 +5849,173 @@ const _footGit = {
   info:       null,   // last fetched GitInfo for current
 };
 
-async function refreshFootGit() {
+const GIT_INFO_TTL_MS = 180000;
+const GIT_SELECTION_DEBOUNCE_MS = 300;
+let _gitSelectionTimer = null;
+let _gitSelectionCancel = null;
+let _gitSelectionToken = 0;
+const _gitInflight = new Map();
+
+function patchGitSyncBadge(projectId) {
+  const entry = ledger.querySelector(projectEntrySelector(projectId));
+  if (!entry) return;
+  const body = entry.querySelector(".entry__body");
+  if (!body) return;
+  const current = body.querySelector(".entry__git-sync");
+  const project = state.all.find(item => item.id === projectId);
+  const html = project ? projectGitSyncBadgeHtml(project) : "";
+  if (current) {
+    if (html) current.outerHTML = html;
+    else current.remove();
+  } else if (html) {
+    const source = body.querySelector(".entry__source");
+    source?.insertAdjacentHTML("afterend", html);
+  }
+}
+
+function renderCachedFootGit(project, info) {
+  if (_footGit.current !== project.id) return;
+  _footGit.info = info;
+  renderFootGit(info);
+  patchGitSyncBadge(project.id);
+}
+
+function refreshFootGit({ force = false, allowFetch = true } = {}) {
   // Close any open add-remote form / branch menu so a selection change
   // always starts clean.
   closeAddRemoteForm();
   closeBranchMenu();
+  const token = ++_gitSelectionToken;
+  if (_gitSelectionTimer) {
+    clearTimeout(_gitSelectionTimer);
+    _gitSelectionTimer = null;
+    _gitSelectionCancel?.(null);
+    _gitSelectionCancel = null;
+  }
   const p = state.all.find(x => x.id === state.selectedId);
   _footGit.current = p ? p.id : null;
   if (!p) {
     _footGit.row.hidden = true;
     _footGit.info = null;
-    return;
+    return Promise.resolve(null);
   }
   if (!HAS_TAURI) {
     renderFootGit({ isRepo: true, branch: "demo", remotes: [], headShort: null, headSummary: null, dirty: false, upstream: "origin/demo", ahead: 1, behind: 0, remoteChecked: true });
-    return;
+    return Promise.resolve(_footGit.info);
   }
-  if (p.source === "remote") {
-    renderFootGit({ isRepo: true, branch: p.gitBranch, remotes: [], headShort: null, headSummary: null, dirty: false, upstream: "remote", ahead: 0, behind: 0, remoteChecked: false });
-    try {
-      const info = await invoke("refresh_remote_git_info", { serverId: Number(p.remoteServerId), path: p.path });
-      if (_footGit.current !== p.id) return;
-      _footGit.info = info;
-      state.gitStatusByProject[p.id] = info;
-      renderFootGit(info);
-      renderLedger();
-    } catch (error) {
-      if (_footGit.current !== p.id) return;
-      renderFootGit({ isRepo: false, remotes: [], error: String(error) });
+  const cached = state.gitStatusByProject[p.id];
+  const cacheAge = Date.now() - Number(state.gitStatusAtByProject[p.id] || 0);
+  if (cached && !force && cached.remoteChecked !== false && cacheAge >= 0 && cacheAge < GIT_INFO_TTL_MS) {
+    renderCachedFootGit(p, cached);
+    return Promise.resolve(cached);
+  }
+  if (!allowFetch) {
+    const existing = cached || (_footGit.current === p.id ? _footGit.info : null);
+    if (existing) renderCachedFootGit(p, existing);
+    else _footGit.row.hidden = true;
+    return Promise.resolve(existing || null);
+  }
+  // Keep a previous snapshot visible while the debounced request is pending.
+  if (cached) renderCachedFootGit(p, cached);
+  // A fast A -> B -> A selection must attach before A's existing sync can
+  // settle. Waiting for the regular debounce here creates a race where the
+  // first promise finishes, is removed, and the timer starts a duplicate
+  // fetch whose resolver/UI state no longer belongs to the original request.
+  if (_gitInflight.has(p.id)) {
+    return loadFootGit(p, token, { force }).catch(() => null);
+  }
+  return new Promise(resolve => {
+    _gitSelectionCancel = resolve;
+    _gitSelectionTimer = setTimeout(() => {
+      _gitSelectionCancel = null;
+      _gitSelectionTimer = null;
+      void loadFootGit(p, token, { force }).then(resolve, () => resolve(null));
+    }, GIT_SELECTION_DEBOUNCE_MS);
+  });
+}
+
+async function loadFootGit(p, token, { force = false } = {}) {
+  const existing = _gitInflight.get(p.id);
+  if (existing) {
+    const quick = state.gitStatusByProject[p.id];
+    if (quick?.remoteChecked === false
+      && _footGit.current === p.id
+      && token === _gitSelectionToken) {
+      renderCachedFootGit(p, quick);
     }
-    return;
+    try {
+      const info = await existing;
+      if (info) {
+        state.gitStatusByProject[p.id] = info;
+        state.gitStatusAtByProject[p.id] = Date.now();
+      }
+      if (_footGit.current === p.id && token === _gitSelectionToken && info) {
+        renderCachedFootGit(p, info);
+      }
+      return info;
+    } catch (error) {
+      if (_footGit.current === p.id && token === _gitSelectionToken) {
+        renderFootGit({ isRepo: false, remotes: [], error: String(error) });
+      }
+      throw error;
+    }
   }
-  let info;
+  if (_footGit.current !== p.id || token !== _gitSelectionToken) return null;
+  const promise = (async () => {
+    if (p.source === "remote") {
+      const provisional = {
+        isRepo: true,
+        branch: p.gitBranch,
+        remotes: [],
+        headShort: null,
+        headSummary: null,
+        dirty: false,
+        upstream: "remote",
+        ahead: 0,
+        behind: 0,
+        remoteChecked: false,
+        fetchError: null,
+      };
+      // Keep the remote project's provisional identity in the same cache as
+      // local quick snapshots.  A fast A→B→A selection can then repaint
+      // the correct branch while the one in-flight SSH refresh is reused.
+      state.gitStatusByProject[p.id] = provisional;
+      state.gitStatusAtByProject[p.id] = Date.now();
+      if (_footGit.current === p.id && token === _gitSelectionToken) {
+        renderCachedFootGit(p, provisional);
+      }
+      return invoke("refresh_remote_git_info", { serverId: Number(p.remoteServerId), path: p.path });
+    }
+    const info = await invoke("get_git_info", { path: p.path });
+    state.gitStatusByProject[p.id] = info;
+    state.gitStatusAtByProject[p.id] = Date.now();
+    if (_footGit.current === p.id && token === _gitSelectionToken) {
+      renderCachedFootGit(p, info);
+    }
+    if (!info.isRepo || !info.upstream) {
+      return { ...info, remoteChecked: true };
+    }
+    try {
+      const sync = await invoke("refresh_git_sync", { path: p.path });
+      return { ...info, ...sync };
+    } catch (error) {
+      return { ...info, remoteChecked: true, fetchError: String(error) };
+    }
+  })();
+  _gitInflight.set(p.id, promise);
   try {
-    info = await invoke("get_git_info", { path: p.path });
-  } catch (e) {
-    // Backend error → render a soft "unavailable" pill and bail.
-    renderFootGit({ isRepo: false, error: String(e) });
-    return;
-  }
-  _footGit.info = info;
-  state.gitStatusByProject[p.id] = info;
-  renderFootGit(info);
-  try {
-    const refreshed = await invoke("refresh_git_info", { path: p.path });
-    if (_footGit.current !== p.id) return;
-    _footGit.info = refreshed;
-    state.gitStatusByProject[p.id] = refreshed;
-    renderFootGit(refreshed);
-    renderLedger();
+    const info = await promise;
+    state.gitStatusByProject[p.id] = info;
+    state.gitStatusAtByProject[p.id] = Date.now();
+    if (_footGit.current !== p.id || token !== _gitSelectionToken) return info;
+    renderCachedFootGit(p, info);
+    return info;
   } catch (error) {
-    if (_footGit.current !== p.id) return;
-    renderFootGit({ ...info, remoteChecked: true, fetchError: String(error) });
+    if (_footGit.current !== p.id || token !== _gitSelectionToken) throw error;
+    renderFootGit({ isRepo: false, remotes: [], error: String(error) });
+    throw error;
+  } finally {
+    if (_gitInflight.get(p.id) === promise) _gitInflight.delete(p.id);
   }
 }
 
@@ -5053,7 +6145,9 @@ function openAddRemoteForm() {
       await invoke("add_git_remote", { path: p.path, name, url });
       setStatus(tr("status.addedRemote", { name }));
       closeAddRemoteForm();
-      await refreshFootGit();
+      delete state.gitStatusByProject[p.id];
+      delete state.gitStatusAtByProject[p.id];
+      await refreshFootGit({ force: true });
     } catch (err) {
       showActionError(tr("status.addRemoteFailed", { err }));
     }
@@ -5192,7 +6286,9 @@ async function checkoutBranch(name) {
   try {
     await invoke("checkout_branch", { path: p.path, name });
     setStatus(tr("status.switched", { name }));
-    await refreshFootGit();
+    delete state.gitStatusByProject[p.id];
+    delete state.gitStatusAtByProject[p.id];
+    await refreshFootGit({ force: true });
   } catch (e) {
     showActionError(tr("status.checkoutFailed", { err: e }));
   }
@@ -5275,7 +6371,6 @@ function startAutoRefresh() {
       renderMeta(state.all);
       applyFilters();
       if (!state.all.find(p => p.id === prev) && state.filtered.length) select(state.filtered[0].id);
-      else { renderLedger(); }
     } catch (e) { /* silent */ }
   }, 60000);
 }
@@ -5357,6 +6452,23 @@ function setupThemeToggle() {
 
 function escapeHtml(s) { return String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
+// Project IDs come from the index and remain opaque for backwards
+// compatibility. Keep project-keyed state maps free of prototype inheritance
+// so IDs such as "__proto__" and "constructor" behave like ordinary keys.
+function createProjectKeyedMap(source) {
+  const map = Object.create(null);
+  if (!source || typeof source !== "object") return map;
+  for (const [key, value] of Object.entries(source)) map[String(key)] = value;
+  return map;
+}
+
+// Every selector that interpolates a project ID must pass through this helper.
+// CSS.escape protects opaque IDs containing quotes, brackets, slashes, and
+// selector punctuation while preserving exact dataset matching.
+function projectEntrySelector(projectId) {
+  return `.entry[data-id="${CSS.escape(String(projectId))}"]`;
+}
+
 /* ── i18n: static-HTML localization + language switching ──── */
 
 // Walk the static HTML in index.html and apply the current language to any
@@ -5412,7 +6524,7 @@ function applyLocalizedUI() {
   if (!drawer.hidden) { renderDrawerBody(); renderDrawerHead(); }
   renderSelectedLaunchPanel();
   syncOverviewCollapseUI();
-  refreshFootGit();
+  refreshFootGit({ allowFetch: false });
   syncThemeButton();                    // theme button label is translated
 }
 
@@ -5447,7 +6559,7 @@ searchInput.addEventListener("input", e => {
   reloadCoordinator.invalidateSearch();
   reloadCoordinator.invalidateAuto();
   clearTimeout(state.searchTimer);
-  state.searchTimer = setTimeout(reload, 200);
+  state.searchTimer = setTimeout(reload, SEARCH_DEBOUNCE_MS);
 });
 
 // Wire a chip-strip nav: clicking a chip updates `state[key]` from
@@ -5567,6 +6679,7 @@ document.addEventListener("keydown", e => {
   wireTrayEvents();
   wireResize();
   wireEntryMenuDelegation();
+  wireLedgerVirtualization();
   wireDrawerDelegation();
   wireDrawerBackButton();
   wireDrawerForms();
@@ -5591,8 +6704,8 @@ document.addEventListener("keydown", e => {
     }
   }
   if (localIndexReady && !localCatalogLoaded) await reload();
-  if (state.filtered.length) select(state.filtered[0].id);
   loadOpenerPrefs();
+  loadWebDevelopmentTools();
   loadGroups();
   pushLangToTray();            // keep the tray menu's language in sync on startup
   if (localIndexReady) startAutoRefresh();

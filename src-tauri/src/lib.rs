@@ -3,25 +3,24 @@ use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
+use sessionatlas_core::adapter::{
+    adapter_root_for_home, install_manifest_upgrade_file, AdapterRegistry, AdapterSource,
+};
 use sessionatlas_core::config as core_config;
 use sessionatlas_core::content_index::content_match_snippet;
 use sessionatlas_core::indexer::{build_index, IndexedToolScan};
 use sessionatlas_core::path as core_path;
-use sessionatlas_core::scanner::aider::AiderScanner;
-use sessionatlas_core::scanner::claude::ClaudeScanner;
-use sessionatlas_core::scanner::codex::CodexScanner;
-use sessionatlas_core::scanner::custom::CustomToolScanner;
-use sessionatlas_core::scanner::kimi::KimiScanner;
-use sessionatlas_core::scanner::opencode::OpenCodeScanner;
-use sessionatlas_core::scanner::pi::PiScanner;
+use sessionatlas_core::private_fs;
 use sessionatlas_core::scanner::{
-    ScanDiagnostic, ScanDiagnosticSeverity, Scanner, CONFIG_READ_FAILED, UNEXPECTED_SCANNER_FAILURE,
+    build_adapter_scanners, ScanDiagnostic, ScanDiagnosticSeverity, Scanner,
+    UNEXPECTED_SCANNER_FAILURE,
 };
-use sessionatlas_core::store::SqliteStore;
+use sessionatlas_core::store::{content_index_sanitizer_is_current, SqliteStore};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::menu::{IsMenuItem, MenuBuilder, MenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
@@ -33,18 +32,33 @@ mod security;
 mod session_cleanup;
 mod tui_tools;
 
-use process::{git_read_spec, ProcessOutput, ProcessRunner, SystemProcessRunner};
-use pty::{normalize_pty_size, take_once, validate_pty_input, SessionStore, Utf8StreamDecoder};
+use process::{
+    git_read_spec, git_user_operation_spec, output_with_timeout, ProcessOutput, ProcessRunner,
+    SystemProcessRunner, TimeoutProcessRunner,
+};
+use pty::{
+    normalize_pty_size, take_once, validate_pty_input, PtyOutputBatcher, SessionStore,
+    Utf8StreamDecoder, PTY_OUTPUT_BATCH_INTERVAL,
+};
 use security::{
     build_argv_launch_input, is_shell_program, parse_command_template, quote_remote_path,
-    render_shell_command, ssh_destination, tool_launch_argv, validate_cli_argv,
-    validate_display_label, validate_external_url, validate_session_id, validate_ssh_host,
-    validate_ssh_user, validate_tool_key,
+    render_shell_command, ssh_destination, validate_cli_argv, validate_display_label,
+    validate_external_url, validate_session_id, validate_ssh_host, validate_ssh_user,
+    validate_tool_key,
 };
-use tui_tools::{TuiCapability, TuiMachineCapabilities, TUI_CATALOG};
+use tui_tools::{TuiCapability, TuiDefinition, TuiMachineCapabilities};
 
 const HOME_OVERRIDE_ENV: &str = "SESSIONATLAS_HOME";
 const DATA_DIRECTORY: &str = ".sessionatlas";
+const TUI_LOCAL_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const TUI_REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const TUI_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
+const TUI_MUTATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const REMOTE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_CONNECTION_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const REMOTE_SCAN_TIMEOUT: Duration = Duration::from_secs(120);
+const REMOTE_SCAN_MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REMOTE_SCAN_RECORDS: usize = 50_000;
 
 fn resolve_home_directory(
     override_home: Option<&str>,
@@ -90,51 +104,124 @@ fn cli_config_path() -> PathBuf {
     data_path_for_home(&app_home_directory(), "config.json")
 }
 
-#[derive(Deserialize, Default, Debug)]
-struct CliConfigFile {
-    #[serde(rename = "CustomTools", alias = "customTools", default)]
-    custom_tools: Vec<CliToolConfig>,
+fn load_core_config() -> Result<core_config::AppConfig, String> {
+    core_config::load(cli_config_path()).map_err(|error| error.to_string())
 }
 
-#[derive(Deserialize, Debug)]
-struct CliToolConfig {
-    #[serde(rename = "Key", alias = "key")]
-    key: String,
-    #[serde(rename = "CliCommand", alias = "cliCommand")]
-    cli_command: String,
-    #[serde(rename = "IsEnabled", alias = "isEnabled", default = "default_true")]
-    is_enabled: bool,
+fn adapter_root_path() -> PathBuf {
+    adapter_root_for_home(app_home_directory())
 }
 
-fn default_true() -> bool {
-    true
+fn load_adapter_registry(config: &core_config::AppConfig) -> Result<AdapterRegistry, String> {
+    AdapterRegistry::load(&adapter_root_path(), config).map_err(|error| error.to_string())
 }
 
-fn load_cli_config() -> Result<CliConfigFile, String> {
-    let path = cli_config_path();
-    if !path.exists() {
-        return Ok(CliConfigFile::default());
+fn load_adapter_context() -> Result<(core_config::AppConfig, AdapterRegistry), String> {
+    let config = load_core_config()?;
+    let registry = load_adapter_registry(&config)?;
+    Ok((config, registry))
+}
+
+fn adapter_selected(
+    server_id: Option<i64>,
+    config: &core_config::AppConfig,
+    registry: &AdapterRegistry,
+    adapter: &TuiDefinition,
+) -> Result<bool, String> {
+    if server_id.is_none() {
+        return Ok(registry
+            .enabled(config)
+            .any(|candidate| candidate.id.eq_ignore_ascii_case(&adapter.id)));
     }
-    let json = std::fs::read_to_string(&path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    serde_json::from_str(&json)
-        .map_err(|error| format!("invalid CLI config at {}: {error}", path.display()))
+    Ok(tui_preference(server_id, &adapter.id)?.unwrap_or(adapter.source == AdapterSource::Bundled))
 }
 
-fn builtin_tool_key(tool_key: &str) -> Option<&'static str> {
-    ["claude", "codex", "kimi", "opencode", "aider", "pi"]
-        .into_iter()
-        .find(|builtin| builtin.eq_ignore_ascii_case(tool_key))
+fn adapter_probe_selected(
+    server_id: Option<i64>,
+    config: &core_config::AppConfig,
+    registry: &AdapterRegistry,
+    adapter: &TuiDefinition,
+) -> Result<bool, String> {
+    adapter_selected(server_id, config, registry, adapter)
+}
+
+fn write_local_adapter_selection(tool_key: &str, enabled: bool) -> Result<(), String> {
+    let path = cli_config_path();
+    let (_, registry) = load_adapter_context()?;
+    let canonical = registry
+        .find(tool_key)
+        .ok_or_else(|| format!("adapter '{tool_key}' is not installed"))?
+        .id
+        .clone();
+    core_config::update(path, None, |latest| {
+        // Derive the selection from the config snapshot held by the update
+        // lock. Building it from a stale pre-lock read could silently discard
+        // another process's adapter-selection change.
+        let mut selected = selected_adapter_ids(latest, &registry);
+        selected.retain(|id| !id.eq_ignore_ascii_case(&canonical));
+        if enabled {
+            selected.push(canonical.clone());
+        }
+        selected.sort_by_key(|id| {
+            registry
+                .adapters()
+                .iter()
+                .position(|adapter| adapter.id.eq_ignore_ascii_case(id))
+                .unwrap_or(usize::MAX)
+        });
+        latest.enabled_adapters = Some(selected);
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn write_tui_selection(
+    server_id: Option<i64>,
+    tool_key: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    match server_id {
+        None => write_local_adapter_selection(tool_key, enabled),
+        Some(server_id) => write_tui_preference(Some(server_id), tool_key, enabled),
+    }
+}
+
+fn probe_with_selection_rollback<F>(
+    probe: Result<TuiMachineCapabilities, String>,
+    prior_enabled: bool,
+    restore: F,
+) -> Result<TuiMachineCapabilities, String>
+where
+    F: FnOnce(bool) -> Result<(), String>,
+{
+    match probe {
+        Ok(capabilities) => Ok(capabilities),
+        Err(error) => {
+            let _ = restore(prior_enabled);
+            Err(error)
+        }
+    }
 }
 
 fn resolve_tool_launch_argv_from_config(
     tool_key: &str,
     session_id: Option<&str>,
-    config: &CliConfigFile,
+    config: &core_config::AppConfig,
+    registry: &AdapterRegistry,
 ) -> Result<Vec<String>, String> {
     let tool_key = validate_tool_key(tool_key)?;
-    if let Some(builtin) = builtin_tool_key(tool_key) {
-        return tool_launch_argv(builtin, session_id);
+    if let Some(adapter) = registry.find(tool_key) {
+        let selected = registry
+            .enabled(config)
+            .any(|candidate| candidate.id.eq_ignore_ascii_case(tool_key));
+        if !selected {
+            return Err(format!("adapter '{tool_key}' is disabled"));
+        }
+        let argv = adapter
+            .launch_argv(session_id)
+            .map_err(|error| error.to_string())?;
+        validate_cli_argv(&argv)?;
+        return Ok(argv);
     }
 
     let configured = config
@@ -155,11 +242,9 @@ fn resolve_configured_tool_launch_argv(
     tool_key: &str,
     session_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    if let Some(builtin) = builtin_tool_key(tool_key) {
-        return tool_launch_argv(builtin, session_id);
-    }
-    let config = load_cli_config()?;
-    resolve_tool_launch_argv_from_config(tool_key, session_id, &config)
+    let config = load_core_config()?;
+    let registry = load_adapter_registry(&config)?;
+    resolve_tool_launch_argv_from_config(tool_key, session_id, &config, &registry)
 }
 
 #[derive(Serialize, Clone)]
@@ -320,6 +405,58 @@ fn summarize_remote_scan_outcomes(
     }
 }
 
+/// Run independent remote jobs with a hard worker bound. Jobs are assigned to
+/// stable round-robin buckets and results are sorted by server id, so SSH
+/// completion order cannot affect the snapshot or the settings UI.
+fn run_bounded_remote_jobs<T, F>(
+    ids: Vec<i64>,
+    max_workers: usize,
+    job: F,
+) -> Vec<(i64, Result<T, String>)>
+where
+    T: Send,
+    F: Fn(i64) -> Result<T, String> + Sync,
+{
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let worker_count = max_workers.max(1).min(ids.len());
+    let mut worker_ids = vec![Vec::new(); worker_count];
+    for (index, id) in ids.iter().copied().enumerate() {
+        worker_ids[index % worker_count].push(id);
+    }
+
+    let mut outcomes = Vec::with_capacity(ids.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = worker_ids
+            .into_iter()
+            .filter(|ids| !ids.is_empty())
+            .map(|worker_ids| {
+                let ids_for_error = worker_ids.clone();
+                let handle = scope.spawn(|| {
+                    worker_ids
+                        .into_iter()
+                        .map(|id| (id, job(id)))
+                        .collect::<Vec<_>>()
+                });
+                (ids_for_error, handle)
+            })
+            .collect();
+        for (worker_ids, handle) in handles {
+            match handle.join() {
+                Ok(chunk_outcomes) => outcomes.extend(chunk_outcomes),
+                Err(_) => outcomes.extend(
+                    worker_ids
+                        .into_iter()
+                        .map(|id| (id, Err("remote scan worker panicked".to_string()))),
+                ),
+            }
+        }
+    });
+    outcomes.sort_by_key(|(id, _)| *id);
+    outcomes
+}
+
 /// A project discovered on a remote server via `scan_remote_server`.
 /// Same camelCase shape as `Project` (so the frontend can merge into
 /// `state.all` without conditional rendering), plus `source` and
@@ -384,6 +521,18 @@ fn open_index_reader(path: &std::path::Path) -> Result<Connection, String> {
             path.display()
         ));
     }
+    if let Some(parent) = path.parent() {
+        private_fs::ensure_private_directory(parent).map_err(|error| {
+            format!(
+                "could not protect index directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    private_fs::harden_existing_private_file(path)
+        .map_err(|error| format!("could not protect index {}: {error}", path.display()))?;
+    private_fs::harden_sqlite_sidecars(path)
+        .map_err(|error| format!("could not protect index sidecars: {error}"))?;
     let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("could not open read-only index {}: {e}", path.display()))?;
     c.pragma_update(None, "query_only", "ON")
@@ -429,6 +578,20 @@ pub struct OpenerPref {
     #[serde(rename = "command")]
     command: String,
     #[serde(rename = "enabled")]
+    enabled: bool,
+    #[serde(rename = "sortOrder")]
+    sort_order: i64,
+}
+
+/// A browser-based development tool such as DSH. Unlike a TUI adapter this
+/// has no local executable to probe or install: it is an explicitly named,
+/// user-configured HTTP(S) endpoint opened in the sandboxed in-app web tab.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct WebDevelopmentTool {
+    id: i64,
+    label: String,
+    #[serde(rename = "connectionUrl")]
+    connection_url: String,
     enabled: bool,
     #[serde(rename = "sortOrder")]
     sort_order: i64,
@@ -481,9 +644,7 @@ fn ensure_remote_server_metadata(connection: &Connection) -> Result<(), String> 
 
 fn open_prefs_db() -> Result<Connection, String> {
     let path = prefs_db_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+    private_fs::prepare_private_database(&path).map_err(|e| e.to_string())?;
     let c = Connection::open(&path).map_err(|e| e.to_string())?;
     configure_prefs_connection(&c)?;
     c.execute_batch(
@@ -503,6 +664,18 @@ fn open_prefs_db() -> Result<Connection, String> {
          VALUES ('builtin','vscode',  'VSCode',  'code {path}',       1, 10),
                 ('builtin','finder',  'Explorer','explorer {path}',   1, 20),
                 ('builtin','terminal','Terminal','wt -d {path}',      0, 30);
+
+         CREATE TABLE IF NOT EXISTS web_development_tools (
+             id             INTEGER PRIMARY KEY AUTOINCREMENT,
+             label          TEXT    NOT NULL,
+             connection_url TEXT    NOT NULL,
+             enabled        INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+             sort_order     INTEGER NOT NULL DEFAULT 0,
+             created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+             updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+         );
+         CREATE INDEX IF NOT EXISTS idx_web_development_tools_sort
+             ON web_development_tools(sort_order, id);
 
          CREATE TABLE IF NOT EXISTS project_groups (
              id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -615,6 +788,8 @@ fn open_prefs_db() -> Result<Connection, String> {
          );"
     ).map_err(|e| e.to_string())?;
     ensure_remote_server_metadata(&c)?;
+    private_fs::harden_existing_private_file(&path).map_err(|e| e.to_string())?;
+    private_fs::harden_sqlite_sidecars(&path).map_err(|e| e.to_string())?;
     Ok(c)
 }
 
@@ -667,6 +842,16 @@ fn row_to_opener(r: &rusqlite::Row) -> rusqlite::Result<OpenerPref> {
         command: r.get(4)?,
         enabled: r.get::<_, i64>(5)? != 0,
         sort_order: r.get(6)?,
+    })
+}
+
+fn row_to_web_development_tool(row: &rusqlite::Row) -> rusqlite::Result<WebDevelopmentTool> {
+    Ok(WebDevelopmentTool {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        connection_url: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        sort_order: row.get(4)?,
     })
 }
 
@@ -1104,6 +1289,9 @@ fn search_projects_in_connection(
 }
 
 fn content_index_available(connection: &Connection) -> Result<bool, String> {
+    if !content_index_sanitizer_is_current(connection).map_err(|error| error.to_string())? {
+        return Ok(false);
+    }
     let count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
@@ -1228,42 +1416,9 @@ fn local_index_exists() -> bool {
     local_index_exists_at(&db_path())
 }
 
-/// Builds the canonical scanner set for the config file at `config_path`: the
-/// six built-in scanners in canonical registration order (Claude, Kimi, Codex,
-/// OpenCode, Aider, Pi), then each enabled custom tool whose key does not collide
-/// with a built-in (case-insensitive). When the config cannot be read or
-/// parsed, built-ins remain available and a `config_read_failed` warning is
-/// returned, matching `commands::scan::build_default_scanners`.
+/// Builds the same adapter-driven scanner set used by the CLI.
 fn build_scan_scanners(config_path: &Path) -> (Vec<Box<dyn Scanner>>, Vec<ScanDiagnostic>) {
-    let mut scanners: Vec<Box<dyn Scanner>> = vec![
-        Box::new(ClaudeScanner::new()),
-        Box::new(KimiScanner::new()),
-        Box::new(CodexScanner::new()),
-        Box::new(OpenCodeScanner::new()),
-        Box::new(AiderScanner::new()),
-        Box::new(PiScanner::new()),
-    ];
-    let mut diagnostics = Vec::new();
-    match core_config::load(config_path) {
-        Ok(config) => {
-            for tool in config.custom_tools.iter().filter(|tool| tool.is_enabled) {
-                if scanners
-                    .iter()
-                    .any(|scanner| scanner.tool_key().eq_ignore_ascii_case(&tool.key))
-                {
-                    continue;
-                }
-                scanners.push(Box::new(CustomToolScanner::new(tool.clone())));
-            }
-        }
-        Err(_) => diagnostics.push(ScanDiagnostic::new(
-            "config",
-            ScanDiagnosticSeverity::Warning,
-            CONFIG_READ_FAILED,
-            "The custom-tool configuration could not be read; built-in scanners remain available.",
-        )),
-    }
-    (scanners, diagnostics)
+    build_adapter_scanners(config_path)
 }
 
 /// Runs the configured local scan in-process, mirroring the CLI's
@@ -1624,6 +1779,153 @@ fn delete_custom_opener(pref_id: i64) -> Result<(), String> {
     })
 }
 
+const MAX_WEB_DEVELOPMENT_TOOLS: i64 = 64;
+
+#[tauri::command]
+fn list_web_development_tools() -> Result<Vec<WebDevelopmentTool>, String> {
+    with_prefs(list_web_development_tools_db)
+}
+
+fn list_web_development_tools_db(
+    connection: &Connection,
+) -> Result<Vec<WebDevelopmentTool>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, label, connection_url, enabled, sort_order
+             FROM web_development_tools
+             ORDER BY sort_order ASC, id ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], row_to_web_development_tool)
+        .map_err(|error| error.to_string())?;
+    collect_query_rows(rows, "list_web_development_tools")
+}
+
+#[tauri::command]
+fn upsert_web_development_tool(
+    tool_id: Option<i64>,
+    label: String,
+    connection_url: String,
+    enabled: bool,
+) -> Result<WebDevelopmentTool, String> {
+    with_prefs(|connection| {
+        upsert_web_development_tool_db(connection, tool_id, &label, &connection_url, enabled)
+    })
+}
+
+fn upsert_web_development_tool_db(
+    connection: &Connection,
+    tool_id: Option<i64>,
+    label: &str,
+    connection_url: &str,
+    enabled: bool,
+) -> Result<WebDevelopmentTool, String> {
+    let label = validate_display_label(label)?.to_string();
+    let connection_url = validate_external_url(connection_url)?;
+    let id = if let Some(tool_id) = tool_id {
+        if tool_id <= 0 {
+            return Err("invalid web development tool id".to_string());
+        }
+        let changed = connection
+            .execute(
+                "UPDATE web_development_tools
+                 SET label = ?1, connection_url = ?2, enabled = ?3,
+                     updated_at = datetime('now')
+                 WHERE id = ?4",
+                params![label, connection_url, i64::from(enabled), tool_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err(format!("web development tool not found: {tool_id}"));
+        }
+        tool_id
+    } else {
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM web_development_tools", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        if count >= MAX_WEB_DEVELOPMENT_TOOLS {
+            return Err(format!(
+                "at most {MAX_WEB_DEVELOPMENT_TOOLS} web development tools can be configured"
+            ));
+        }
+        let next_sort_order: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM web_development_tools",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO web_development_tools
+                    (label, connection_url, enabled, sort_order)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![label, connection_url, i64::from(enabled), next_sort_order],
+            )
+            .map_err(|error| error.to_string())?;
+        connection.last_insert_rowid()
+    };
+
+    connection
+        .query_row(
+            "SELECT id, label, connection_url, enabled, sort_order
+             FROM web_development_tools WHERE id = ?1",
+            params![id],
+            row_to_web_development_tool,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_web_development_tool_enabled(tool_id: i64, enabled: bool) -> Result<(), String> {
+    with_prefs(|connection| set_web_development_tool_enabled_db(connection, tool_id, enabled))
+}
+
+fn set_web_development_tool_enabled_db(
+    connection: &Connection,
+    tool_id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    if tool_id <= 0 {
+        return Err("invalid web development tool id".to_string());
+    }
+    let changed = connection
+        .execute(
+            "UPDATE web_development_tools
+             SET enabled = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![i64::from(enabled), tool_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("web development tool not found: {tool_id}"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_web_development_tool(tool_id: i64) -> Result<(), String> {
+    with_prefs(|connection| delete_web_development_tool_db(connection, tool_id))
+}
+
+fn delete_web_development_tool_db(connection: &Connection, tool_id: i64) -> Result<(), String> {
+    if tool_id <= 0 {
+        return Err("invalid web development tool id".to_string());
+    }
+    let changed = connection
+        .execute(
+            "DELETE FROM web_development_tools WHERE id = ?1",
+            params![tool_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("web development tool not found: {tool_id}"));
+    }
+    Ok(())
+}
+
 /// Resolve a builtin opener by key — VSCode / file manager / terminal —
 /// platform-specific argv so paths with spaces are safe. The persisted
 /// `command_template` is shown in the settings drawer for transparency
@@ -1857,6 +2159,11 @@ struct PtyExit {
     exit_code: Option<u32>,
     #[serde(rename = "readError")]
     read_error: bool,
+}
+
+enum PtyOutputMessage {
+    Data(Vec<u8>),
+    Done(bool),
 }
 
 fn local_shell_command(path: &str) -> CommandBuilder {
@@ -2335,20 +2642,82 @@ fn pty_attach(
         return Err(error);
     }
     let sessions = state.sessions.clone();
+    // The reader is deliberately decoupled from the emitter. A bounded
+    // channel applies backpressure, while the output thread owns the UTF-8
+    // decoder and batcher exclusively. When a batch has a pending tail it
+    // waits at most 16ms; with no pending tail it blocks with zero polling.
+    let (output_tx, output_rx) = mpsc::sync_channel::<PtyOutputMessage>(32);
+    let output_app = app.clone();
+    let output_thread = std::thread::Builder::new()
+        .name(format!("pty-output-{id}"))
+        .spawn(move || {
+            let mut decoder = Utf8StreamDecoder::new();
+            let mut batcher = PtyOutputBatcher::new(Instant::now());
+            let mut read_error = false;
+            loop {
+                let message = if batcher.has_pending() {
+                    match output_rx.recv_timeout(PTY_OUTPUT_BATCH_INTERVAL) {
+                        Ok(message) => Some(message),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Some(data) = batcher.flush_if_due(Instant::now()) {
+                                let _ = output_app.emit("pty-data", PtyData { id, data });
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+                    }
+                } else {
+                    output_rx.recv().ok()
+                };
+                match message {
+                    Some(PtyOutputMessage::Data(bytes)) => {
+                        let chunk = decoder.push(&bytes);
+                        for data in batcher.push(&chunk, Instant::now()) {
+                            let _ = output_app.emit("pty-data", PtyData { id, data });
+                        }
+                    }
+                    Some(PtyOutputMessage::Done(error)) => {
+                        read_error = error;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            let final_chunk = decoder.finish();
+            for data in batcher.push(&final_chunk, Instant::now()) {
+                let _ = output_app.emit("pty-data", PtyData { id, data });
+            }
+            if let Some(data) = batcher.flush(Instant::now()) {
+                let _ = output_app.emit("pty-data", PtyData { id, data });
+            }
+            let exit_code = finish_pty_session(&sessions, id, read_error);
+            let _ = output_app.emit(
+                "pty-exit",
+                PtyExit {
+                    id,
+                    exit_code,
+                    read_error,
+                },
+            );
+        });
+    if let Err(error) = output_thread {
+        finish_pty_session(&state.sessions, id, true);
+        return Err(format!("failed to start PTY output thread: {error}"));
+    }
     let reader_thread = std::thread::Builder::new()
         .name(format!("pty-reader-{id}"))
         .spawn(move || {
             let mut buf = [0u8; 8192];
-            let mut decoder = Utf8StreamDecoder::new();
             let mut read_error = false;
-
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let chunk = decoder.push(&buf[..n]);
-                        if !chunk.is_empty() {
-                            let _ = app.emit("pty-data", PtyData { id, data: chunk });
+                        if output_tx
+                            .send(PtyOutputMessage::Data(buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            return;
                         }
                     }
                     Err(_) => {
@@ -2357,28 +2726,8 @@ fn pty_attach(
                     }
                 }
             }
-
-            let final_chunk = decoder.finish();
-            if !final_chunk.is_empty() {
-                let _ = app.emit(
-                    "pty-data",
-                    PtyData {
-                        id,
-                        data: final_chunk,
-                    },
-                );
-            }
+            let _ = output_tx.send(PtyOutputMessage::Done(read_error));
             drop(reader);
-
-            let exit_code = finish_pty_session(&sessions, id, read_error);
-            let _ = app.emit(
-                "pty-exit",
-                PtyExit {
-                    id,
-                    exit_code,
-                    read_error,
-                },
-            );
         });
 
     if let Err(error) = reader_thread {
@@ -3429,38 +3778,141 @@ fn safe_process_detail(output: &ProcessOutput) -> String {
     detail.trim().to_string()
 }
 
-fn make_tui_capability(
+fn adapter_support_error(
+    definition: &tui_tools::TuiDefinition,
+    is_remote: bool,
+    os_family: &str,
+) -> Option<String> {
+    if is_remote && !definition.supports_remote {
+        return Some("this adapter does not support remote machines".to_string());
+    }
+    let platform = normalize_os_family(os_family);
+    if !matches!(platform, "windows" | "macos" | "linux") {
+        return Some(format!("unsupported or unknown machine OS: {os_family}"));
+    }
+    if !definition.supports_platform(platform) {
+        return Some(format!("this adapter does not support {platform}"));
+    }
+    None
+}
+
+fn ensure_adapter_supports_machine(
+    definition: &tui_tools::TuiDefinition,
     server_id: Option<i64>,
+) -> Result<(), String> {
+    let (is_remote, os_family) = match server_id {
+        None => (false, std::env::consts::OS.to_string()),
+        Some(server_id) => (true, load_remote_server(server_id)?.os_family),
+    };
+    adapter_support_error(definition, is_remote, &os_family)
+        .map_or(Ok(()), |error| Err(format!("{}: {error}", definition.name)))
+}
+
+fn make_tui_capability(
     definition: &tui_tools::TuiDefinition,
     detected: tui_tools::DetectedTui,
+    adapter_enabled: bool,
     install_available: bool,
-) -> Result<TuiCapability, String> {
-    let enabled = detected.installed && tui_preference(server_id, definition.key)?.unwrap_or(true);
-    Ok(TuiCapability {
-        tool_key: definition.key.to_string(),
-        tool_name: definition.name.to_string(),
+    support_error: Option<String>,
+) -> TuiCapability {
+    let supported = support_error.is_none();
+    let enabled = supported && detected.installed && adapter_enabled;
+    TuiCapability {
+        tool_key: definition.id.clone(),
+        tool_name: definition.name.clone(),
         installed: detected.installed,
         version: detected.version,
+        supported,
+        support_error,
         enabled,
+        adapter_enabled,
+        adapter_version: definition.adapter_version.clone(),
+        adapter_source: definition.source,
+        adapter_newest_version: definition.newest_version.clone(),
+        adapter_update_available: definition.update_available(),
+        adapter_rollback_version: definition.rollback_version.clone(),
         install_available,
-        install_manager: definition.manager.to_string(),
-    })
+        install_manager: definition.manager.clone().unwrap_or_default(),
+        install_package: definition.package.clone().unwrap_or_default(),
+        latest_version: None,
+        update_checked: false,
+        update_available: false,
+        update_check_error: None,
+    }
+}
+
+fn apply_tui_update_check(capability: &mut TuiCapability, check: tui_tools::TuiUpdateCheck) {
+    capability.update_checked = true;
+    capability.latest_version = check.latest_version;
+    capability.update_check_error = check.error;
+    capability.update_available = false;
+    if capability.update_check_error.is_some() {
+        return;
+    }
+    let (Some(installed), Some(latest)) = (
+        capability.version.as_deref(),
+        capability.latest_version.as_deref(),
+    ) else {
+        capability.update_check_error = Some("installed version could not be compared".to_string());
+        return;
+    };
+    match tui_tools::update_is_available(installed, latest) {
+        Ok(available) => capability.update_available = available,
+        Err(error) => capability.update_check_error = Some(error),
+    }
+}
+
+fn preserve_tui_update_metadata(
+    refreshed: &mut TuiMachineCapabilities,
+    checked: &TuiMachineCapabilities,
+) {
+    for capability in &mut refreshed.tools {
+        let Some(previous) = checked
+            .tools
+            .iter()
+            .find(|item| item.tool_key == capability.tool_key && item.update_checked)
+        else {
+            continue;
+        };
+        apply_tui_update_check(
+            capability,
+            tui_tools::TuiUpdateCheck {
+                latest_version: previous.latest_version.clone(),
+                error: previous.update_check_error.clone(),
+            },
+        );
+    }
 }
 
 fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, String> {
+    let (config, registry) = load_adapter_context()?;
+    let catalog = registry.adapters().to_vec();
     match server_id {
         None => {
-            let runner = SystemProcessRunner;
-            let tools = TUI_CATALOG
+            let runner = TimeoutProcessRunner::new(TUI_LOCAL_PROBE_TIMEOUT);
+            let tools = catalog
                 .iter()
                 .map(|definition| {
-                    let detected = tui_tools::detect_local(definition, &runner);
-                    make_tui_capability(
-                        None,
+                    let support_error =
+                        adapter_support_error(definition, false, std::env::consts::OS);
+                    let probe_selected =
+                        adapter_probe_selected(None, &config, &registry, definition)?;
+                    let detected = if support_error.is_none() && probe_selected {
+                        tui_tools::detect_local(definition, &runner)
+                    } else {
+                        tui_tools::DetectedTui {
+                            installed: false,
+                            version: None,
+                        }
+                    };
+                    Ok::<TuiCapability, String>(make_tui_capability(
                         definition,
                         detected,
-                        tui_tools::local_manager_path(definition).is_some(),
-                    )
+                        adapter_selected(None, &config, &registry, definition)?,
+                        support_error.is_none()
+                            && tui_tools::local_manager_path(definition).is_some(),
+                        support_error,
+                    ))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(TuiMachineCapabilities {
@@ -3468,18 +3920,33 @@ fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, S
                 server_id: None,
                 label: "Local".to_string(),
                 tools,
+                adapter_diagnostics: registry.diagnostics().to_vec(),
             })
         }
         Some(server_id) => {
             let server = load_remote_server(server_id)?;
+            let probe_catalog = catalog
+                .iter()
+                .filter(|definition| {
+                    adapter_support_error(definition, true, &server.os_family).is_none()
+                })
+                .map(|definition| {
+                    adapter_probe_selected(Some(server_id), &config, &registry, definition)
+                        .map(|selected| selected.then(|| definition.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let remote_command = tui_tools::remote_probe_script(&probe_catalog)?;
             let command = build_ssh_command(
                 &server.user,
                 &server.host,
                 u16::try_from(server.port).map_err(|_| "invalid SSH port".to_string())?,
                 server.identity_file.as_deref(),
-                tui_tools::remote_probe_script(),
+                &remote_command,
             )?;
-            let output = SystemProcessRunner
+            let output = TimeoutProcessRunner::new(TUI_REMOTE_PROBE_TIMEOUT)
                 .output(&command)
                 .map_err(|error| format!("could not start SSH capability probe: {error}"))?;
             if !output.success {
@@ -3490,23 +3957,34 @@ fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, S
                     &String::from_utf8_lossy(&output.stderr),
                 ));
             }
-            let (detected, managers) =
-                tui_tools::parse_remote_probe(&String::from_utf8_lossy(&output.stdout));
-            let tools = TUI_CATALOG
+            let (detected, managers) = tui_tools::parse_remote_probe(
+                &probe_catalog,
+                &String::from_utf8_lossy(&output.stdout),
+            );
+            tui_tools::validate_remote_probe(&probe_catalog, &detected, &managers)?;
+            let tools = catalog
                 .iter()
                 .map(|definition| {
-                    make_tui_capability(
-                        Some(server_id),
+                    let support_error = adapter_support_error(definition, true, &server.os_family);
+                    Ok::<TuiCapability, String>(make_tui_capability(
                         definition,
                         detected
-                            .get(definition.key)
+                            .get(&definition.id)
                             .cloned()
                             .unwrap_or(tui_tools::DetectedTui {
                                 installed: false,
                                 version: None,
                             }),
-                        managers.get(definition.manager).copied().unwrap_or(false),
-                    )
+                        adapter_selected(Some(server_id), &config, &registry, definition)?,
+                        support_error.is_none()
+                            && definition
+                                .manager
+                                .as_deref()
+                                .and_then(|manager| managers.get(manager))
+                                .copied()
+                                .unwrap_or(false),
+                        support_error,
+                    ))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(TuiMachineCapabilities {
@@ -3514,9 +3992,81 @@ fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, S
                 server_id: Some(server_id),
                 label: server.label,
                 tools,
+                adapter_diagnostics: Vec::new(),
             })
         }
     }
+}
+
+fn check_tui_machine_updates(server_id: Option<i64>) -> Result<TuiMachineCapabilities, String> {
+    let mut capabilities = probe_tui_machine(server_id)?;
+    let (_, registry) = load_adapter_context()?;
+    let catalog = registry.adapters().to_vec();
+    match server_id {
+        None => {
+            let runner = TimeoutProcessRunner::new(TUI_UPDATE_CHECK_TIMEOUT);
+            for capability in capabilities
+                .tools
+                .iter_mut()
+                .filter(|capability| capability.installed)
+            {
+                let definition = tui_tools::definition(&catalog, &capability.tool_key)?;
+                apply_tui_update_check(
+                    capability,
+                    tui_tools::run_local_update_check(definition, &runner),
+                );
+            }
+        }
+        Some(server_id) => {
+            let installed_keys = capabilities
+                .tools
+                .iter()
+                .filter(|capability| capability.installed)
+                .map(|capability| capability.tool_key.clone())
+                .collect::<Vec<_>>();
+            if installed_keys.is_empty() {
+                return Ok(capabilities);
+            }
+            let server = load_remote_server(server_id)?;
+            let remote_command = tui_tools::remote_update_check_script(&catalog, &installed_keys)?;
+            let command = build_ssh_command(
+                &server.user,
+                &server.host,
+                u16::try_from(server.port).map_err(|_| "invalid SSH port".to_string())?,
+                server.identity_file.as_deref(),
+                &remote_command,
+            )?;
+            let output = TimeoutProcessRunner::new(TUI_UPDATE_CHECK_TIMEOUT)
+                .output(&command)
+                .map_err(|error| format!("could not start SSH update check: {error}"))?;
+            if !output.success {
+                return Err(classify_ssh_failure(
+                    &server.user,
+                    &server.host,
+                    u16::try_from(server.port).unwrap_or(22),
+                    &String::from_utf8_lossy(&output.stderr),
+                ));
+            }
+            let mut checks = tui_tools::parse_remote_update_checks(
+                &catalog,
+                &String::from_utf8_lossy(&output.stdout),
+            );
+            for capability in capabilities
+                .tools
+                .iter_mut()
+                .filter(|capability| capability.installed)
+            {
+                let check = checks.remove(&capability.tool_key).unwrap_or_else(|| {
+                    tui_tools::TuiUpdateCheck {
+                        latest_version: None,
+                        error: Some("remote update check returned no result".to_string()),
+                    }
+                });
+                apply_tui_update_check(capability, check);
+            }
+        }
+    }
+    Ok(capabilities)
 }
 
 #[tauri::command]
@@ -3527,27 +4077,63 @@ async fn probe_tui_capabilities(server_id: Option<i64>) -> Result<TuiMachineCapa
 }
 
 #[tauri::command]
+async fn check_tui_updates(server_id: Option<i64>) -> Result<TuiMachineCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || check_tui_machine_updates(server_id))
+        .await
+        .map_err(|error| format!("TUI update-check worker panicked: {error}"))?
+}
+
+#[tauri::command]
 async fn set_tui_enabled(
     server_id: Option<i64>,
     tool_key: String,
     enabled: bool,
 ) -> Result<TuiMachineCapabilities, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let definition = tui_tools::definition(&tool_key)?;
-        let capabilities = probe_tui_machine(server_id)?;
-        let installed = capabilities
-            .tools
-            .iter()
-            .find(|tool| tool.tool_key == definition.key)
-            .is_some_and(|tool| tool.installed);
-        if enabled && !installed {
+        let (config, registry) = load_adapter_context()?;
+        let definition = registry
+            .find(&tool_key)
+            .cloned()
+            .ok_or_else(|| format!("adapter '{tool_key}' is not installed"))?;
+        ensure_adapter_supports_machine(&definition, server_id)?;
+        let prior_enabled = adapter_selected(server_id, &config, &registry, &definition)?;
+        if enabled && server_id.is_none() && !tui_tools::local_command_available(&definition) {
             return Err(format!(
-                "{} is not installed on this machine and cannot be enabled",
+                "{} is not installed on this machine; install it before enabling it",
                 definition.name
             ));
         }
-        write_tui_preference(server_id, definition.key, enabled)?;
-        probe_tui_machine(server_id)
+        write_tui_selection(server_id, &definition.id, enabled)?;
+        let mut capabilities = probe_with_selection_rollback(
+            probe_tui_machine(server_id),
+            prior_enabled,
+            |selection| write_tui_selection(server_id, &definition.id, selection),
+        )?;
+        let Some(capability) = capabilities
+            .tools
+            .iter_mut()
+            .find(|item| item.tool_key == definition.id)
+        else {
+            let _ = write_tui_selection(server_id, &definition.id, prior_enabled);
+            return Err(format!(
+                "{} is not supported on this machine",
+                definition.name
+            ));
+        };
+        if enabled && !capability.supported {
+            let _ = write_tui_selection(server_id, &definition.id, prior_enabled);
+            return Err(capability.support_error.clone().unwrap_or_else(|| {
+                format!("{} is not supported on this machine", definition.name)
+            }));
+        }
+        if enabled && !capability.installed {
+            let _ = write_tui_selection(server_id, &definition.id, prior_enabled);
+            return Err(format!(
+                "{} is not installed on this machine; install it before enabling it",
+                definition.name
+            ));
+        }
+        Ok(capabilities)
     })
     .await
     .map_err(|error| format!("TUI preference worker panicked: {error}"))?
@@ -3559,12 +4145,21 @@ async fn install_tui(
     tool_key: String,
 ) -> Result<TuiMachineCapabilities, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let definition = tui_tools::definition(&tool_key)?;
+        let (config, registry) = load_adapter_context()?;
+        let definition = registry
+            .find(&tool_key)
+            .cloned()
+            .ok_or_else(|| format!("adapter '{tool_key}' is not installed"))?;
+        ensure_adapter_supports_machine(&definition, server_id)?;
+        let prior_enabled = adapter_selected(server_id, &config, &registry, &definition)?;
         match server_id {
-            None => tui_tools::run_local_install(definition, &SystemProcessRunner)?,
+            None => tui_tools::run_local_install(
+                &definition,
+                &TimeoutProcessRunner::new(TUI_MUTATION_TIMEOUT),
+            )?,
             Some(server_id) => {
                 let server = load_remote_server(server_id)?;
-                let remote_command = tui_tools::remote_install_script(definition)?;
+                let remote_command = tui_tools::remote_install_script(&definition)?;
                 let command = build_ssh_command(
                     &server.user,
                     &server.host,
@@ -3572,7 +4167,7 @@ async fn install_tui(
                     server.identity_file.as_deref(),
                     &remote_command,
                 )?;
-                let output = SystemProcessRunner.output(&command)?;
+                let output = TimeoutProcessRunner::new(TUI_MUTATION_TIMEOUT).output(&command)?;
                 if !output.success {
                     return Err(format!(
                         "could not install {} on {}: {}",
@@ -3583,36 +4178,225 @@ async fn install_tui(
                 }
             }
         }
-        let capabilities = probe_tui_machine(server_id)?;
+        write_tui_selection(server_id, &definition.id, true)?;
+        let capabilities = probe_with_selection_rollback(
+            probe_tui_machine(server_id),
+            prior_enabled,
+            |selection| write_tui_selection(server_id, &definition.id, selection),
+        )?;
         let installed = capabilities
             .tools
             .iter()
-            .find(|tool| tool.tool_key == definition.key)
+            .find(|tool| tool.tool_key == definition.id)
             .is_some_and(|tool| tool.installed);
         if !installed {
+            let _ = write_tui_selection(server_id, &definition.id, prior_enabled);
             return Err(format!(
                 "{} installer finished, but the command is still not available on PATH",
                 definition.name
             ));
         }
-        write_tui_preference(server_id, definition.key, true)?;
-        probe_tui_machine(server_id)
+        Ok(capabilities)
     })
     .await
     .map_err(|error| format!("TUI install worker panicked: {error}"))?
 }
 
+#[tauri::command]
+async fn upgrade_tui(
+    server_id: Option<i64>,
+    tool_key: String,
+) -> Result<TuiMachineCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, registry) = load_adapter_context()?;
+        let definition = registry
+            .find(&tool_key)
+            .cloned()
+            .ok_or_else(|| format!("adapter '{tool_key}' is not installed"))?;
+        ensure_adapter_supports_machine(&definition, server_id)?;
+        let checked = check_tui_machine_updates(server_id)?;
+        let capability = checked
+            .tools
+            .iter()
+            .find(|tool| tool.tool_key == definition.id)
+            .ok_or_else(|| format!("{} capability was not detected", definition.name))?;
+        if !capability.installed {
+            return Err(format!(
+                "{} is not installed on this machine and cannot be upgraded",
+                definition.name
+            ));
+        }
+        if let Some(error) = &capability.update_check_error {
+            return Err(format!(
+                "could not verify an update for {}: {error}",
+                definition.name
+            ));
+        }
+        if !capability.update_available {
+            return Err(format!("{} is already up to date", definition.name));
+        }
+        if !capability.install_available {
+            return Err(format!(
+                "{} is required to upgrade {}",
+                definition.manager.as_deref().unwrap_or("package manager"),
+                definition.name
+            ));
+        }
+        let expected_latest = capability
+            .latest_version
+            .clone()
+            .ok_or_else(|| "latest version is unavailable".to_string())?;
+
+        match server_id {
+            None => tui_tools::run_local_upgrade(
+                &definition,
+                &TimeoutProcessRunner::new(TUI_MUTATION_TIMEOUT),
+            )?,
+            Some(server_id) => {
+                let server = load_remote_server(server_id)?;
+                let remote_command = tui_tools::remote_upgrade_script(&definition)?;
+                let command = build_ssh_command(
+                    &server.user,
+                    &server.host,
+                    u16::try_from(server.port).map_err(|_| "invalid SSH port".to_string())?,
+                    server.identity_file.as_deref(),
+                    &remote_command,
+                )?;
+                let output = TimeoutProcessRunner::new(TUI_MUTATION_TIMEOUT).output(&command)?;
+                if !output.success {
+                    return Err(format!(
+                        "could not upgrade {} on {}: {}",
+                        definition.name,
+                        server.label,
+                        safe_process_detail(&output)
+                    ));
+                }
+            }
+        }
+
+        let mut refreshed = probe_tui_machine(server_id)?;
+        let installed_version = refreshed
+            .tools
+            .iter()
+            .find(|tool| tool.tool_key == definition.id)
+            .and_then(|tool| tool.version.as_deref())
+            .ok_or_else(|| {
+                format!(
+                    "{} upgrader finished, but the command version is unavailable on PATH",
+                    definition.name
+                )
+            })?;
+        if tui_tools::update_is_available(installed_version, &expected_latest)? {
+            return Err(format!(
+                "{} upgrader finished, but PATH still reports {} instead of {}",
+                definition.name, installed_version, expected_latest
+            ));
+        }
+        preserve_tui_update_metadata(&mut refreshed, &checked);
+        Ok(refreshed)
+    })
+    .await
+    .map_err(|error| format!("TUI upgrade worker panicked: {error}"))?
+}
+
+fn selected_adapter_ids(
+    config: &core_config::AppConfig,
+    registry: &AdapterRegistry,
+) -> Vec<String> {
+    config.enabled_adapters.clone().unwrap_or_else(|| {
+        registry
+            .adapters()
+            .iter()
+            .filter(|adapter| adapter.source == AdapterSource::Bundled)
+            .map(|adapter| adapter.id.clone())
+            .collect()
+    })
+}
+
+#[tauri::command]
+async fn install_tui_adapter(manifest_path: String) -> Result<TuiMachineCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = PathBuf::from(manifest_path.trim());
+        if !source.is_absolute() {
+            return Err("adapter manifest path must be absolute".to_string());
+        }
+        let (_, registry) = load_adapter_context()?;
+        // The core installer validates and compares the same bounded byte
+        // snapshot it persists, avoiding a source-file TOCTOU window.
+        let active_versions = registry
+            .adapters()
+            .iter()
+            .map(|adapter| (adapter.id.clone(), adapter.adapter_version.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let installed =
+            install_manifest_upgrade_file(&source, &adapter_root_path(), &active_versions)
+                .map_err(|error| error.to_string())?;
+        core_config::update(cli_config_path(), None, |latest| {
+            latest
+                .active_adapter_versions
+                .insert(installed.id.clone(), installed.adapter_version.clone());
+        })
+        .map_err(|error| error.to_string())?;
+        probe_tui_machine(None)
+    })
+    .await
+    .map_err(|error| format!("adapter install worker panicked: {error}"))?
+}
+
+#[tauri::command]
+async fn rollback_tui_adapter(tool_key: String) -> Result<TuiMachineCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, registry) = load_adapter_context()?;
+        let adapter = registry
+            .find(&tool_key)
+            .ok_or_else(|| format!("adapter '{tool_key}' is not installed"))?;
+        let rollback = adapter
+            .rollback_version
+            .clone()
+            .ok_or_else(|| format!("{} has no previous adapter version", adapter.name))?;
+        let id = adapter.id.clone();
+        core_config::update(cli_config_path(), None, |latest| {
+            latest.active_adapter_versions.insert(id, rollback);
+        })
+        .map_err(|error| error.to_string())?;
+        probe_tui_machine(None)
+    })
+    .await
+    .map_err(|error| format!("adapter rollback worker panicked: {error}"))?
+}
+
+#[tauri::command]
+async fn activate_tui_adapter_update(tool_key: String) -> Result<TuiMachineCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, registry) = load_adapter_context()?;
+        let adapter = registry
+            .find(&tool_key)
+            .ok_or_else(|| format!("adapter '{tool_key}' is not installed"))?;
+        if !adapter.update_available() {
+            return Err(format!("{} adapter is already current", adapter.name));
+        }
+        let id = adapter.id.clone();
+        let newest = adapter.newest_version.clone();
+        core_config::update(cli_config_path(), None, |latest| {
+            latest.active_adapter_versions.insert(id, newest);
+        })
+        .map_err(|error| error.to_string())?;
+        probe_tui_machine(None)
+    })
+    .await
+    .map_err(|error| format!("adapter activation worker panicked: {error}"))?
+}
+
 fn ensure_tui_preference_allows(server_id: Option<i64>, tool_key: &str) -> Result<(), String> {
-    let Some(definition) = TUI_CATALOG
-        .iter()
-        .find(|definition| definition.key.eq_ignore_ascii_case(tool_key))
-    else {
+    let (config, registry) = load_adapter_context()?;
+    let Some(definition) = registry.find(tool_key) else {
         return Ok(());
     };
-    if tui_preference(server_id, definition.key)? == Some(false) {
+    ensure_adapter_supports_machine(definition, server_id)?;
+    if !adapter_selected(server_id, &config, &registry, definition)? {
         return Err(format!("{} is disabled for this machine", definition.name));
     }
-    if server_id.is_none() && !tui_tools::detect_local(definition, &SystemProcessRunner).installed {
+    if server_id.is_none() && !tui_tools::local_command_available(definition) {
         return Err(format!(
             "{} is not installed on this machine",
             definition.name
@@ -3713,7 +4497,15 @@ fn run_remote_connection_probe(
         idfile.as_deref().and_then(|path| path.to_str()),
         probe,
     )?;
-    let out = SystemProcessRunner.output(&cmd).map_err(|e| {
+    let out = TimeoutProcessRunner::with_limits(
+        REMOTE_CONNECTION_TIMEOUT,
+        REMOTE_CONNECTION_MAX_OUTPUT_BYTES,
+    )
+    .output(&cmd)
+    .map_err(|e| {
+        if e.starts_with("process timed out") || e.contains("output limit") {
+            return format!("remote SSH connection probe failed: {e}");
+        }
         // Failed to even spawn ssh — usually means ssh isn't installed.
         format!(
             "Could not start ssh.\n\
@@ -3896,14 +4688,32 @@ fn shell_quote_path(value: &str) -> Result<String, String> {
 /// entry is empty or contains control characters. Used by the remote scan
 /// so a crafted scan_roots value can't inject commands into the remote shell.
 fn shell_quote_roots(scan_roots: &str) -> Result<String, String> {
-    let quoted: Vec<String> = scan_roots
-        .split_whitespace()
-        .map(shell_quote_path)
-        .collect::<Result<_, _>>()?;
-    if quoted.is_empty() {
+    normalize_scan_roots(scan_roots)?
+        .iter()
+        .map(|root| shell_quote_path(root))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|roots| roots.join(" "))
+}
+
+fn normalize_scan_roots(scan_roots: &str) -> Result<Vec<String>, String> {
+    let mut roots = Vec::new();
+    for raw in scan_roots.split_whitespace() {
+        if raw.chars().any(|character| character.is_control()) {
+            return Err("scan_roots contains control characters".to_string());
+        }
+        let normalized = if raw == "/" || raw == "~" {
+            raw.to_string()
+        } else {
+            raw.trim_end_matches('/').to_string()
+        };
+        if normalized.is_empty() || !roots.iter().any(|root| root == &normalized) {
+            roots.push(normalized);
+        }
+    }
+    if roots.is_empty() {
         return Err("scan_roots has no entries".to_string());
     }
-    Ok(quoted.join(" "))
+    Ok(roots)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3932,22 +4742,40 @@ fn build_remote_scan_command(scan_roots: &str) -> Result<String, String> {
         ""
     };
     Ok(format!(
-        "scan_failed=0; \
+        "scan_file=$(mktemp) || exit 1; \
+         trap 'rm -f \"$scan_file\"' EXIT HUP INT TERM; \
+         unique_file=$(mktemp) || exit 1; \
+         trap 'rm -f \"$scan_file\" \"$unique_file\"' EXIT HUP INT TERM; \
+         scan_failed=0; \
          for r in {roots}; do \
              {skip_absent_builtin_roots}\
-             if ! \
-            find \"$r\" -maxdepth 6 -name .git -prune -exec sh -c ' \
-                for marker do \
-                    candidate=${{marker%/.git}}; \
-                    repo=$(git -C \"$candidate\" rev-parse --show-toplevel 2>/dev/null) || continue; \
-                    branch=$(git -C \"$repo\" branch --show-current 2>/dev/null); \
-                    activity=$(git -C \"$repo\" log -1 --all --format=%ct 2>/dev/null); \
-                    printf \"%s\\000%s\\000%s\\000\" \"$repo\" \"$branch\" \"$activity\"; \
-                done \
-            ' sh {{}} +; then \
+             if ! find \"$r\" -maxdepth 6 -name .git -prune -exec sh -c ' \
+                 for marker do \
+                     candidate=${{marker%/.git}}; \
+                     repo=$(git -C \"$candidate\" rev-parse --show-toplevel 2>/dev/null) || continue; \
+                     printf \"%s\\000\" \"$repo\"; \
+                 done \
+             ' sh {{}} + >>\"$scan_file\"; then \
                 scan_failed=1; \
             fi; \
          done; \
+         if printf 'x\\000' | sort -z -u >/dev/null 2>&1; then \
+             if ! sort -z -u \"$scan_file\" >\"$unique_file\"; then \
+                 scan_failed=1; \
+             fi; \
+             scan_input=\"$unique_file\"; \
+         else \
+             scan_input=\"$scan_file\"; \
+         fi; \
+         if ! xargs -0 -n 1 sh -c ' \
+                 for repo do \
+                     branch=$(git -C \"$repo\" branch --show-current 2>/dev/null); \
+                     activity=$(git -C \"$repo\" log -1 --all --format=%ct 2>/dev/null); \
+                     printf \"%s\\000%s\\000%s\\000\" \"$repo\" \"$branch\" \"$activity\"; \
+                 done \
+             ' sh <\"$scan_input\"; then \
+             scan_failed=1; \
+         fi; \
          exit \"$scan_failed\""
     ))
 }
@@ -3969,7 +4797,12 @@ fn parse_remote_scan_output(
             fields.len()
         ));
     }
-
+    let record_count = fields.len() / 3;
+    if record_count > MAX_REMOTE_SCAN_RECORDS {
+        return Err(format!(
+            "remote scan returned too many records ({record_count}; maximum is {MAX_REMOTE_SCAN_RECORDS})"
+        ));
+    }
     let mut deduplicated: BTreeMap<String, RemoteScanRow> = BTreeMap::new();
     for record in fields.chunks_exact(3) {
         let path = std::str::from_utf8(record[0])
@@ -4083,6 +4916,22 @@ fn validate_remote_scan_output(
     parse_remote_scan_output(&output.stdout, remote_home)
 }
 
+fn validate_remote_scan_before_write<T, F>(
+    output: &ProcessOutput,
+    remote_home: &str,
+    user: &str,
+    host: &str,
+    port: u16,
+    identity_file: Option<&str>,
+    write_snapshot: F,
+) -> Result<T, String>
+where
+    F: FnOnce(Vec<RemoteScanRow>) -> Result<T, String>,
+{
+    let rows = validate_remote_scan_output(output, remote_home, user, host, port, identity_file)?;
+    write_snapshot(rows)
+}
+
 fn legacy_remote_project_path(path: &str) -> String {
     format!("{}/.git", path.trim_end_matches('/'))
 }
@@ -4173,7 +5022,15 @@ fn run_remote_server_scan(server_id: i64) -> Result<i64, String> {
             idfile.as_deref(),
             &identity_cmd,
         )?;
-        let out = SystemProcessRunner.output(&cmd).map_err(|e| {
+        let out = TimeoutProcessRunner::with_limits(
+            REMOTE_CONNECTION_TIMEOUT,
+            REMOTE_CONNECTION_MAX_OUTPUT_BYTES,
+        )
+        .output(&cmd)
+        .map_err(|e| {
+            if e.starts_with("process timed out") || e.contains("output limit") {
+                return format!("remote SSH identity probe failed: {e}");
+            }
             format!(
                 "Could not start ssh.\n\
                  Is OpenSSH installed and on PATH? ({e})\n\
@@ -4208,121 +5065,132 @@ fn run_remote_server_scan(server_id: i64) -> Result<i64, String> {
             idfile.as_deref(),
             &find_cmd,
         )?;
-        SystemProcessRunner.output(&cmd).map_err(|e| {
-            format!(
-                "Could not start ssh.\n\
+        TimeoutProcessRunner::with_limits(REMOTE_SCAN_TIMEOUT, REMOTE_SCAN_MAX_OUTPUT_BYTES)
+            .output(&cmd)
+            .map_err(|e| {
+                if e.starts_with("process timed out") || e.contains("output limit") {
+                    return format!("remote SSH project scan failed: {e}");
+                }
+                format!(
+                    "Could not start ssh.\n\
                  Is OpenSSH installed and on PATH? ({e})\n\
                  无法启动 ssh。\n\
                  请确认已安装 OpenSSH 并在 PATH 中。({e})"
-            )
-        })?
+                )
+            })?
     };
-    let rows = validate_remote_scan_output(
+    validate_remote_scan_before_write(
         &out,
         &home,
         &server.user,
         &server.host,
         port,
         idfile.as_deref(),
-    )?;
-
-    // Upsert into remote_projects. Use a transaction so a partial scan
-    // never leaves the table half-written. We replace the entire set
-    // for this server (matches the local `scan_projects` model — each
-    // scan is a snapshot, deletions happen because the dir is gone).
-    with_prefs(|c| {
-        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
-        // Manual ignore rules hide rows at presentation time rather than
-        // deleting scanner-owned data. Keep inserting every discovered row so
-        // removing a rule restores it immediately, but report only the rows a
-        // user can actually see after this scan.
-        let ignore_rules = list_project_ignores_from_connection(&tx)?;
-        let previous_access: HashMap<String, String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT path, last_accessed_at
+        |rows| {
+            // Upsert into remote_projects. Use a transaction so a partial scan
+            // never leaves the table half-written. We replace the entire set
+            // for this server (matches the local `scan_projects` model — each
+            // scan is a snapshot, deletions happen because the dir is gone).
+            with_prefs(|c| {
+                let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+                // Manual ignore rules hide rows at presentation time rather than
+                // deleting scanner-owned data. Keep inserting every discovered row so
+                // removing a rule restores it immediately, but report only the rows a
+                // user can actually see after this scan.
+                let ignore_rules = list_project_ignores_from_connection(&tx)?;
+                let previous_access: HashMap<String, String> = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT path, last_accessed_at
                      FROM remote_projects
                      WHERE server_id = ?1",
-                )
-                .map_err(|e| e.to_string())?;
-            let values = stmt
-                .query_map(params![server_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<_, _>>()
-                .map_err(|e| e.to_string())?;
-            values
-        };
-        for row in &rows {
-            let project_id = remote_project_id(server_id, &row.path);
-            let legacy_project_id =
-                remote_project_id(server_id, &legacy_remote_project_path(&row.path));
-            migrate_legacy_remote_tool_usages(&tx, server_id, &legacy_project_id, &project_id)?;
-        }
-        let latest_tool_access: HashMap<String, String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT project_id, MAX(last_used_at)
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let values = stmt
+                        .query_map(params![server_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| e.to_string())?
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| e.to_string())?;
+                    values
+                };
+                for row in &rows {
+                    let project_id = remote_project_id(server_id, &row.path);
+                    let legacy_project_id =
+                        remote_project_id(server_id, &legacy_remote_project_path(&row.path));
+                    migrate_legacy_remote_tool_usages(
+                        &tx,
+                        server_id,
+                        &legacy_project_id,
+                        &project_id,
+                    )?;
+                }
+                let latest_tool_access: HashMap<String, String> = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT project_id, MAX(last_used_at)
                      FROM remote_tool_usages
                      WHERE server_id = ?1
                      GROUP BY project_id",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let values = stmt
+                        .query_map(params![server_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| e.to_string())?
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| e.to_string())?;
+                    values
+                };
+                tx.execute(
+                    "DELETE FROM remote_projects WHERE server_id = ?1",
+                    params![server_id],
                 )
                 .map_err(|e| e.to_string())?;
-            let values = stmt
-                .query_map(params![server_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<_, _>>()
-                .map_err(|e| e.to_string())?;
-            values
-        };
-        tx.execute(
-            "DELETE FROM remote_projects WHERE server_id = ?1",
-            params![server_id],
-        )
-        .map_err(|e| e.to_string())?;
-        let now = chrono_like_now_iso();
-        let mut total: i64 = 0;
-        for row in &rows {
-            let path = &row.path;
-            let legacy_path = legacy_remote_project_path(path);
-            // project_id is synthetic: 'r<server_id>:<path>'. We hash the
-            // path into a short hex suffix so the id stays well-bounded
-            // for the frontend (avoids giant DOM ids in queries).
-            let project_id = remote_project_id(server_id, path);
-            let last_accessed_at = remote_last_accessed_at(
-                row.last_activity_epoch,
-                latest_tool_access.get(&project_id).map(String::as_str),
-                previous_access
-                    .get(path)
-                    .or_else(|| previous_access.get(&legacy_path))
-                    .map(String::as_str),
-                &now,
-            );
-            tx.execute(
-                "INSERT INTO remote_projects
+                let now = chrono_like_now_iso();
+                let mut total: i64 = 0;
+                for row in &rows {
+                    let path = &row.path;
+                    let legacy_path = legacy_remote_project_path(path);
+                    // project_id is synthetic: 'r<server_id>:<path>'. We hash the
+                    // path into a short hex suffix so the id stays well-bounded
+                    // for the frontend (avoids giant DOM ids in queries).
+                    let project_id = remote_project_id(server_id, path);
+                    let last_accessed_at = remote_last_accessed_at(
+                        row.last_activity_epoch,
+                        latest_tool_access.get(&project_id).map(String::as_str),
+                        previous_access
+                            .get(path)
+                            .or_else(|| previous_access.get(&legacy_path))
+                            .map(String::as_str),
+                        &now,
+                    );
+                    tx.execute(
+                        "INSERT INTO remote_projects
                    (project_id, server_id, path, name, last_accessed_at, git_branch)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    project_id,
-                    server_id,
-                    path,
-                    project_name_from_path(path),
-                    last_accessed_at,
-                    row.branch.as_deref()
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-            if !project_path_is_excluded("remote", Some(server_id), path, &ignore_rules) {
-                total += 1;
-            }
-        }
-        update_remote_server_scan_metadata(&tx, server_id, &now, &identity.os_family)?;
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(total)
-    })
+                        params![
+                            project_id,
+                            server_id,
+                            path,
+                            project_name_from_path(path),
+                            last_accessed_at,
+                            row.branch.as_deref()
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    if !project_path_is_excluded("remote", Some(server_id), path, &ignore_rules) {
+                        total += 1;
+                    }
+                }
+                update_remote_server_scan_metadata(&tx, server_id, &now, &identity.os_family)?;
+                tx.commit().map_err(|e| e.to_string())?;
+                Ok(total)
+            })
+        },
+    )
 }
 
 /// Remote discovery can wait on two SSH processes and perform SQLite work.
@@ -4351,10 +5219,10 @@ fn run_all_remote_server_scans() -> Result<RemoteScanBatchResult, String> {
         )?;
         Ok(v)
     })?;
-    let outcomes = ids
-        .into_iter()
-        .map(|id| (id, run_remote_server_scan(id)))
-        .collect();
+    // Two workers are enough to overlap independent SSH latency without
+    // turning a settings refresh into an unbounded network burst. The helper
+    // keeps completion order from changing the UI's server order.
+    let outcomes = run_bounded_remote_jobs(ids, 2, run_remote_server_scan);
     Ok(summarize_remote_scan_outcomes(outcomes))
 }
 
@@ -4926,6 +5794,29 @@ pub struct GitInfo {
     error: Option<String>,
 }
 
+/// The inexpensive post-fetch delta for a GitInfo snapshot. Keeping this
+/// separate from branch/remotes/head discovery lets the UI show the quick
+/// snapshot immediately and refresh only synchronization fields afterward.
+#[derive(Serialize, Clone, Debug)]
+pub struct GitSyncInfo {
+    #[serde(rename = "branch")]
+    branch: Option<String>,
+    #[serde(rename = "headShort")]
+    head_short: Option<String>,
+    #[serde(rename = "dirty")]
+    dirty: bool,
+    #[serde(rename = "upstream")]
+    upstream: Option<String>,
+    #[serde(rename = "ahead")]
+    ahead: u32,
+    #[serde(rename = "behind")]
+    behind: u32,
+    #[serde(rename = "remoteChecked")]
+    remote_checked: bool,
+    #[serde(rename = "fetchError")]
+    fetch_error: Option<String>,
+}
+
 /// Run `git -C <path> <args...>`, returning trimmed stdout (None on non-zero
 /// exit or spawn failure). All git queries in this section are best-effort
 /// reads — the frontend treats failures as "no info" rather than errors.
@@ -4947,9 +5838,179 @@ fn run_git_with(runner: &dyn ProcessRunner, path: &str, args: &[&str]) -> Option
     }
 }
 
+fn run_git_user_operation(path: &str, args: &[&str]) -> Option<String> {
+    run_git_user_operation_with(&SystemProcessRunner, path, args)
+}
+
+fn run_git_user_operation_with(
+    runner: &dyn ProcessRunner,
+    path: &str,
+    args: &[&str],
+) -> Option<String> {
+    let spec = git_user_operation_spec(std::path::Path::new(path), args);
+    let out = runner.output(&spec).ok()?;
+    if !out.success {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+#[derive(Default)]
+struct LocalGitStatus {
+    branch: Option<String>,
+    head_short: Option<String>,
+    dirty: bool,
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
+}
+
+fn parse_local_git_status(output: &str) -> LocalGitStatus {
+    let mut status = LocalGitStatus::default();
+    for line in output.lines() {
+        let Some(value) = line.strip_prefix("# branch.head ") else {
+            if let Some(value) = line.strip_prefix("# branch.oid ") {
+                if value != "(initial)" {
+                    status.head_short = Some(value.chars().take(12).collect());
+                }
+            } else if let Some(value) = line.strip_prefix("# branch.upstream ") {
+                if !value.trim().is_empty() {
+                    status.upstream = Some(value.trim().to_string());
+                }
+            } else if let Some(value) = line.strip_prefix("# branch.ab ") {
+                let mut values = value.split_whitespace();
+                status.ahead = values
+                    .next()
+                    .and_then(|value| value.strip_prefix('+'))
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                status.behind = values
+                    .next()
+                    .and_then(|value| value.strip_prefix('-'))
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+            }
+            continue;
+        };
+        if !value.is_empty() && value != "(detached)" {
+            status.branch = Some(value.to_string());
+        }
+    }
+    status.dirty = output
+        .lines()
+        .any(|line| !line.starts_with('#') && !line.trim().is_empty());
+    status
+}
+
+fn run_git_status(path: &str) -> Option<LocalGitStatus> {
+    run_git(path, &["status", "--porcelain=v2", "--branch"])
+        .map(|output| parse_local_git_status(&output))
+}
+
+fn git_fetch_spec(path: &Path) -> process::ProcessSpec {
+    git_read_spec(
+        path,
+        &[
+            "-c",
+            "credential.interactive=never",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+        ],
+    )
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GCM_INTERACTIVE", "Never")
+}
+
+fn is_supported_git_remote_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() || url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("ssh://") {
+        return true;
+    }
+    // Git's scp-like SSH syntax (for example git@example.test:org/repo.git)
+    // has no URI scheme but is still an explicitly supported SSH transport.
+    let Some((user_host, remote_path)) = url.split_once(':') else {
+        return false;
+    };
+    !user_host.is_empty()
+        && user_host.contains('@')
+        && !remote_path.is_empty()
+        && !user_host.starts_with('-')
+}
+
+fn run_git_fetch_with_timeout(path: &str, timeout: Duration) -> Result<Option<String>, String> {
+    let spec = git_fetch_spec(Path::new(path));
+    let output = match output_with_timeout(&spec, timeout) {
+        Ok(output) => output,
+        Err(error) if error.contains("timed out") => {
+            return Ok(Some(format!(
+                "git fetch timed out after {} seconds",
+                timeout.as_secs()
+            )));
+        }
+        Err(error) => return Err(format!("failed to run git fetch: {error}")),
+    };
+    if output.success {
+        return Ok(None);
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Ok(Some(if message.is_empty() {
+        "git fetch failed".to_string()
+    } else {
+        message.chars().take(300).collect()
+    }))
+}
+
+fn run_git_fetch_and_read_status<Fetch, ReadStatus>(
+    fetch: Fetch,
+    read_status: ReadStatus,
+) -> Result<(Option<String>, LocalGitStatus), String>
+where
+    Fetch: FnOnce() -> Result<Option<String>, String>,
+    ReadStatus: FnOnce() -> Option<LocalGitStatus>,
+{
+    let fetch_error = fetch()?;
+    let status =
+        read_status().ok_or_else(|| "could not read Git status after fetch".to_string())?;
+    Ok((fetch_error, status))
+}
+
+fn run_parallel_git_metadata<F>(run: F) -> (Option<String>, Option<String>, Option<String>)
+where
+    F: Fn(&[&str]) -> Option<String> + Sync,
+{
+    std::thread::scope(|scope| {
+        let head = scope.spawn(|| run(&["log", "-1", "--pretty=%s"]));
+        let branches = scope.spawn(|| {
+            run(&[
+                "for-each-ref",
+                "--format=%(HEAD) %(refname:short)",
+                "refs/heads/",
+            ])
+        });
+        let remotes = scope.spawn(|| run(&["remote", "-v"]));
+        (
+            head.join().unwrap_or(None),
+            branches.join().unwrap_or(None),
+            remotes.join().unwrap_or(None),
+        )
+    })
+}
+
 #[tauri::command]
-fn get_git_info(path: String) -> Result<GitInfo, String> {
-    get_git_info_inner(path, false, None)
+async fn get_git_info(path: String) -> Result<GitInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || get_git_info_inner(path, false, None))
+        .await
+        .map_err(|error| format!("git info worker panicked: {error}"))?
 }
 
 fn get_git_info_inner(
@@ -4960,10 +6021,7 @@ fn get_git_info_inner(
     if !std::path::Path::new(&path).is_dir() {
         return Err(format!("directory not found: {path}"));
     }
-    let is_repo = run_git(&path, &["rev-parse", "--is-inside-work-tree"])
-        .map(|s| s == "true")
-        .unwrap_or(false);
-    if !is_repo {
+    let Some(status) = run_git_status(&path) else {
         return Ok(GitInfo {
             is_repo: false,
             branch: None,
@@ -4979,35 +6037,25 @@ fn get_git_info_inner(
             fetch_error,
             error: Some("not a git repository".into()),
         });
-    }
-    let branch = run_git(&path, &["branch", "--show-current"]);
-    let head_short = run_git(&path, &["rev-parse", "--short", "HEAD"]);
-    let head_summary = run_git(&path, &["log", "-1", "--pretty=%s"]);
-    let dirty = run_git(&path, &["status", "--porcelain"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    let upstream = run_git(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
-    let (ahead, behind) = upstream
-        .as_ref()
-        .and_then(|_| {
-            run_git(
-                &path,
-                &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
-            )
-        })
-        .and_then(|value| parse_ahead_behind(&value))
-        .unwrap_or((0, 0));
+    };
+    let LocalGitStatus {
+        branch,
+        head_short,
+        dirty,
+        upstream,
+        ahead,
+        behind,
+    } = status;
+    // Once the repository/status check has succeeded, these reads are
+    // independent. Run them concurrently on the existing blocking worker so
+    // selecting a project gets its local snapshot without a serial process
+    // chain, while terminal startup remains on its own async path.
+    let (head_summary, branches_output, remotes_output) =
+        run_parallel_git_metadata(|args| run_git(&path, args));
     // Local branches via for-each-ref. Format: `* main` (current) or
     // `  feature` (non-current) — leading char is the HEAD marker.
     let mut local_branches: Vec<BranchInfo> = Vec::new();
-    if let Some(out) = run_git(
-        &path,
-        &[
-            "for-each-ref",
-            "--format=%(HEAD) %(refname:short)",
-            "refs/heads/",
-        ],
-    ) {
+    if let Some(out) = branches_output {
         for line in out.lines() {
             let mut parts = line.splitn(2, ' ');
             let marker = parts.next().unwrap_or("");
@@ -5024,7 +6072,7 @@ fn get_git_info_inner(
     // `git remote -v` lines: "<name>\t<url> (fetch|push)". Two lines per
     // remote (fetch + push), we dedupe by name and keep the fetch URL.
     let mut remotes: Vec<GitRemote> = Vec::new();
-    if let Some(out) = run_git(&path, &["remote", "-v"]) {
+    if let Some(out) = remotes_output {
         for line in out.lines() {
             // split into [name, url "(fetch|push)"]
             let mut parts = line.split_whitespace();
@@ -5063,6 +6111,7 @@ fn get_git_info_inner(
     })
 }
 
+#[cfg(test)]
 fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
     let mut counts = value.split_whitespace();
     Some((counts.next()?.parse().ok()?, counts.next()?.parse().ok()?))
@@ -5070,7 +6119,14 @@ fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod git_sync_tests {
-    use super::{parse_ahead_behind, parse_remote_git_info};
+    use super::{
+        git_fetch_spec, is_supported_git_remote_url, parse_ahead_behind, parse_local_git_status,
+        parse_remote_git_info, run_git_fetch_and_read_status, run_parallel_git_metadata,
+        LocalGitStatus,
+    };
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn parses_ahead_and_behind_counts_in_git_order() {
@@ -5091,42 +6147,191 @@ mod git_sync_tests {
         assert_eq!(info.remotes.len(), 1);
         assert!(info.local_branches[0].is_current);
     }
+
+    #[test]
+    fn parses_local_status_snapshot_without_follow_up_git_queries() {
+        let status = parse_local_git_status(
+            "# branch.oid abcdef0123456789\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -3\n1 .M N... 100644 100644 100644 abc def file.txt\n",
+        );
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.head_short.as_deref(), Some("abcdef012345"));
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(status.ahead, 2);
+        assert_eq!(status.behind, 3);
+        assert!(status.dirty);
+    }
+
+    #[test]
+    fn parses_clean_detached_status_snapshot() {
+        let status =
+            parse_local_git_status("# branch.oid abcdef0123456789\n# branch.head (detached)\n");
+        assert!(status.branch.is_none());
+        assert!(!status.dirty);
+        assert!(status.upstream.is_none());
+    }
+
+    #[test]
+    fn local_git_metadata_queries_run_in_parallel() {
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let (head, branches, remotes) = run_parallel_git_metadata(|args| {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            active.fetch_sub(1, Ordering::SeqCst);
+            match args.first().copied() {
+                Some("log") => Some("summary".to_string()),
+                Some("for-each-ref") => Some("* main".to_string()),
+                Some("remote") => Some("origin https://example.test/repo.git".to_string()),
+                _ => None,
+            }
+        });
+
+        assert_eq!(head.as_deref(), Some("summary"));
+        assert_eq!(branches.as_deref(), Some("* main"));
+        assert_eq!(
+            remotes.as_deref(),
+            Some("origin https://example.test/repo.git")
+        );
+        assert!(maximum.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn git_fetch_is_hidden_non_interactive_and_argument_safe() {
+        let spec = git_fetch_spec(Path::new(r"C:\fixture workspace\repo & safe"));
+
+        assert_eq!(spec.program, std::ffi::OsString::from("git"));
+        assert_eq!(spec.args[0], std::ffi::OsString::from("-C"));
+        assert_eq!(
+            spec.args[1],
+            std::ffi::OsString::from(r"C:\fixture workspace\repo & safe")
+        );
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("credential.interactive=never"),
+            ]
+        }));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|(key, value)| { key == "GIT_TERMINAL_PROMPT" && value == "0" }));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|(key, value)| key == "GCM_INTERACTIVE" && value == "Never"));
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("protocol.allow=never"),
+            ]
+        }));
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("protocol.https.allow=always"),
+            ]
+        }));
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("protocol.ssh.allow=always"),
+            ]
+        }));
+    }
+
+    #[test]
+    fn background_fetch_accepts_only_explicit_https_or_ssh_remotes() {
+        assert!(is_supported_git_remote_url("https://example.test/repo.git"));
+        assert!(is_supported_git_remote_url(
+            "ssh://git@example.test/repo.git"
+        ));
+        assert!(is_supported_git_remote_url("git@example.test:org/repo.git"));
+        assert!(!is_supported_git_remote_url("http://example.test/repo.git"));
+        assert!(!is_supported_git_remote_url("file:///tmp/repo"));
+        assert!(!is_supported_git_remote_url("ext::echo should-not-run"));
+        assert!(!is_supported_git_remote_url("helper::example.test/repo"));
+    }
+
+    #[test]
+    fn post_fetch_status_is_the_snapshot_returned_to_the_caller() {
+        let before = LocalGitStatus {
+            behind: 3,
+            ..LocalGitStatus::default()
+        };
+        let after = LocalGitStatus {
+            behind: 0,
+            ..before
+        };
+        let (fetch_error, status) = run_git_fetch_and_read_status(
+            || Ok(Some("remote was temporarily unavailable".to_string())),
+            || Some(after),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fetch_error.as_deref(),
+            Some("remote was temporarily unavailable")
+        );
+        assert_eq!(status.behind, 0);
+    }
+
+    #[test]
+    fn post_fetch_status_failure_keeps_an_explicit_error() {
+        let error = match run_git_fetch_and_read_status(|| Ok(None), || None) {
+            Ok(_) => panic!("post-fetch status should be required"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "could not read Git status after fetch");
+    }
+}
+
+fn run_git_sync(path: &str) -> Result<GitSyncInfo, String> {
+    if !Path::new(path).is_dir() {
+        return Err(format!("directory not found: {path}"));
+    }
+    let status =
+        run_git_status(path).ok_or_else(|| "could not read Git status before fetch".to_string())?;
+    let (status, fetch_error) = match status.upstream.as_deref() {
+        Some(upstream) => {
+            let remote_name = upstream.split_once('/').map(|(name, _)| name);
+            match remote_name.and_then(|name| run_git(path, &["remote", "get-url", "--", name])) {
+                Some(url) if is_supported_git_remote_url(&url) => {
+                    let (fetch_error, status) = run_git_fetch_and_read_status(
+                        || run_git_fetch_with_timeout(path, Duration::from_secs(10)),
+                        || run_git_status(path),
+                    )?;
+                    (status, fetch_error)
+                }
+                Some(_) => (
+                    status,
+                    Some("git fetch skipped: remote transport is not HTTPS or SSH".into()),
+                ),
+                None => (
+                    status,
+                    Some("git fetch skipped: could not resolve upstream remote".into()),
+                ),
+            }
+        }
+        None => (status, None),
+    };
+    Ok(GitSyncInfo {
+        branch: status.branch,
+        head_short: status.head_short,
+        dirty: status.dirty,
+        upstream: status.upstream,
+        ahead: status.ahead,
+        behind: status.behind,
+        remote_checked: true,
+        fetch_error,
+    })
 }
 
 #[tauri::command]
-async fn refresh_git_info(path: String) -> Result<GitInfo, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if !Path::new(&path).is_dir() {
-            return Err(format!("directory not found: {path}"));
-        }
-        let upstream = run_git(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
-        let fetch_error = if upstream.is_some() {
-            let output = Command::new("git")
-                .arg("-c")
-                .arg("credential.interactive=never")
-                .arg("-C")
-                .arg(&path)
-                .args(["fetch", "--quiet", "--no-tags"])
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-                .map_err(|error| format!("failed to run git fetch: {error}"))?;
-            if output.status.success() {
-                None
-            } else {
-                let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                Some(if message.is_empty() {
-                    "git fetch failed".to_string()
-                } else {
-                    message.chars().take(300).collect()
-                })
-            }
-        } else {
-            None
-        };
-        get_git_info_inner(path, true, fetch_error)
-    })
-    .await
-    .map_err(|error| format!("git refresh worker failed: {error}"))?
+async fn refresh_git_sync(path: String) -> Result<GitSyncInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || run_git_sync(&path))
+        .await
+        .map_err(|error| format!("git sync worker failed: {error}"))?
 }
 
 fn run_remote_git_info(server_id: i64, path: &str) -> Result<GitInfo, String> {
@@ -5157,9 +6362,13 @@ fn run_remote_git_info(server_id: i64, path: &str) -> Result<GitInfo, String> {
         server.identity_file.as_deref(),
         &remote_command,
     )?;
-    let output = SystemProcessRunner
-        .output(&spec)
-        .map_err(|error| format!("could not start ssh: {error}"))?;
+    let output = match output_with_timeout(&spec, Duration::from_secs(12)) {
+        Ok(output) => output,
+        Err(error) if error.contains("timed out") => {
+            return Err("remote Git check timed out after 12 seconds".to_string());
+        }
+        Err(error) => return Err(format!("could not start ssh: {error}")),
+    };
     if !output.success {
         return Err(classify_ssh_failure(
             &server.user,
@@ -5250,12 +6459,15 @@ async fn analyze_session_cleanup() -> Result<session_cleanup::SessionCleanupAnal
 
 #[tauri::command]
 async fn quarantine_session_candidates(
+    snapshot_id: String,
     keys: Vec<String>,
 ) -> Result<session_cleanup::SessionTrashBatch, String> {
     let home = app_home_directory();
-    tauri::async_runtime::spawn_blocking(move || session_cleanup::quarantine_sessions(&home, &keys))
-        .await
-        .map_err(|error| format!("session cleanup worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        session_cleanup::quarantine_sessions(&home, &snapshot_id, &keys)
+    })
+    .await
+    .map_err(|error| format!("session cleanup worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -5293,30 +6505,27 @@ fn add_git_remote(path: String, name: String, url: String) -> Result<(), String>
     // remote can be attached. This makes "+ add remote" a one-click
     // "make this a git project and connect it" affordance — the user
     // can then `git add . && git commit` to push their first commit.
-    let is_repo = run_git(&path, &["rev-parse", "--is-inside-work-tree"])
+    let is_repo = run_git_user_operation(&path, &["rev-parse", "--is-inside-work-tree"])
         .map(|s| s == "true")
         .unwrap_or(false);
     if !is_repo {
-        let init = Command::new("git")
-            .arg("-C")
-            .arg(&path)
-            .arg("init")
-            .output()
+        let init = SystemProcessRunner
+            .output(&git_user_operation_spec(Path::new(&path), &["init"]))
             .map_err(|e| format!("failed to run git: {e}"))?;
-        if !init.status.success() {
+        if !init.success {
             return Err(format!(
                 "git init failed: {}",
                 String::from_utf8_lossy(&init.stderr).trim()
             ));
         }
     }
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&path)
-        .args(["remote", "add", name, url])
-        .output()
+    let out = SystemProcessRunner
+        .output(&git_user_operation_spec(
+            Path::new(&path),
+            &["remote", "add", name, url],
+        ))
         .map_err(|e| format!("failed to run git: {e}"))?;
-    if !out.status.success() {
+    if !out.success {
         return Err(format!(
             "git remote add failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -5351,7 +6560,7 @@ fn checkout_branch(path: String, name: String) -> Result<(), String> {
         return Err(format!("invalid branch name: {name}"));
     }
     // Confirm the branch actually exists in the local repo.
-    let known = run_git(
+    let known = run_git_user_operation(
         &path,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
     )
@@ -5362,13 +6571,13 @@ fn checkout_branch(path: String, name: String) -> Result<(), String> {
     }
     // `git switch` (not `checkout`) is the modern, safer command —
     // refuses to clobber uncommitted changes unless --force.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&path)
-        .args(["switch", name])
-        .output()
+    let out = SystemProcessRunner
+        .output(&git_user_operation_spec(
+            Path::new(&path),
+            &["switch", name],
+        ))
         .map_err(|e| format!("failed to run git: {e}"))?;
-    if !out.status.success() {
+    if !out.success {
         return Err(format!(
             "git switch failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -5758,6 +6967,10 @@ pub fn run() {
             upsert_custom_opener,
             delete_custom_opener,
             open_with_opener,
+            list_web_development_tools,
+            upsert_web_development_tool,
+            set_web_development_tool_enabled,
+            delete_web_development_tool,
             list_groups,
             create_group,
             rename_group,
@@ -5773,7 +6986,7 @@ pub fn run() {
             read_text_file,
             list_dir,
             get_git_info,
-            refresh_git_info,
+            refresh_git_sync,
             refresh_remote_git_info,
             analyze_session_cleanup,
             quarantine_session_candidates,
@@ -5786,8 +6999,13 @@ pub fn run() {
             set_tray_language,
             list_remote_servers,
             probe_tui_capabilities,
+            check_tui_updates,
             set_tui_enabled,
             install_tui,
+            upgrade_tui,
+            install_tui_adapter,
+            rollback_tui_adapter,
+            activate_tui_adapter_update,
             add_remote_server,
             rename_remote_server,
             delete_remote_server,
@@ -6061,6 +7279,23 @@ mod baseline_tests {
     }
 
     #[test]
+    fn remote_scan_roots_remove_nested_duplicates_before_quoting() {
+        let roots = normalize_scan_roots("~ ~/projects ~/code ~/projects /srv /srv/team").unwrap();
+        assert_eq!(
+            roots,
+            vec!["~", "~/projects", "~/code", "/srv", "/srv/team"]
+        );
+        let command = build_remote_scan_command("~ ~/projects ~/code").unwrap();
+        assert_eq!(command.matches("for r in").count(), 1);
+        assert!(command.contains("sort -z -u"));
+        assert!(command.contains("scan_input=\"$scan_file\""));
+        assert!(command.contains("unique_file=$(mktemp)"));
+        assert!(command.contains("sort -z -u \"$scan_file\" >\"$unique_file\""));
+        assert!(command.contains("xargs -0"));
+        assert!(!command.contains("\\n+"));
+    }
+
+    #[test]
     fn remote_scan_rejects_partial_stdout_when_process_fails() {
         let output = ProcessOutput {
             success: false,
@@ -6092,6 +7327,35 @@ mod baseline_tests {
             Some("remote_scan")
         );
         assert_eq!(summary.servers[2].count, 0);
+    }
+
+    #[test]
+    fn remote_scan_worker_pool_is_bounded_and_returns_stable_ids() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let active_for_job = Arc::clone(&active);
+        let maximum_for_job = Arc::clone(&maximum);
+        let outcomes = run_bounded_remote_jobs(vec![5, 2, 9, 1, 7], 2, move |id| {
+            let now = active_for_job.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum_for_job.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(10));
+            active_for_job.fetch_sub(1, Ordering::SeqCst);
+            Ok(id * 10)
+        });
+
+        assert_eq!(
+            outcomes
+                .into_iter()
+                .map(|(id, result)| (id, result.unwrap()))
+                .collect::<Vec<_>>(),
+            vec![(1, 10), (2, 20), (5, 50), (7, 70), (9, 90)]
+        );
+        assert!(maximum.load(Ordering::SeqCst) <= 2);
     }
 
     #[test]
@@ -6183,6 +7447,67 @@ mod baseline_tests {
                 .unwrap(),
             ("cmd {path}".to_string(), 0)
         );
+    }
+
+    fn web_development_tool_fixture() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE web_development_tools (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT NOT NULL,
+                    connection_url TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn web_development_tools_require_safe_urls_and_support_crud() {
+        let connection = web_development_tool_fixture();
+        assert!(
+            upsert_web_development_tool_db(&connection, None, "DSH", "file:///tmp/dsh", true,)
+                .is_err()
+        );
+
+        let created = upsert_web_development_tool_db(
+            &connection,
+            None,
+            "DSH",
+            "HTTPS://DSH.EXAMPLE.TEST/workspace",
+            true,
+        )
+        .unwrap();
+        assert_eq!(created.label, "DSH");
+        assert_eq!(created.connection_url, "https://dsh.example.test/workspace");
+        assert!(created.enabled);
+
+        let updated = upsert_web_development_tool_db(
+            &connection,
+            Some(created.id),
+            "DSH staging",
+            "http://127.0.0.1:8080/",
+            true,
+        )
+        .unwrap();
+        assert_eq!(updated.label, "DSH staging");
+        set_web_development_tool_enabled_db(&connection, created.id, false).unwrap();
+
+        let listed = list_web_development_tools_db(&connection).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].enabled);
+        assert!(set_web_development_tool_enabled_db(&connection, 99, true).is_err());
+
+        delete_web_development_tool_db(&connection, created.id).unwrap();
+        assert!(delete_web_development_tool_db(&connection, created.id).is_err());
+        assert!(list_web_development_tools_db(&connection)
+            .unwrap()
+            .is_empty());
     }
 
     fn group_snapshot(connection: &Connection) -> String {
@@ -6626,6 +7951,96 @@ mod baseline_tests {
     }
 
     #[test]
+    fn adapter_platform_and_remote_contracts_are_enforced() {
+        let registry = AdapterRegistry::bundled().unwrap();
+        let mut adapter = registry.find("claude").unwrap().clone();
+        adapter.manifest.platforms = vec!["linux".to_string()];
+        assert_eq!(
+            adapter_support_error(&adapter, false, "Windows_NT").as_deref(),
+            Some("this adapter does not support windows")
+        );
+        assert!(adapter_support_error(&adapter, false, "Linux").is_none());
+        assert_eq!(
+            adapter_support_error(&adapter, true, "FreeBSD").as_deref(),
+            Some("unsupported or unknown machine OS: FreeBSD")
+        );
+
+        adapter.manifest.supports_remote = false;
+        assert_eq!(
+            adapter_support_error(&adapter, true, "Linux").as_deref(),
+            Some("this adapter does not support remote machines")
+        );
+    }
+
+    #[test]
+    fn adapter_probe_selection_defaults_to_official_and_requires_extension_enablement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("adapters");
+        let source = temporary.path().join("demo.json");
+        std::fs::write(
+            &source,
+            r#"{
+              "apiVersion": 1,
+              "id": "demo",
+              "name": "Demo",
+              "adapterVersion": "1.0.0",
+              "command": "demo",
+              "launch": { "newArgs": [], "resumeArgs": [] },
+              "scanner": { "handler": "metadata-v1", "dataDirectory": "~/.demo/sessions" }
+            }"#,
+        )
+        .unwrap();
+        sessionatlas_core::adapter::install_manifest_file(&source, &root).unwrap();
+
+        let config = core_config::AppConfig::default();
+        let registry = AdapterRegistry::load(&root, &config).unwrap();
+        let official = registry.find("codex").unwrap();
+        let extension = registry.find("demo").unwrap();
+        assert!(adapter_probe_selected(None, &config, &registry, official).unwrap());
+        assert!(!adapter_probe_selected(None, &config, &registry, extension).unwrap());
+
+        let mut extension_only = config.clone();
+        extension_only.enabled_adapters = Some(vec!["demo".to_string()]);
+        assert!(!adapter_probe_selected(None, &extension_only, &registry, official).unwrap());
+        assert!(adapter_probe_selected(None, &extension_only, &registry, extension).unwrap());
+
+        let mut enabled = config.clone();
+        enabled.enabled_adapters = Some(vec!["codex".to_string(), "demo".to_string()]);
+        assert!(adapter_probe_selected(None, &enabled, &registry, official).unwrap());
+        assert!(adapter_probe_selected(None, &enabled, &registry, extension).unwrap());
+    }
+
+    #[test]
+    fn probe_failure_restores_the_prior_adapter_selection() {
+        for prior_enabled in [true, false] {
+            let restored = std::cell::Cell::new(None);
+            let result = probe_with_selection_rollback(
+                Err("probe failed".to_string()),
+                prior_enabled,
+                |selection| {
+                    restored.set(Some(selection));
+                    Ok(())
+                },
+            );
+
+            assert!(result.is_err());
+            assert_eq!(restored.get(), Some(prior_enabled));
+        }
+    }
+
+    #[test]
+    fn explicit_adapter_selection_preserves_concurrent_extension_ids() {
+        let registry = AdapterRegistry::bundled().unwrap();
+        let mut config = core_config::AppConfig::default();
+        config.enabled_adapters = Some(vec!["codex".to_string(), "new-extension".to_string()]);
+
+        assert_eq!(
+            selected_adapter_ids(&config, &registry),
+            vec!["codex".to_string(), "new-extension".to_string()]
+        );
+    }
+
+    #[test]
     fn remote_tmux_names_are_stable_safe_and_tool_scoped() {
         let first = remote_tmux_session_name("/srv/Project One", Some("custom.tool")).unwrap();
         let second = remote_tmux_session_name("/srv/Project One", Some("custom.tool")).unwrap();
@@ -6687,6 +8102,22 @@ mod baseline_tests {
             1
         );
         assert!(!codex_command.contains("codex --resume"));
+
+        let (opencode_tool, opencode_argv) =
+            resolve_remote_tool_launch(Some("opencode"), Some("ses_remote_123")).unwrap();
+        let opencode_command = build_remote_tmux_command(
+            "/srv/opencode-project",
+            opencode_tool.as_deref(),
+            opencode_argv.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_command
+                .matches("opencode --session ses_remote_123")
+                .count(),
+            1
+        );
+        assert!(!opencode_command.contains("opencode --resume"));
 
         let shell_command =
             build_remote_tmux_command("~/projects/demo", Some("shell"), None).unwrap();
@@ -6873,6 +8304,9 @@ mod baseline_tests {
     #[test]
     fn remote_scan_root_quoting_rejects_control_characters() {
         assert!(shell_quote_path("~/projects\nmalicious").is_err());
+        // Nested roots remain in the scan set so that they can contribute
+        // their own depth; quoting keeps the tilde as a literal shell-safe
+        // path component.
         assert_eq!(shell_quote_roots("~ ~/projects").unwrap(), "~ ~/'projects'");
         assert_eq!(
             shell_quote_path("/srv/alice's repo").unwrap(),
@@ -6913,6 +8347,117 @@ mod baseline_tests {
     fn remote_scan_output_rejects_incomplete_records() {
         let error = parse_remote_scan_output(b"/srv/repo\0main\0", "/home/demo").unwrap_err();
         assert!(error.contains("incomplete record"));
+    }
+
+    #[test]
+    fn remote_scan_output_accepts_the_record_limit_before_deduplication() {
+        let mut stdout = Vec::new();
+        for _ in 0..MAX_REMOTE_SCAN_RECORDS {
+            stdout.extend_from_slice(b"/srv/repo\x00main\x001720000000\x00");
+        }
+        let rows = parse_remote_scan_output(&stdout, "/home/demo").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn remote_scan_output_rejects_one_record_over_the_limit_before_deduplication() {
+        let mut stdout = Vec::new();
+        for _ in 0..=MAX_REMOTE_SCAN_RECORDS {
+            stdout.extend_from_slice(b"/srv/repo\x00main\x001720000000\x00");
+        }
+        let error = parse_remote_scan_output(&stdout, "/home/demo").unwrap_err();
+        assert!(error.contains("too many records"));
+        assert!(error.contains("50001"));
+    }
+
+    #[test]
+    fn remote_scan_validation_does_not_invoke_snapshot_writer_on_failure() {
+        use std::cell::Cell;
+
+        let mut stdout = Vec::new();
+        for _ in 0..=MAX_REMOTE_SCAN_RECORDS {
+            stdout.extend_from_slice(b"/srv/repo\x00main\x001720000000\x00");
+        }
+        let writer_called = Cell::new(false);
+        let result = validate_remote_scan_before_write(
+            &ProcessOutput {
+                success: true,
+                status_code: Some(0),
+                stdout,
+                stderr: Vec::new(),
+            },
+            "/home/demo",
+            "demo",
+            "example.test",
+            22,
+            None,
+            |_| {
+                writer_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!writer_called.get());
+    }
+
+    #[test]
+    fn remote_scan_validation_failure_preserves_existing_snapshot_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE remote_projects (server_id INTEGER, path TEXT);
+                 CREATE TABLE remote_servers (id INTEGER PRIMARY KEY, last_scanned_at TEXT);
+                 INSERT INTO remote_projects VALUES (7, '/srv/old');
+                 INSERT INTO remote_servers VALUES (7, '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        let mut stdout = Vec::new();
+        for _ in 0..=MAX_REMOTE_SCAN_RECORDS {
+            stdout.extend_from_slice(b"/srv/repo\x00main\x001720000000\x00");
+        }
+
+        let result = validate_remote_scan_before_write(
+            &ProcessOutput {
+                success: true,
+                status_code: Some(0),
+                stdout,
+                stderr: Vec::new(),
+            },
+            "/home/demo",
+            "demo",
+            "example.test",
+            22,
+            None,
+            |rows| {
+                connection
+                    .execute("DELETE FROM remote_projects", [])
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE remote_servers SET last_scanned_at = 'changed' WHERE id = 7",
+                        [],
+                    )
+                    .unwrap();
+                Ok(rows.len())
+            },
+        );
+        assert!(result.is_err());
+        let project_path: String = connection
+            .query_row(
+                "SELECT path FROM remote_projects WHERE server_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let scanned_at: String = connection
+            .query_row(
+                "SELECT last_scanned_at FROM remote_servers WHERE id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(project_path, "/srv/old");
+        assert_eq!(scanned_at, "2026-01-01T00:00:00Z");
     }
 
     #[test]
@@ -7086,20 +8631,23 @@ mod baseline_tests {
 
     #[test]
     fn custom_tool_launch_uses_configured_command_instead_of_key() {
-        let config: CliConfigFile = serde_json::from_str(
-            r#"{
-                "CustomTools": [{
-                    "Key": "friendly-key",
-                    "CliCommand": "fixture-cli --profile \"safe profile\"",
-                    "IsEnabled": true
-                }]
-            }"#,
+        let mut config = core_config::AppConfig::default();
+        config.custom_tools = vec![sessionatlas_core::model::ToolSource {
+            key: "friendly-key".to_string(),
+            name: "Friendly".to_string(),
+            cli_command: "fixture-cli --profile \"safe profile\"".to_string(),
+            is_enabled: true,
+            ..sessionatlas_core::model::ToolSource::default()
+        }];
+        let registry = AdapterRegistry::bundled().unwrap();
+
+        let args = resolve_tool_launch_argv_from_config(
+            "friendly-key",
+            Some("session-123"),
+            &config,
+            &registry,
         )
         .unwrap();
-
-        let args =
-            resolve_tool_launch_argv_from_config("friendly-key", Some("session-123"), &config)
-                .unwrap();
         assert_eq!(
             args,
             vec![
@@ -7114,44 +8662,114 @@ mod baseline_tests {
     }
 
     #[test]
-    fn custom_tool_launch_rejects_disabled_unknown_and_shell_commands() {
-        let config = CliConfigFile {
-            custom_tools: vec![
-                CliToolConfig {
-                    key: "disabled".to_string(),
-                    cli_command: "fixture-cli".to_string(),
-                    is_enabled: false,
-                },
-                CliToolConfig {
-                    key: "unsafe".to_string(),
-                    cli_command: "cmd.exe /C calc".to_string(),
-                    is_enabled: true,
-                },
-            ],
-        };
+    fn legacy_resume_rejects_option_session_ids_before_remote_command_building() {
+        let mut config = core_config::AppConfig::default();
+        config.custom_tools = vec![sessionatlas_core::model::ToolSource {
+            key: "legacy-tool".to_string(),
+            cli_command: "fixture-cli".to_string(),
+            is_enabled: true,
+            ..sessionatlas_core::model::ToolSource::default()
+        }];
+        let registry = AdapterRegistry::bundled().unwrap();
 
-        assert!(resolve_tool_launch_argv_from_config("disabled", None, &config).is_err());
-        assert!(resolve_tool_launch_argv_from_config("missing", None, &config).is_err());
-        assert!(resolve_tool_launch_argv_from_config("unsafe", None, &config).is_err());
+        for session_id in [
+            "-x",
+            "--help",
+            " -x ",
+            "\u{2212}x",
+            "\u{2011}x",
+            "legacy\nresume",
+        ] {
+            assert!(
+                resolve_tool_launch_argv_from_config(
+                    "legacy-tool",
+                    Some(session_id),
+                    &config,
+                    &registry,
+                )
+                .is_err(),
+                "local legacy launch accepted {session_id:?}"
+            );
+
+            let mut remote_builder_called = false;
+            let result = resolve_tool_launch_argv_from_config(
+                "legacy-tool",
+                Some(session_id),
+                &config,
+                &registry,
+            )
+            .and_then(|argv| {
+                remote_builder_called = true;
+                build_remote_tmux_command("/srv/project", Some("legacy-tool"), Some(&argv))
+            });
+            assert!(result.is_err());
+            assert!(!remote_builder_called);
+        }
+
+        let valid = resolve_tool_launch_argv_from_config(
+            "legacy-tool",
+            Some("provider.v2_1:part+2-id"),
+            &config,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(
+            valid.last().map(String::as_str),
+            Some("provider.v2_1:part+2-id")
+        );
+        let remote =
+            build_remote_tmux_command("/srv/project", Some("legacy-tool"), Some(&valid)).unwrap();
+        assert!(remote.contains("--resume provider.v2_1:part+2-id"));
+    }
+
+    #[test]
+    fn custom_tool_launch_rejects_disabled_unknown_and_shell_commands() {
+        let mut config = core_config::AppConfig::default();
+        config.custom_tools = vec![
+            sessionatlas_core::model::ToolSource {
+                key: "disabled".to_string(),
+                cli_command: "fixture-cli".to_string(),
+                is_enabled: false,
+                ..sessionatlas_core::model::ToolSource::default()
+            },
+            sessionatlas_core::model::ToolSource {
+                key: "unsafe".to_string(),
+                cli_command: "cmd.exe /C calc".to_string(),
+                is_enabled: true,
+                ..sessionatlas_core::model::ToolSource::default()
+            },
+        ];
+        let registry = AdapterRegistry::bundled().unwrap();
+
+        assert!(
+            resolve_tool_launch_argv_from_config("disabled", None, &config, &registry).is_err()
+        );
+        assert!(resolve_tool_launch_argv_from_config("missing", None, &config, &registry).is_err());
+        assert!(resolve_tool_launch_argv_from_config("unsafe", None, &config, &registry).is_err());
     }
 
     #[test]
     fn builtin_tool_keys_are_canonicalized_before_launch() {
-        let args = resolve_tool_launch_argv_from_config(
-            "CoDeX",
-            Some("session-123"),
-            &CliConfigFile::default(),
-        )
-        .unwrap();
+        let config = core_config::AppConfig::default();
+        let registry = AdapterRegistry::bundled().unwrap();
+        let args =
+            resolve_tool_launch_argv_from_config("CoDeX", Some("session-123"), &config, &registry)
+                .unwrap();
         assert_eq!(args, vec!["codex", "resume", "session-123"]);
 
-        let pi_args = resolve_tool_launch_argv_from_config(
-            "PI",
-            Some("pi-session"),
-            &CliConfigFile::default(),
+        let pi_args =
+            resolve_tool_launch_argv_from_config("PI", Some("pi-session"), &config, &registry)
+                .unwrap();
+        assert_eq!(pi_args, vec!["pi", "--session", "pi-session"]);
+
+        let opencode_args = resolve_tool_launch_argv_from_config(
+            "OpenCode",
+            Some("ses_feff4ba8"),
+            &config,
+            &registry,
         )
         .unwrap();
-        assert_eq!(pi_args, vec!["pi", "--session", "pi-session"]);
+        assert_eq!(opencode_args, vec!["opencode", "--session", "ses_feff4ba8"]);
     }
 
     #[test]
@@ -7250,6 +8868,30 @@ mod baseline_tests {
             .contains("distinctive_content_symbol"));
         drop(connection);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn content_search_fails_closed_for_an_older_sanitizer_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessionatlas_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE project_content_files (id INTEGER PRIMARY KEY);
+                 CREATE TABLE project_content_fts (rowid INTEGER PRIMARY KEY);
+                 INSERT INTO sessionatlas_meta (key, value)
+                 VALUES ('content_index_sanitizer_version', '1');",
+            )
+            .unwrap();
+
+        assert!(!content_index_available(&connection).unwrap());
+        connection
+            .execute(
+                "UPDATE sessionatlas_meta SET value = ?1
+                 WHERE key = 'content_index_sanitizer_version'",
+                [sessionatlas_core::store::CONTENT_INDEX_SANITIZER_VERSION.to_string()],
+            )
+            .unwrap();
+        assert!(content_index_available(&connection).unwrap());
     }
 }
 

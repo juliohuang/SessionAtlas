@@ -1,6 +1,6 @@
 # SessionAtlas 剩余问题与完成执行手册
 
-**更新时间：** 2026-08-16
+**更新时间：** 2026-08-18
 
 **文档状态：** 当前剩余工作的唯一入口。仓库已切换为纯 Rust 工作区
 （见 [`rust-migration-plan.md`](./rust-migration-plan.md)）；本文件只整理 R13 之后
@@ -40,14 +40,14 @@
 | RI-01 | P1 | 测试隔离/原生证据 | IN PROGRESS | 临时 home 与 fixture 已完成；仍需原生过程真实数据根前后哈希证据 |
 | RI-02 | P1 | Tauri 原生验收 | BLOCKED by RI-01 | T1～T9 全部 PASS，并保存非生产 fixture 的证据 |
 | RI-04 | P1 | 托管 CI/发布 | BLOCKED | 需同一 commit 的 Windows + Ubuntu 托管 job 证据；本地 R14 自动化不能替代托管执行器 |
-| RI-05 | P2 | 供应链检查 | PASS | 2026-08-16 本地 `cargo audit 0.22.2` 扫描 542 个锁定 crate：0 个漏洞；17 个上游 informational warning 已记录风险与依赖路径 |
+| RI-05 | P2 | 供应链检查 | PASS | 2026-08-18 本地 `cargo audit 0.22.2` 扫描 538 个锁定 crate：0 个漏洞；17 个上游 informational warning 已记录风险与依赖路径 |
 | RI-06 | P2 | 版本控制/交付 | BLOCKED by RI-01/RI-02 | 首次 GitHub 交付已完成；剩余门禁通过后执行最终交付复核 |
 | RI-07 | P3 | 测试残留处置 | BLOCKED by 用户授权 | 5 个可恢复数据库备份被归档或删除，结果有记录 |
 
 ### 2.3 已知现场状态
 
 - 当前 `origin` 是私有 GitHub 仓库 `juliohuang/SessionAtlas`。
-- 2026-08-16 使用 `cargo-audit 0.22.2` 扫描 542 个锁定 Rust crate，结果为 0 个漏洞、
+- 2026-08-18 使用 `cargo-audit 0.22.2` 扫描 538 个锁定 Rust crate，结果为 0 个漏洞、
   17 个已分析的上游 informational warning；处置边界记录在
   `execution-security-contract.md`。本地 RI-05 判为 PASS；托管 Security workflow
   仍须在交付 commit 上成功运行，本地结果不能替代托管证据。
@@ -275,7 +275,7 @@ manifest schemaVersion=2 完整记录两个项目/会话 ID/UTC 时间；`git di
 workflow 仍是门禁）；托管 CI 未运行（RI-04 保持 BLOCKED）；第 10 节手工/真机
 门禁与原生 UI T1～T9 全部未通过。
 
-**2026-08-16 后续复核：** 已在当前工作区执行 `cargo audit 0.22.2`，扫描 542 个
+**2026-08-18 后续复核：** 已在当前工作区执行 `cargo audit 0.22.2`，扫描 538 个
 锁定 crate，结果为 0 个漏洞、17 个已分析的上游 informational warning，RI-05
 更新为 PASS。R14 当时未执行的历史记录保留不变；托管 Security workflow 仍需在
 交付 commit 上通过。

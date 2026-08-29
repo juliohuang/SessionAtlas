@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub(crate) const MAX_PTY_COLS: u16 = 1_000;
 pub(crate) const MAX_PTY_ROWS: u16 = 1_000;
 pub(crate) const MAX_PTY_INPUT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_PTY_OUTPUT_BATCH_BYTES: usize = 64 * 1024;
+pub(crate) const PTY_OUTPUT_BATCH_INTERVAL: Duration = Duration::from_millis(16);
 
 pub(crate) fn normalize_pty_size(cols: u16, rows: u16) -> (u16, u16) {
     (cols.clamp(2, MAX_PTY_COLS), rows.clamp(1, MAX_PTY_ROWS))
@@ -187,6 +190,89 @@ impl Utf8StreamDecoder {
     }
 }
 
+/// Coalesces PTY output before it crosses the Tauri event bridge. The output
+/// worker owns this state, so output order is unchanged and the bounded input
+/// channel provides backpressure. A full batch is emitted immediately;
+/// otherwise a busy stream is flushed at most every 16ms and the final tail is
+/// explicitly flushed when the reader exits.
+pub(crate) struct PtyOutputBatcher {
+    pending: String,
+    last_emit: Instant,
+}
+
+impl PtyOutputBatcher {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            pending: String::new(),
+            last_emit: now,
+        }
+    }
+
+    pub(crate) fn push(&mut self, data: &str, now: Instant) -> Vec<String> {
+        let mut batches = Vec::new();
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let available = MAX_PTY_OUTPUT_BATCH_BYTES.saturating_sub(self.pending.len());
+            if available == 0 {
+                batches.push(self.take_pending(now));
+                continue;
+            }
+            let mut take = remaining.len().min(available);
+            while take > 0 && !remaining.is_char_boundary(take) {
+                take -= 1;
+            }
+            // If the next scalar does not fit, flush the existing batch first
+            // so the byte bound remains strict. Only an empty batch may take
+            // the scalar as a whole (UTF-8 scalars are far below the limit).
+            if take == 0 && !self.pending.is_empty() {
+                batches.push(self.take_pending(now));
+                continue;
+            }
+            // `take` is at least one byte for a valid non-empty UTF-8 string;
+            // if the first character itself is larger than the remaining
+            // budget, include that character rather than splitting it.
+            let take = if take == 0 {
+                remaining
+                    .char_indices()
+                    .nth(1)
+                    .map_or(remaining.len(), |(index, _)| index)
+            } else {
+                take
+            };
+            self.pending.push_str(&remaining[..take]);
+            remaining = &remaining[take..];
+            if self.pending.len() >= MAX_PTY_OUTPUT_BATCH_BYTES {
+                batches.push(self.take_pending(now));
+            }
+        }
+        if !self.pending.is_empty()
+            && now.saturating_duration_since(self.last_emit) >= PTY_OUTPUT_BATCH_INTERVAL
+        {
+            batches.push(self.take_pending(now));
+        }
+        batches
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub(crate) fn flush(&mut self, now: Instant) -> Option<String> {
+        (!self.pending.is_empty()).then(|| self.take_pending(now))
+    }
+
+    pub(crate) fn flush_if_due(&mut self, now: Instant) -> Option<String> {
+        (!self.pending.is_empty()
+            && now.saturating_duration_since(self.last_emit) >= PTY_OUTPUT_BATCH_INTERVAL)
+            .then(|| self.take_pending(now))
+    }
+
+    fn take_pending(&mut self, now: Instant) -> String {
+        self.last_emit = now;
+        std::mem::take(&mut self.pending)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +337,92 @@ mod tests {
         assert_eq!(decoder.push(&[0xff, b'a']), "\u{fffd}a");
         assert_eq!(decoder.push(&[0xe2]), "");
         assert_eq!(decoder.finish(), "\u{fffd}");
+    }
+
+    #[test]
+    fn output_batcher_preserves_order_and_flushes_on_interval() {
+        let start = Instant::now();
+        let mut batcher = PtyOutputBatcher::new(start);
+        assert!(batcher
+            .push("one", start + Duration::from_millis(8))
+            .is_empty());
+        assert_eq!(
+            batcher.push("-two", start + PTY_OUTPUT_BATCH_INTERVAL),
+            vec!["one-two".to_string()]
+        );
+        assert_eq!(batcher.flush(start + PTY_OUTPUT_BATCH_INTERVAL), None,);
+    }
+
+    #[test]
+    fn output_batcher_flushes_at_bounded_size_and_on_exit() {
+        let start = Instant::now();
+        let mut batcher = PtyOutputBatcher::new(start);
+        let first = "x".repeat(MAX_PTY_OUTPUT_BATCH_BYTES);
+        assert_eq!(
+            batcher.push(&first, start + Duration::from_millis(1)),
+            vec![first]
+        );
+        assert!(batcher
+            .push("tail", start + Duration::from_millis(2))
+            .is_empty());
+        assert_eq!(
+            batcher.flush(start + Duration::from_millis(2)),
+            Some("tail".to_string())
+        );
+    }
+
+    #[test]
+    fn short_prompt_is_due_without_a_follow_up_read() {
+        let start = Instant::now();
+        let mut batcher = PtyOutputBatcher::new(start);
+        assert!(batcher.push("prompt> ", start).is_empty());
+        assert!(batcher
+            .flush_if_due(start + Duration::from_millis(8))
+            .is_none());
+        assert_eq!(
+            batcher
+                .flush_if_due(start + PTY_OUTPUT_BATCH_INTERVAL)
+                .as_deref(),
+            Some("prompt> ")
+        );
+    }
+
+    #[test]
+    fn empty_timer_ticks_never_emit_empty_frames() {
+        let start = Instant::now();
+        let mut batcher = PtyOutputBatcher::new(start);
+        assert!(batcher
+            .flush_if_due(start + PTY_OUTPUT_BATCH_INTERVAL)
+            .is_none());
+        assert!(batcher
+            .flush_if_due(start + PTY_OUTPUT_BATCH_INTERVAL * 2)
+            .is_none());
+    }
+
+    #[test]
+    fn output_batcher_does_not_split_utf8_at_the_byte_limit() {
+        let start = Instant::now();
+        let mut batcher = PtyOutputBatcher::new(start);
+        let data = format!("{}界", "a".repeat(MAX_PTY_OUTPUT_BATCH_BYTES - 3));
+        let batches = batcher.push(&data, start + Duration::from_millis(1));
+        assert_eq!(batches.join(""), data);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.len() <= MAX_PTY_OUTPUT_BATCH_BYTES));
+    }
+
+    #[test]
+    fn output_batcher_flushes_before_a_scalar_that_would_cross_the_limit() {
+        let start = Instant::now();
+        let mut batcher = PtyOutputBatcher::new(start);
+        let ascii = "a".repeat(MAX_PTY_OUTPUT_BATCH_BYTES - 1);
+        let data = format!("{ascii}界");
+        let batches = batcher.push(&data, start + Duration::from_millis(1));
+        assert_eq!(batches, vec![ascii.clone()]);
+        assert_eq!(
+            batcher.flush(start + Duration::from_millis(1)),
+            Some("界".to_string())
+        );
+        assert_eq!(batches.join("") + "界", data);
     }
 }

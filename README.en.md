@@ -20,19 +20,19 @@ SessionAtlas has two cooperating components:
 
 ## Who it is for
 
-SessionAtlas helps people who use several AI coding CLIs and regularly lose track of which tool or session was last used for a project. It does not purchase or authenticate any AI service for you. The desktop settings can install an allowlisted CLI package through npm or uv after an explicit confirmation; account login remains the user's responsibility.
+SessionAtlas helps people who use several AI coding CLIs and regularly lose track of which tool or session was last used for a project. It does not purchase or authenticate any AI service for you. After explicit confirmation, desktop settings can install only the fixed npm/uv package declared by a validated active adapter; account login remains the user's responsibility.
 
 ## Install
 
 ### Windows desktop beta
 
-Download the latest `.msi` or `-setup.exe` from [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest). Scanning runs in-process inside the desktop app; the installer does not bundle a separate scanner binary and no .NET runtime is required. When the index is missing, the first launch scans automatically; use **Rescan** for later refreshes.
+Download the latest `.msi` or `-setup.exe` from [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest). Scanning runs in-process inside the desktop app; the installer does not bundle a separate scanner binary or require an additional language runtime. When the index is missing, the first launch scans automatically; use **Rescan** for later refreshes.
 
 Requirements:
 
 - Windows 10/11 x64;
 - WebView2 Runtime (normally included with Windows 11);
-- a supported AI CLI must be installed, enabled for that machine, and authenticated before SessionAtlas can launch its sessions. Missing allowlisted CLIs can be installed from **Settings → AI TUI tools** when npm or uv is available.
+- a supported AI CLI must be installed, compatible with the adapter's platform/remote contract, enabled for that machine, and authenticated before SessionAtlas can launch its sessions. When an active adapter declares a fixed npm/uv package, it can be installed from **Settings → AI TUI tools** if that manager is available.
 
 The first public release is a beta. Keep a copy of `~/.sessionatlas/` before upgrading and see [SUPPORT.md](./SUPPORT.md) when reporting a problem.
 
@@ -69,7 +69,13 @@ The CLI source is built and tested on Windows, macOS, and Linux. Automated deskt
 | Aider | `.aider.chat.history` in common development roots | `aider` |
 | Pi Coding Agent | `~/.pi/agent/sessions/**/*.jsonl` | `pi` |
 
-Additional tools that meet the command-safety contract can be registered with `sessionatlas config add-tool`.
+The six official tools and extensions now use the same declarative adapter
+contract. Official adapters are bundled with the app; **Settings → AI TUI
+tools** can import a validated `adapter.json`, select it per machine, and
+activate, update, or non-destructively roll back adapter versions independently
+from the app. API v1 loads no scripts, native libraries, or arbitrary installer
+commands. See [`docs/tui-adapter-contract.md`](./docs/tui-adapter-contract.md).
+The legacy `sessionatlas config add-tool` command remains for compatibility.
 
 ## Highlights
 
@@ -77,8 +83,10 @@ Additional tools that meet the command-safety contract can be registered with `s
 - tool and recency filters, persistent groups, and drag ordering;
 - real multi-tab PTY terminals and recent-session resume actions;
 - configurable VS Code, file manager, terminal, and custom openers;
+- configurable browser-based development tools such as DSH; each requires an absolute credential-free HTTP(S) connection URL and opens in a sandboxed in-app web tab;
 - remote SSH indexing through passwordless key/agent authentication, with persistent tmux TUI sessions and one reused SSH terminal per server;
-- per-machine local/remote TUI detection, enable switches, and confirmed one-click installation for missing allowlisted tools;
+- one declarative TUI adapter registry for official and extension detection, scanning, launch/resume, installation, and updates, with explicit import, activation, and non-destructive rollback;
+- per-machine local/remote TUI detection and selection; only installed adapters compatible with the machine and remote mode can be enabled, while fixed npm/uv packages support confirmed one-click installation;
 - Chinese and English UI with keyboard-first navigation;
 - browser demo mode backed by bundled sample data when Tauri is unavailable.
 
@@ -86,7 +94,8 @@ Additional tools that meet the command-safety contract can be registered with `s
 
 - **Local first:** indexes, preferences, and configuration stay in `~/.sessionatlas/`; the project contains no telemetry or cloud-sync service.
 - **Read boundary:** scanners read supported tools' local data directories to extract project paths, timestamps, and session metadata. SessionAtlas does not upload this content to a SessionAtlas service.
-- **Execution boundary:** a user action can launch local AI CLIs, terminals, Git, SSH, or a fixed npm/uv package installation. SessionAtlas never accepts an installer command from the frontend; those third-party tools and package managers retain their own network and data policies.
+- **Adapter boundary:** adapters are strictly validated JSON declarations. They load no JavaScript, native library, WASM, or shell script; an ID/version cannot be overwritten and older versions remain available for rollback. API v1 supports explicit local-manifest import, not an online marketplace or signature trust store.
+- **Execution boundary:** a user action can launch local AI CLIs, terminals, Git, SSH, or a fixed npm/uv package installation declared by a validated adapter and allowed by the backend. SessionAtlas never accepts an installer command from the frontend; those third-party tools and package managers retain their own network and data policies.
 - **Normal permission policy:** queued Claude tasks do not add a permission-bypass flag; tasks requiring approval may pause for the user.
 - **Local assets:** xterm.js, highlighting, and fonts do not depend on a CDN. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 
@@ -128,7 +137,7 @@ cargo test
 cargo tauri build
 ```
 
-The desktop `scan_projects` runs the `sessionatlas-core` scan pipeline in-process via `spawn_blocking`; no sidecar is bundled and no .NET runtime is required. Tests must use a temporary `SESSIONATLAS_HOME` and must not read or mutate the real `~/.sessionatlas/`.
+The desktop `scan_projects` runs the `sessionatlas-core` scan pipeline in-process via `spawn_blocking`; no sidecar is bundled and no additional language runtime is required. Tests must use a temporary `SESSIONATLAS_HOME` and must not read or mutate the real `~/.sessionatlas/`.
 
 See [AGENTS.md](./AGENTS.md) for architecture, [`docs/scan-contract.md`](./docs/scan-contract.md) for scanner semantics, and [`docs/test-baseline.md`](./docs/test-baseline.md) for the verification baseline.
 

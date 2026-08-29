@@ -7,21 +7,21 @@
 //! fields; prompts, responses, tool calls, and other conversation content are
 //! never retained.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::base::{
-    complete_session_files, missing_source, probe_directory, probe_file, source_read_failure,
-    ScanDiagnostic, ScanDiagnosticSeverity, ScanOutcome, ScannedProject, Scanner, SourceProbe,
-    MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, MISSING_SESSION_ID, SESSION_READ_FAILED,
-    TIMESTAMP_FALLBACK,
+    bounded_recursive_files, complete_session_files, missing_source, no_follow_metadata,
+    probe_directory, read_bounded_file_detailed, source_read_failure, BoundedFileError,
+    BoundedLines, BudgetError, ScanBudget, ScanContext, ScanDiagnostic, ScanDiagnosticSeverity,
+    ScanOutcome, ScannedProject, Scanner, SourceProbe, MALFORMED_SESSION_RECORD,
+    MISSING_PROJECT_PATH, MISSING_SESSION_ID, SESSION_READ_FAILED, TIMESTAMP_FALLBACK,
 };
 use super::parsing::{
-    expand_tilde, home_directory, recursive_file_enumeration, try_normalize_project_path,
-    try_read_unix_timestamp, try_read_utc_timestamp,
+    expand_tilde, home_directory, try_normalize_project_path, try_read_unix_timestamp,
+    try_read_utc_timestamp,
 };
 
 const AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
@@ -30,6 +30,7 @@ const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
 /// Scanner for Pi Coding Agent's persisted JSONL sessions.
 pub struct PiScanner {
     is_available: Box<dyn Fn() -> bool>,
+    budget: ScanBudget,
 }
 
 impl PiScanner {
@@ -43,7 +44,12 @@ impl PiScanner {
     pub fn with_availability(availability: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_available: Box::new(availability),
+            budget: ScanBudget::default(),
         }
+    }
+    pub fn with_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -76,9 +82,15 @@ impl PiScanner {
         let Some(agent_dir) = resolve_agent_dir() else {
             return missing_source("pi", self.is_available());
         };
-        let sessions_dir = match resolve_sessions_dir(&agent_dir) {
+        let context = self.budget.context();
+        let sessions_dir = match resolve_sessions_dir_bounded(&agent_dir, &context) {
             Ok(path) => path,
-            Err(()) => return source_read_failure("pi", "the Pi Coding Agent settings file"),
+            Err(ResolveSessionsError::Budget(error)) => {
+                return ScanOutcome::failed([context.diagnostic("pi", error)]);
+            }
+            Err(ResolveSessionsError::SourceRead) => {
+                return source_read_failure("pi", "the Pi Coding Agent settings file");
+            }
         };
         match probe_directory(&sessions_dir) {
             SourceProbe::Missing => return missing_source("pi", self.is_available()),
@@ -88,18 +100,27 @@ impl PiScanner {
             SourceProbe::Exists => {}
         }
 
-        let session_files = match enumerate_jsonl_files(&sessions_dir) {
+        let session_files = match enumerate_jsonl_files(&sessions_dir, &context) {
             Ok(files) => files,
-            Err(()) => {
-                return source_read_failure("pi", "the Pi Coding Agent sessions directory");
-            }
+            Err(error) => return ScanOutcome::failed([context.diagnostic("pi", error)]),
         };
 
         let mut projects = Vec::new();
         let mut diagnostics = Vec::new();
         let source_root = agent_dir.to_string_lossy().into_owned();
         for session_file in &session_files {
-            parse_session_file(session_file, &source_root, &mut projects, &mut diagnostics);
+            if context.source_file_path(session_file).is_err() {
+                return ScanOutcome::failed([context.diagnostic("pi", BudgetError::Exceeded)]);
+            }
+            if let Err(error) = parse_session_file(
+                session_file,
+                &source_root,
+                &context,
+                &mut projects,
+                &mut diagnostics,
+            ) {
+                return ScanOutcome::failed([context.diagnostic("pi", error)]);
+            }
         }
 
         complete_session_files("pi", session_files.len(), projects, diagnostics)
@@ -124,30 +145,75 @@ fn resolve_agent_dir() -> Option<PathBuf> {
 
 /// Resolve the official override first, then the global `settings.json`
 /// `sessionDir`, then Pi's default `~/.pi/agent/sessions` location.
+#[cfg(test)]
 fn resolve_sessions_dir(agent_dir: &Path) -> Result<PathBuf, ()> {
     if let Some(value) = non_blank_env(SESSION_DIR_ENV) {
         return Ok(resolve_configured_path(&value, agent_dir));
     }
 
     let settings_path = agent_dir.join("settings.json");
-    match probe_file(&settings_path) {
-        SourceProbe::Missing => {}
-        SourceProbe::Failed => return Err(()),
-        SourceProbe::Exists => {
-            let content = std::fs::read_to_string(settings_path).map_err(|_| ())?;
-            let settings =
-                serde_json::from_str::<Value>(content.strip_prefix('\u{feff}').unwrap_or(&content))
-                    .map_err(|_| ())?;
-            let settings = settings.as_object().ok_or(())?;
-            if let Some(value) = settings.get("sessionDir") {
-                let value = value.as_str().ok_or(())?.trim();
-                if !value.is_empty() {
-                    return Ok(resolve_configured_path(value, agent_dir));
-                }
+    if let Ok(content) = std::fs::read_to_string(settings_path) {
+        if let Ok(settings) =
+            serde_json::from_str::<Value>(content.strip_prefix('\u{feff}').unwrap_or(&content))
+        {
+            if let Some(value) = settings
+                .get("sessionDir")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Ok(resolve_configured_path(value, agent_dir));
             }
         }
     }
 
+    Ok(agent_dir.join("sessions"))
+}
+
+enum ResolveSessionsError {
+    Budget(BudgetError),
+    SourceRead,
+}
+
+fn resolve_sessions_dir_bounded(
+    agent_dir: &Path,
+    context: &ScanContext,
+) -> Result<PathBuf, ResolveSessionsError> {
+    if let Some(value) = non_blank_env(SESSION_DIR_ENV) {
+        return Ok(resolve_configured_path(&value, agent_dir));
+    }
+    let settings_path = agent_dir.join("settings.json");
+    match no_follow_metadata(&settings_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(ResolveSessionsError::SourceRead),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(agent_dir.join("sessions"));
+        }
+        Err(_) => return Err(ResolveSessionsError::SourceRead),
+    }
+    let content = match read_bounded_file_detailed(&settings_path, context) {
+        Ok(content) => content,
+        Err(BoundedFileError::Budget(error)) => return Err(ResolveSessionsError::Budget(error)),
+        Err(BoundedFileError::Io) => return Err(ResolveSessionsError::SourceRead),
+    };
+    let settings = serde_json::from_slice::<Value>(
+        content
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .unwrap_or(&content),
+    )
+    .map_err(|_| ResolveSessionsError::SourceRead)?;
+    let settings = settings
+        .as_object()
+        .ok_or(ResolveSessionsError::SourceRead)?;
+    if let Some(value) = settings.get("sessionDir") {
+        let value = value
+            .as_str()
+            .ok_or(ResolveSessionsError::SourceRead)?
+            .trim();
+        if !value.is_empty() {
+            return Ok(resolve_configured_path(value, agent_dir));
+        }
+    }
     Ok(agent_dir.join("sessions"))
 }
 
@@ -169,12 +235,14 @@ fn resolve_configured_path(value: &str, agent_dir: &Path) -> PathBuf {
     }
 }
 
-fn enumerate_jsonl_files(sessions_dir: &Path) -> Result<Vec<PathBuf>, ()> {
+fn enumerate_jsonl_files(
+    sessions_dir: &Path,
+    context: &ScanContext,
+) -> Result<Vec<PathBuf>, BudgetError> {
     let mut files = Vec::new();
-    for entry in recursive_file_enumeration(sessions_dir) {
-        let entry = entry.map_err(|_| ())?;
-        if entry.file_type().is_file() && is_jsonl(entry.path()) {
-            files.push(entry.into_path());
+    for path in bounded_recursive_files(sessions_dir, context)? {
+        if is_jsonl(&path) {
+            files.push(path);
         }
     }
     files.sort();
@@ -195,19 +263,21 @@ fn is_jsonl(path: &Path) -> bool {
 fn parse_session_file(
     session_file: &Path,
     source_root: &str,
+    context: &ScanContext,
     projects: &mut Vec<ScannedProject>,
     diagnostics: &mut Vec<ScanDiagnostic>,
-) {
-    let file = match std::fs::File::open(session_file) {
-        Ok(file) => file,
-        Err(_) => {
+) -> Result<(), BudgetError> {
+    let mut lines = match BoundedLines::open(session_file, context) {
+        Ok(lines) => lines,
+        Err(crate::scanner::BoundedLineError::Budget(error)) => return Err(error),
+        Err(crate::scanner::BoundedLineError::Io) => {
             diagnostics.push(ScanDiagnostic::new(
                 "pi",
                 ScanDiagnosticSeverity::Warning,
                 SESSION_READ_FAILED,
                 "A Pi Coding Agent session file could not be read and was skipped.",
             ));
-            return;
+            return Ok(());
         }
     };
 
@@ -217,8 +287,22 @@ fn parse_session_file(
     let mut malformed_lines = 0;
     let mut first_line = true;
 
-    for line in BufReader::new(file).lines() {
-        let line = match line {
+    loop {
+        let raw_line = match lines.next_line() {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(crate::scanner::BoundedLineError::Budget(error)) => return Err(error),
+            Err(crate::scanner::BoundedLineError::Io) => {
+                diagnostics.push(ScanDiagnostic::new(
+                    "pi",
+                    ScanDiagnosticSeverity::Warning,
+                    SESSION_READ_FAILED,
+                    "A Pi Coding Agent session file could not be read and was skipped.",
+                ));
+                return Ok(());
+            }
+        };
+        let line = match String::from_utf8(raw_line) {
             Ok(line) => line,
             Err(_) => {
                 diagnostics.push(ScanDiagnostic::new(
@@ -227,7 +311,7 @@ fn parse_session_file(
                     SESSION_READ_FAILED,
                     "A Pi Coding Agent session file could not be read and was skipped.",
                 ));
-                return;
+                return Ok(());
             }
         };
         let line = if first_line {
@@ -287,7 +371,7 @@ fn parse_session_file(
             MISSING_PROJECT_PATH,
             "A Pi Coding Agent session did not contain a safe absolute cwd and was skipped.",
         ));
-        return;
+        return Ok(());
     };
 
     let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) else {
@@ -297,7 +381,7 @@ fn parse_session_file(
             MISSING_SESSION_ID,
             "A Pi Coding Agent session did not contain a native session ID and was skipped.",
         ));
-        return;
+        return Ok(());
     };
 
     let last_accessed_at = match latest_activity {
@@ -310,7 +394,7 @@ fn parse_session_file(
                 "A Pi Coding Agent session had no valid activity timestamp; file modification time was used.",
             ));
             let Some(fallback) = file_last_write_utc(session_file) else {
-                return;
+                return Ok(());
             };
             fallback
         }
@@ -322,6 +406,7 @@ fn parse_session_file(
         session_id: Some(session_id),
         git_branch: None,
     });
+    Ok(())
 }
 
 fn file_last_write_utc(path: &Path) -> Option<DateTime<Utc>> {
@@ -367,10 +452,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let previous_home = std::env::var_os("SESSIONATLAS_HOME");
+        let previous_agent = std::env::var_os(AGENT_DIR_ENV);
         let previous_sessions = std::env::var_os(SESSION_DIR_ENV);
         std::env::set_var("SESSIONATLAS_HOME", path);
+        std::env::remove_var(AGENT_DIR_ENV);
         std::env::remove_var(SESSION_DIR_ENV);
-        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        struct Restore(
+            Option<std::ffi::OsString>,
+            Option<std::ffi::OsString>,
+            Option<std::ffi::OsString>,
+        );
         impl Drop for Restore {
             fn drop(&mut self) {
                 match &self.0 {
@@ -378,12 +469,16 @@ mod tests {
                     None => std::env::remove_var("SESSIONATLAS_HOME"),
                 }
                 match &self.1 {
+                    Some(value) => std::env::set_var(AGENT_DIR_ENV, value),
+                    None => std::env::remove_var(AGENT_DIR_ENV),
+                }
+                match &self.2 {
                     Some(value) => std::env::set_var(SESSION_DIR_ENV, value),
                     None => std::env::remove_var(SESSION_DIR_ENV),
                 }
             }
         }
-        let _restore = Restore(previous_home, previous_sessions);
+        let _restore = Restore(previous_home, previous_agent, previous_sessions);
         body()
     }
 

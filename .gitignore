@@ -16,6 +16,12 @@ desktop.ini
 *.user
 *.suo
 
+# Local environment files (keep documented examples trackable)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
 # Local SQLite WAL/SHM files (defensive — sessionatlas writes them next to the DB)
 *.db-shm
 *.db-wal

@@ -23,13 +23,13 @@ pub(crate) fn validate_tool_key(value: &str) -> Result<&str, String> {
 
 pub(crate) fn validate_session_id(value: &str) -> Result<&str, String> {
     let value = value.trim();
-    if value.is_empty() || value.len() > MAX_SESSION_ID_LEN {
-        return Err("invalid session id length".to_string());
-    }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '+' | '-'))
-    {
+    if sessionatlas_core::security::validate_session_id(value).is_err() {
+        if value.is_empty() || value.len() > MAX_SESSION_ID_LEN {
+            return Err("invalid session id length".to_string());
+        }
+        if value.starts_with('-') {
+            return Err("session id cannot start with '-'".to_string());
+        }
         return Err("session id contains unsupported characters".to_string());
     }
     Ok(value)
@@ -51,26 +51,19 @@ pub(crate) fn build_tool_launch_input(
     Ok(Some(build_argv_launch_input(&args)?))
 }
 
+#[cfg(test)]
 pub(crate) fn tool_launch_argv(
     tool_key: &str,
     session_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let tool_key = validate_tool_key(tool_key)?;
-    let mut args = vec![tool_key.to_string()];
-    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
-        args.push(
-            if tool_key.eq_ignore_ascii_case("codex") {
-                "resume"
-            } else if tool_key.eq_ignore_ascii_case("pi") {
-                "--session"
-            } else {
-                "--resume"
-            }
-            .to_string(),
-        );
-        args.push(validate_session_id(session_id)?.to_string());
-    }
-    Ok(args)
+    let registry = sessionatlas_core::adapter::AdapterRegistry::bundled()
+        .map_err(|error| error.to_string())?;
+    registry
+        .find(tool_key)
+        .ok_or_else(|| format!("unsupported TUI adapter: {tool_key}"))?
+        .launch_argv(session_id)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn validate_cli_argv(args: &[String]) -> Result<(), String> {
@@ -332,6 +325,30 @@ mod tests {
         );
         assert!(build_tool_launch_input(Some("codex & calc"), None).is_err());
         assert!(build_tool_launch_input(Some("codex"), Some("ok\rwhoami")).is_err());
+    }
+
+    #[test]
+    fn session_ids_reject_option_shapes_and_unicode_dash_lookalikes() {
+        for value in [
+            "-x",
+            "--help",
+            " -x ",
+            "\t--help\t",
+            "\u{2212}x",
+            "\u{2010}x",
+            "\u{2011}x",
+            "\u{2013}x",
+            "\u{2014}x",
+            "a\nresume",
+            "a\u{0000}resume",
+        ] {
+            assert!(validate_session_id(value).is_err(), "accepted {value:?}");
+        }
+
+        for value in ["session-123", "provider.v2_1:part+2", "id-with-dash"] {
+            assert_eq!(validate_session_id(value).unwrap(), value);
+        }
+        assert_eq!(validate_session_id(" session-123 ").unwrap(), "session-123");
     }
 
     #[test]

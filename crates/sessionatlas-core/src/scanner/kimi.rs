@@ -12,13 +12,13 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::base::{
-    complete_session_files, missing_source, probe_directory, source_read_failure, ScanDiagnostic,
-    ScanDiagnosticSeverity, ScanOutcome, ScannedProject, Scanner, SourceProbe,
-    MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, SESSION_READ_FAILED, TIMESTAMP_FALLBACK,
+    bounded_recursive_files, complete_session_files, missing_source, probe_directory,
+    read_bounded_file_detailed, source_read_failure, BoundedFileError, BudgetError, ScanBudget,
+    ScanContext, ScanDiagnostic, ScanDiagnosticSeverity, ScanOutcome, ScannedProject, Scanner,
+    SourceProbe, MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, SESSION_READ_FAILED,
+    TIMESTAMP_FALLBACK,
 };
-use super::parsing::{
-    home_directory, recursive_file_enumeration, try_normalize_project_path, try_read_utc_timestamp,
-};
+use super::parsing::{home_directory, try_normalize_project_path, try_read_utc_timestamp};
 
 /// Kimi Code state file name under each session directory.
 const STATE_FILE_NAME: &str = "state.json";
@@ -26,6 +26,7 @@ const STATE_FILE_NAME: &str = "state.json";
 /// Kimi CLI scanner for `~/.kimi-code/sessions/<worktree-key>/<session-id>/state.json`.
 pub struct KimiScanner {
     is_available: Box<dyn Fn() -> bool>,
+    budget: ScanBudget,
 }
 
 impl KimiScanner {
@@ -39,7 +40,12 @@ impl KimiScanner {
     pub fn with_availability(availability: impl Fn() -> bool + 'static) -> Self {
         Self {
             is_available: Box::new(availability),
+            budget: ScanBudget::default(),
         }
+    }
+    pub fn with_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -81,18 +87,25 @@ impl KimiScanner {
             SourceProbe::Exists => {}
         }
 
-        let state_files = match enumerate_state_files(&sessions_dir) {
+        let context = self.budget.context();
+        let state_files = match enumerate_state_files(&sessions_dir, &context) {
             Ok(files) => files,
-            Err(()) => {
-                return source_read_failure("kimi", "the Kimi Code sessions directory");
-            }
+            Err(error) => return ScanOutcome::failed([context.diagnostic("kimi", error)]),
         };
 
         let mut projects = Vec::new();
         let mut diagnostics = Vec::new();
         let kimi_home = kimi_home.to_string_lossy().into_owned();
         for state_file in &state_files {
-            parse_state_file(state_file, &kimi_home, &mut projects, &mut diagnostics);
+            if let Err(error) = parse_state_file(
+                state_file,
+                &kimi_home,
+                &context,
+                &mut projects,
+                &mut diagnostics,
+            ) {
+                return ScanOutcome::failed([context.diagnostic("kimi", error)]);
+            }
         }
 
         complete_session_files("kimi", state_files.len(), projects, diagnostics)
@@ -124,15 +137,14 @@ fn env_var_non_blank(name: &str) -> bool {
 /// Recursively enumerates `state.json` files in ordinal path order. Any
 /// inaccessible entry surfaces as `Err(())`; enumeration stops on the first
 /// unreadable path.
-fn enumerate_state_files(sessions_dir: &Path) -> Result<Vec<PathBuf>, ()> {
+fn enumerate_state_files(
+    sessions_dir: &Path,
+    context: &ScanContext,
+) -> Result<Vec<PathBuf>, BudgetError> {
     let mut files = Vec::new();
-    for entry in recursive_file_enumeration(sessions_dir) {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => return Err(()),
-        };
-        if entry.file_type().is_file() && is_state_file(entry.path()) {
-            files.push(entry.into_path());
+    for path in bounded_recursive_files(sessions_dir, context)? {
+        if is_state_file(&path) {
+            files.push(path);
         }
     }
     files.sort();
@@ -161,10 +173,24 @@ fn is_state_file(path: &Path) -> bool {
 fn parse_state_file(
     state_file: &Path,
     kimi_home: &str,
+    context: &ScanContext,
     projects: &mut Vec<ScannedProject>,
     diagnostics: &mut Vec<ScanDiagnostic>,
-) {
-    let content = match std::fs::read_to_string(state_file) {
+) -> Result<(), BudgetError> {
+    let bytes = match read_bounded_file_detailed(state_file, context) {
+        Ok(bytes) => bytes,
+        Err(BoundedFileError::Budget(error)) => return Err(error),
+        Err(BoundedFileError::Io) => {
+            diagnostics.push(ScanDiagnostic::new(
+                "kimi",
+                ScanDiagnosticSeverity::Warning,
+                SESSION_READ_FAILED,
+                "A Kimi Code state file could not be read and was skipped.",
+            ));
+            return Ok(());
+        }
+    };
+    let content = match String::from_utf8(bytes) {
         Ok(content) => content,
         Err(_) => {
             diagnostics.push(ScanDiagnostic::new(
@@ -173,7 +199,7 @@ fn parse_state_file(
                 SESSION_READ_FAILED,
                 "A Kimi Code state file could not be read and was skipped.",
             ));
-            return;
+            return Ok(());
         }
     };
 
@@ -187,7 +213,7 @@ fn parse_state_file(
                 MALFORMED_SESSION_RECORD,
                 "A Kimi Code state file contained malformed JSON and was skipped.",
             ));
-            return;
+            return Ok(());
         }
     };
 
@@ -202,7 +228,7 @@ fn parse_state_file(
             MISSING_PROJECT_PATH,
             "A Kimi Code session did not contain a safe absolute workDir and was skipped.",
         ));
-        return;
+        return Ok(());
     };
 
     let last_accessed_at = match read_timestamp(&root) {
@@ -215,7 +241,7 @@ fn parse_state_file(
                 "A Kimi Code session had no valid activity timestamp; state-file modification time was used.",
             ));
             let Some(fallback) = file_last_write_utc(state_file) else {
-                return;
+                return Ok(());
             };
             fallback
         }
@@ -230,6 +256,7 @@ fn parse_state_file(
             .map(|name| name.to_string_lossy().into_owned()),
         git_branch: None,
     });
+    Ok(())
 }
 
 /// First usable timestamp among the candidate property names, in order.
