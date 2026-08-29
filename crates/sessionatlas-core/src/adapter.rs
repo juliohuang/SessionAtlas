@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
+use crate::private_fs;
 use crate::process::is_bare_program_name;
 use crate::security;
 
@@ -738,7 +739,15 @@ fn persist_manifest_document(
     bytes: Vec<u8>,
     root: &Path,
 ) -> Result<AdapterManifest, AdapterError> {
-    fs::create_dir_all(root)
+    if let Some(data_root) = root
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == ".sessionatlas"))
+    {
+        private_fs::ensure_private_directory(data_root).map_err(|error| {
+            AdapterError::new(format!("could not prepare private data root: {error}"))
+        })?;
+    }
+    private_fs::ensure_private_directory(root)
         .map_err(|error| AdapterError::new(format!("could not create adapter root: {error}")))?;
     verify_adapter_directory(root)?;
     let id_directory = root.join(&manifest.id);
@@ -776,13 +785,9 @@ fn persist_manifest_document(
     }
     let temporary = target_directory.join(format!("adapter.json.tmp.{}", Uuid::new_v4()));
     let write_result = (|| -> Result<(), AdapterError> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|error| {
-                AdapterError::new(format!("could not create adapter temp file: {error}"))
-            })?;
+        let mut file = private_fs::open_private_create_new(&temporary).map_err(|error| {
+            AdapterError::new(format!("could not create adapter temp file: {error}"))
+        })?;
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|error| {
@@ -801,15 +806,9 @@ fn persist_manifest_document(
 }
 
 fn create_adapter_directory(path: &Path) -> Result<(), AdapterError> {
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(AdapterError::new(format!(
-                "could not create adapter directory: {error}"
-            )));
-        }
-    }
+    private_fs::ensure_private_directory(path).map_err(|error| {
+        AdapterError::new(format!("could not create adapter directory: {error}"))
+    })?;
     verify_adapter_directory(path)
 }
 
@@ -962,6 +961,27 @@ mod tests {
         fs::write(&source, &upgraded).unwrap();
         let manifest = install_manifest_file(&source, &root).unwrap();
         assert_eq!(manifest.adapter_version, "1.1.0");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let version = root.join("codex").join("1.1.0");
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&version).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(version.join("adapter.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
 
         let mut config = AppConfig::default();
         config

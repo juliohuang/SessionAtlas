@@ -27,6 +27,7 @@ pub mod indexer;
 pub mod launcher;
 pub mod model;
 pub mod path;
+pub mod private_fs;
 pub mod process;
 pub mod scanner;
 pub mod security;

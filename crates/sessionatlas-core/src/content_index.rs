@@ -10,6 +10,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use base64::Engine;
 use walkdir::{DirEntry, WalkDir};
 
 /// File metadata used to skip unchanged documents without reading them.
@@ -113,6 +114,10 @@ pub fn collect_project_content(
             continue;
         };
         let relative_path = relative.replace('\\', "/");
+        if path_contains_high_confidence_credential(&relative_path) {
+            result.skipped_files += 1;
+            continue;
+        }
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -392,37 +397,57 @@ fn read_utf8_document(path: &Path, max_bytes: usize) -> io::Result<Option<String
 fn redact_sensitive_lines(text: &str) -> String {
     let mut redacted = Vec::new();
     let mut inside_private_key = false;
+    let mut redact_next_value = false;
+    let mut redact_indented_block_after = None;
     for line in text.lines() {
+        if let Some(parent_indent) = redact_indented_block_after {
+            if line.trim().is_empty() {
+                redacted.push(line);
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            if indent > parent_indent {
+                redacted.push("[redacted-sensitive-line]");
+                continue;
+            }
+            redact_indented_block_after = None;
+        }
+        if redact_next_value {
+            if line.trim().is_empty() {
+                redacted.push(line);
+                continue;
+            }
+            redacted.push("[redacted-sensitive-line]");
+            redact_next_value = false;
+            continue;
+        }
         let lower = line.to_ascii_lowercase();
-        if lower.contains("begin private key") {
+        if begins_sensitive_key_block(&lower) {
             inside_private_key = true;
             redacted.push("[redacted-sensitive-block]");
             continue;
         }
         if inside_private_key {
-            if lower.contains("end private key") {
+            if ends_sensitive_key_block(&lower) {
                 inside_private_key = false;
             }
             continue;
         }
-        let sensitive_marker = [
-            "password",
-            "passwd",
-            "api_key",
-            "apikey",
-            "access_token",
-            "refresh_token",
-            "client_secret",
-            "private_key",
-            "authorization:",
-            "bearer ",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker));
+        let sensitive_assignment = sensitive_assignment_separator(line);
         redacted.push(
-            if sensitive_marker
-                && (line.contains('=') || line.contains(':') || lower.contains("bearer "))
+            if sensitive_assignment.is_some()
+                || contains_high_confidence_credential(line)
+                || lower.contains("bearer ")
+                || (lower.contains("basic ") && lower.contains("authorization"))
             {
+                if let Some(separator) = sensitive_assignment {
+                    let remainder = line[separator + 1..].trim();
+                    if matches!(remainder, "|" | ">" | "|-" | ">-" | "|+" | ">+") {
+                        redact_indented_block_after = Some(line.len() - line.trim_start().len());
+                    } else {
+                        redact_next_value = remainder.is_empty();
+                    }
+                }
                 "[redacted-sensitive-line]"
             } else {
                 line
@@ -430,6 +455,197 @@ fn redact_sensitive_lines(text: &str) -> String {
         );
     }
     redacted.join("\n")
+}
+
+fn begins_sensitive_key_block(lower: &str) -> bool {
+    (lower.contains("-----begin ") && lower.contains("private key-----"))
+        || lower.contains("-----begin pgp private key block-----")
+}
+
+fn ends_sensitive_key_block(lower: &str) -> bool {
+    (lower.contains("-----end ") && lower.contains("private key-----"))
+        || lower.contains("-----end pgp private key block-----")
+}
+
+fn sensitive_assignment_separator(line: &str) -> Option<usize> {
+    line.char_indices()
+        .filter(|(_, character)| matches!(character, '=' | ':'))
+        .find_map(|(separator, _)| {
+            let key = line[..separator]
+                .trim_end()
+                .rsplit(|character: char| {
+                    character.is_whitespace()
+                        || matches!(character, '=' | ':' | '{' | '[' | '(' | ',' | ';')
+                })
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character: char| {
+                    matches!(character, '"' | '\'' | '`' | ']' | '}' | ')')
+                });
+            sensitive_key_name(key).then_some(separator)
+        })
+}
+
+fn sensitive_key_name(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if normalized.is_empty() {
+        return false;
+    }
+    [
+        "apikey",
+        "xapikey",
+        "privatekey",
+        "secretkey",
+        "accountkey",
+        "awsaccesskeyid",
+        "awssecretaccesskey",
+        "authorization",
+        "proxyauthorization",
+        "cookie",
+        "setcookie",
+        "databaseurl",
+        "connectionstring",
+        "dsn",
+        "pwd",
+    ]
+    .contains(&normalized.as_str())
+        || [
+            "password",
+            "passwd",
+            "passphrase",
+            "token",
+            "secret",
+            "credential",
+        ]
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
+}
+
+fn contains_high_confidence_credential(line: &str) -> bool {
+    if contains_credentialized_url(line) {
+        return true;
+    }
+    line.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\''
+                    | '`'
+                    | ','
+                    | ';'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '/'
+                    | '?'
+                    | '&'
+                    | '='
+                    | '@'
+            )
+    })
+    .map(|token| token.trim_matches(|character: char| matches!(character, ':' | '=')))
+    .any(looks_like_known_credential)
+}
+
+fn path_contains_high_confidence_credential(relative_path: &str) -> bool {
+    relative_path.split('/').any(|component| {
+        looks_like_known_credential(component)
+            || component
+                .rsplit_once('.')
+                .is_some_and(|(stem, _)| looks_like_known_credential(stem))
+    })
+}
+
+fn contains_credentialized_url(line: &str) -> bool {
+    let mut remaining = line;
+    while let Some(scheme_end) = remaining.find("://") {
+        let after_scheme = &remaining[scheme_end + 3..];
+        let authority_end = after_scheme
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '/' | '?' | '#' | '"' | '\'' | '`')
+            })
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            if !authority[..at].is_empty() {
+                return true;
+            }
+        }
+        remaining = &after_scheme[authority_end..];
+    }
+    false
+}
+
+fn looks_like_known_credential(token: &str) -> bool {
+    let trimmed = token.trim_matches(|character: char| {
+        matches!(character, '.' | '!' | '?' | '\\' | '/' | '*' | '&')
+    });
+    let lower = trimmed.to_ascii_lowercase();
+    let provider_prefix = [
+        "github_pat_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "glpat-",
+        "npm_",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
+        "sk_live_",
+        "rk_live_",
+        "pypi-",
+        "sg.",
+        "sk-proj-",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix) && trimmed.len() >= prefix.len() + 16);
+    provider_prefix
+        || (trimmed.len() == 20
+            && (trimmed.starts_with("AKIA") || trimmed.starts_with("ASIA"))
+            && trimmed
+                .chars()
+                .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit()))
+        || (trimmed.starts_with("AIza")
+            && trimmed.len() >= 32
+            && trimmed
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character)))
+        || looks_like_jwt(trimmed)
+}
+
+fn looks_like_jwt(token: &str) -> bool {
+    let segments: Vec<&str> = token.split('.').collect();
+    if segments.len() != 3
+        || segments.iter().any(|segment| {
+            segment.len() < 8
+                || !segment.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '=')
+                })
+        })
+    {
+        return false;
+    }
+    let decode_object = |segment: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segment.trim_end_matches('='))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.as_object().cloned())
+    };
+    decode_object(segments[0]).is_some_and(|header| header.contains_key("alg"))
+        && decode_object(segments[1]).is_some()
 }
 
 fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
@@ -625,5 +841,65 @@ gamma searchable_component delta";
         assert!(!redacted.contains("do-not-store"));
         assert!(!redacted.contains("private-key-material"));
         assert!(redacted.contains("[redacted-sensitive-block]"));
+    }
+
+    #[test]
+    fn redacts_provider_tokens_jwts_and_credentialized_urls_without_hiding_code() {
+        let github = format!("ghp_{}", "A".repeat(36));
+        let aws_id = format!("AKIA{}", "B".repeat(16));
+        let jwt = [
+            "eyJhbGciOiJIUzI1NiJ9",
+            "eyJzdWIiOiJleGFtcGxlIn0",
+            "not-a-real-signature",
+        ]
+        .join(".");
+        let body = format!(
+            "GITHUB_TOKEN={github}\n\
+             AWS_ACCESS_KEY_ID={aws_id}\n\
+             AWS_SECRET_ACCESS_KEY=example-secret-value\n\
+             jwt: {jwt}\n\
+             database_url=postgres://demo:example-password@example.invalid/app\n\
+             mirror=https://{github}@github.com/example/project\n\
+             endpoint=https://example.invalid/hook?key={github}\n\
+             TOKEN = \"spaced-secret\"\n\
+             api_token:\n\
+               \"multiline-secret\"\n\
+             remote=https://opaque-userinfo@example.invalid/repo\n\
+             let config = {{ endpoint: \"safe\", access_token: \"nested-secret\" }};\n\
+             pub fn tokenize_input(project_key: &str) {{}}\n\
+             block_token: |\n  block-first-secret\n  block-second-secret\n\
+             safe_component: visible\n"
+        );
+
+        let redacted = redact_sensitive_lines(&body);
+
+        for secret in [
+            github.as_str(),
+            aws_id.as_str(),
+            "example-secret-value",
+            jwt.as_str(),
+            "example-password",
+            "nested-secret",
+            "spaced-secret",
+            "multiline-secret",
+            "opaque-userinfo",
+            "block-first-secret",
+            "block-second-secret",
+        ] {
+            assert!(!redacted.contains(secret), "secret survived redaction");
+        }
+        assert!(redacted.contains("tokenize_input"));
+        assert!(redacted.contains("project_key"));
+        assert!(redacted.contains("safe_component: visible"));
+        assert_eq!(
+            redact_sensitive_lines("candidate.manifest.adapter_version"),
+            "candidate.manifest.adapter_version"
+        );
+        assert!(path_contains_high_confidence_credential(&format!(
+            "notes/{github}.md"
+        )));
+        assert!(path_contains_high_confidence_credential(&format!(
+            "fixtures/{aws_id}.txt"
+        )));
     }
 }

@@ -155,6 +155,51 @@ fn config_contract_invalid_json_is_a_typed_error() {
     assert!(config::try_load(&path).is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn config_contract_repairs_private_modes_without_chmodding_custom_ancestors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join(".sessionatlas");
+    fs::create_dir(&data).unwrap();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = data.join("config.json");
+    fs::write(&path, "{}").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    config::load(&path).unwrap();
+    let mut value = AppConfig::default();
+    value.save(&path, None).unwrap();
+
+    assert_eq!(
+        fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(lock_path_for(&path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let custom = temp.path().join("custom-config-dir");
+    fs::create_dir(&custom).unwrap();
+    fs::set_permissions(&custom, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut value = AppConfig::default();
+    value.save(custom.join("config.json"), None).unwrap();
+    assert_eq!(
+        fs::metadata(&custom).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
 #[test]
 fn config_contract_case_insensitive_property_names_at_appconfig_level() {
     let temp = tempfile::tempdir().unwrap();

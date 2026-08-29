@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
+
+use sessionatlas_core::private_fs;
 
 const RECENT_PROTECTION_DAYS: i64 = 14;
 const TRIVIAL_AGE_DAYS: i64 = 30;
@@ -658,6 +658,9 @@ fn cache_path(home: &Path) -> PathBuf {
 
 fn load_cache(home: &Path) -> SessionCleanupCache {
     let path = cache_path(home);
+    if private_fs::harden_existing_private_file(&path).is_err() {
+        return SessionCleanupCache::default();
+    }
     let Ok(bytes) = fs::read(path) else {
         return SessionCleanupCache::default();
     };
@@ -677,7 +680,7 @@ fn save_cache(home: &Path, cache: &SessionCleanupCache) {
     let Some(parent) = path.parent() else {
         return;
     };
-    if fs::create_dir_all(parent).is_err() {
+    if private_fs::ensure_private_directory(parent).is_err() {
         return;
     }
     let Ok(bytes) = serde_json::to_vec(cache) else {
@@ -696,11 +699,7 @@ fn save_cache(home: &Path, cache: &SessionCleanupCache) {
     ));
     let write_result = (|| -> std::io::Result<()> {
         {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            let mut file = options.open(&temporary)?;
+            let mut file = private_fs::open_private_create_new(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
@@ -1074,9 +1073,12 @@ fn safe_trash_root(home: &Path, create: bool) -> Result<Option<PathBuf>, String>
                 if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
                     return Err("recovery area contains a link or reparse point".to_string());
                 }
+                private_fs::ensure_private_directory(&current)
+                    .map_err(|error| error.to_string())?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-                fs::create_dir(&current).map_err(|error| error.to_string())?;
+                private_fs::ensure_private_directory(&current)
+                    .map_err(|error| error.to_string())?;
                 let metadata = fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
                 if !metadata.is_dir() || metadata_is_link_or_reparse(&metadata) {
                     return Err("recovery area contains a link or reparse point".to_string());
@@ -1156,6 +1158,7 @@ fn create_batch_directory(root: &Path) -> Result<(String, PathBuf), String> {
         let batch = root.join(&batch_id);
         match fs::create_dir(&batch) {
             Ok(()) => {
+                private_fs::ensure_private_directory(&batch).map_err(|error| error.to_string())?;
                 safe_batch_directory(root, &batch)?;
                 return Ok((batch_id, batch));
             }
@@ -1271,10 +1274,7 @@ pub(crate) fn quarantine_sessions(
     let manifest_path = batch_dir.join("manifest.json");
     let json = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&manifest_path)?;
+        let mut file = private_fs::open_private_create_new(&manifest_path)?;
         file.write_all(&json)?;
         file.sync_all()
     })();
@@ -1762,7 +1762,13 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let data_mode = fs::metadata(home.path().join(".sessionatlas"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             let mode = fs::metadata(&cache).unwrap().permissions().mode() & 0o777;
+            assert_eq!(data_mode, 0o700);
             assert_eq!(mode, 0o600);
         }
         let first_bytes = fs::read(&cache).unwrap();
@@ -2121,6 +2127,25 @@ mod tests {
         .unwrap();
         let trash = safe_trash_root(home.path(), false).unwrap().unwrap();
         let batch_dir = trash.join(&batch.batch_id);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&trash).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&batch_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(batch_dir.join("manifest.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         assert!(is_same_or_child_path(&batch_dir, &trash));
         assert!(!same_path(&batch_dir, &trash));
         assert!(!child.exists());

@@ -15,6 +15,12 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use crate::content_index::{collect_project_content, ContentFingerprint, ContentIndexOptions};
 use crate::model::{project_path_missing, Project, Session, ToolUsage};
 use crate::path;
+use crate::private_fs;
+
+/// Bump whenever content sanitization changes in a way that requires every
+/// unchanged source file to be reopened and all stored previews/FTS terms to
+/// be rebuilt.
+pub const CONTENT_INDEX_SANITIZER_VERSION: i64 = 2;
 
 /// Result alias for store operations.
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -127,6 +133,11 @@ impl From<std::io::Error> for StoreError {
 
 /// The `index.db` schema, mirroring `SqliteStore.InitializeSchema`.
 const SCHEMA_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS sessionatlas_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         path TEXT NOT NULL UNIQUE,
@@ -334,14 +345,12 @@ impl SqliteStore {
     /// rebuilds the FTS index. No other business file is created or touched.
     pub fn new(database_path: impl AsRef<Path>) -> Result<Self> {
         let path = database_path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+        private_fs::prepare_private_database(path)?;
         let mut connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys = ON")?;
         initialize_schema(&mut connection)?;
+        private_fs::harden_existing_private_file(path)?;
+        private_fs::harden_sqlite_sidecars(path)?;
         Ok(Self { connection })
     }
 
@@ -943,6 +952,7 @@ fn project_fields(row: &rusqlite::Row) -> rusqlite::Result<ProjectFields> {
 
 fn initialize_schema(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(SCHEMA_SQL)?;
+    migrate_content_index_sanitizer(connection)?;
     migrate_tool_usage_identity(connection)?;
     if cfg!(windows) {
         connection.execute_batch(
@@ -952,6 +962,74 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(TOOL_KEY_NOCASE_INDEX_SQL)?;
     rebuild_fts(connection)?;
     Ok(())
+}
+
+fn migrate_content_index_sanitizer(connection: &Connection) -> Result<()> {
+    let current = connection
+        .query_row(
+            "SELECT value FROM sessionatlas_meta
+             WHERE key = 'content_index_sanitizer_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if current.as_deref() == Some(&CONTENT_INDEX_SANITIZER_VERSION.to_string()) {
+        return Ok(());
+    }
+
+    connection.execute_batch("PRAGMA secure_delete = ON")?;
+    let tx = connection.unchecked_transaction()?;
+    tx.execute("DELETE FROM project_content_fts", [])?;
+    tx.execute("DELETE FROM project_content_files", [])?;
+    tx.execute("DELETE FROM project_content_status", [])?;
+    tx.commit()?;
+
+    // Reclaim pages that may still contain a preview from an older sanitizer.
+    // Commit the version only after physical cleanup succeeds. An interrupted
+    // or busy cleanup is therefore retried on the next open even when the
+    // logical rows are already gone.
+    connection.execute_batch("VACUUM")?;
+    let checkpoint_busy: i64 =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if checkpoint_busy != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "content index WAL cleanup is busy",
+        )
+        .into());
+    }
+
+    connection.execute(
+        "INSERT INTO sessionatlas_meta (key, value)
+         VALUES ('content_index_sanitizer_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![CONTENT_INDEX_SANITIZER_VERSION.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Whether stored content was produced by the current sanitizer. Readers use
+/// this as a fail-closed gate so an older database cannot surface stale
+/// previews before the next scan rebuilds them.
+pub fn content_index_sanitizer_is_current(connection: &Connection) -> Result<bool> {
+    let has_meta: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'sessionatlas_meta'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_meta != 1 {
+        return Ok(false);
+    }
+    let version = connection
+        .query_row(
+            "SELECT value FROM sessionatlas_meta
+             WHERE key = 'content_index_sanitizer_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(version.as_deref() == Some(&CONTENT_INDEX_SANITIZER_VERSION.to_string()))
 }
 
 fn migrate_tool_usage_identity(connection: &Connection) -> Result<()> {

@@ -10,11 +10,12 @@ use sessionatlas_core::config as core_config;
 use sessionatlas_core::content_index::content_match_snippet;
 use sessionatlas_core::indexer::{build_index, IndexedToolScan};
 use sessionatlas_core::path as core_path;
+use sessionatlas_core::private_fs;
 use sessionatlas_core::scanner::{
     build_adapter_scanners, ScanDiagnostic, ScanDiagnosticSeverity, Scanner,
     UNEXPECTED_SCANNER_FAILURE,
 };
-use sessionatlas_core::store::SqliteStore;
+use sessionatlas_core::store::{content_index_sanitizer_is_current, SqliteStore};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -520,6 +521,18 @@ fn open_index_reader(path: &std::path::Path) -> Result<Connection, String> {
             path.display()
         ));
     }
+    if let Some(parent) = path.parent() {
+        private_fs::ensure_private_directory(parent).map_err(|error| {
+            format!(
+                "could not protect index directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    private_fs::harden_existing_private_file(path)
+        .map_err(|error| format!("could not protect index {}: {error}", path.display()))?;
+    private_fs::harden_sqlite_sidecars(path)
+        .map_err(|error| format!("could not protect index sidecars: {error}"))?;
     let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("could not open read-only index {}: {e}", path.display()))?;
     c.pragma_update(None, "query_only", "ON")
@@ -631,9 +644,7 @@ fn ensure_remote_server_metadata(connection: &Connection) -> Result<(), String> 
 
 fn open_prefs_db() -> Result<Connection, String> {
     let path = prefs_db_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+    private_fs::prepare_private_database(&path).map_err(|e| e.to_string())?;
     let c = Connection::open(&path).map_err(|e| e.to_string())?;
     configure_prefs_connection(&c)?;
     c.execute_batch(
@@ -777,6 +788,8 @@ fn open_prefs_db() -> Result<Connection, String> {
          );"
     ).map_err(|e| e.to_string())?;
     ensure_remote_server_metadata(&c)?;
+    private_fs::harden_existing_private_file(&path).map_err(|e| e.to_string())?;
+    private_fs::harden_sqlite_sidecars(&path).map_err(|e| e.to_string())?;
     Ok(c)
 }
 
@@ -1276,6 +1289,9 @@ fn search_projects_in_connection(
 }
 
 fn content_index_available(connection: &Connection) -> Result<bool, String> {
+    if !content_index_sanitizer_is_current(connection).map_err(|error| error.to_string())? {
+        return Ok(false);
+    }
     let count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
@@ -8852,6 +8868,30 @@ mod baseline_tests {
             .contains("distinctive_content_symbol"));
         drop(connection);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn content_search_fails_closed_for_an_older_sanitizer_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessionatlas_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE project_content_files (id INTEGER PRIMARY KEY);
+                 CREATE TABLE project_content_fts (rowid INTEGER PRIMARY KEY);
+                 INSERT INTO sessionatlas_meta (key, value)
+                 VALUES ('content_index_sanitizer_version', '1');",
+            )
+            .unwrap();
+
+        assert!(!content_index_available(&connection).unwrap());
+        connection
+            .execute(
+                "UPDATE sessionatlas_meta SET value = ?1
+                 WHERE key = 'content_index_sanitizer_version'",
+                [sessionatlas_core::store::CONTENT_INDEX_SANITIZER_VERSION.to_string()],
+            )
+            .unwrap();
+        assert!(content_index_available(&connection).unwrap());
     }
 }
 

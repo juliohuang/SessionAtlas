@@ -40,6 +40,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::model::{ToolSource, DEFAULT_OPEN_COMMAND_TEMPLATE};
+use crate::private_fs;
 
 /// Default terminal used when `config.json` omits `DefaultTerminal`.
 pub const DEFAULT_TERMINAL: &str = "auto";
@@ -374,6 +375,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// as Windows share violations. A missing file is
 /// reported as `Ok(None)`.
 fn read_config_bytes(path: &Path) -> Result<Option<Vec<u8>>, ConfigError> {
+    #[cfg(unix)]
+    {
+        match fs::symlink_metadata(path) {
+            Ok(_) => create_config_directory(path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ConfigError::Io(error)),
+        }
+        private_fs::harden_existing_private_file(path).map_err(ConfigError::Io)?;
+    }
     for attempt in 0..5u32 {
         match fs::read(path) {
             Ok(bytes) => return Ok(Some(bytes)),
@@ -397,7 +407,14 @@ fn create_config_directory(path: &Path) -> Result<(), ConfigError> {
     let directory = path
         .parent()
         .ok_or_else(|| ConfigError::InvalidPath(path.display().to_string()))?;
-    fs::create_dir_all(directory).map_err(ConfigError::Io)
+    if directory
+        .file_name()
+        .is_some_and(|name| name == ".sessionatlas")
+    {
+        private_fs::ensure_private_directory(directory).map_err(ConfigError::Io)
+    } else {
+        fs::create_dir_all(directory).map_err(ConfigError::Io)
+    }
 }
 
 fn lock_path_for(config_path: &Path) -> PathBuf {
@@ -413,12 +430,7 @@ fn acquire_lock(config_path: &Path, timeout: Duration) -> Result<File, ConfigErr
     let lock_path = lock_path_for(config_path);
     let deadline = Instant::now() + timeout;
     loop {
-        match File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
+        match private_fs::open_private_read_write(&lock_path)
             .and_then(|file| file.try_lock_exclusive().map(|()| file))
         {
             Ok(file) => return Ok(file),
@@ -466,11 +478,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
 }
 
 fn write_temp_and_sync(temp_path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
-    let mut file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(temp_path)
-        .map_err(ConfigError::Io)?;
+    let mut file = private_fs::open_private_create_new(temp_path).map_err(ConfigError::Io)?;
     file.write_all(bytes).map_err(ConfigError::Io)?;
     file.sync_all().map_err(ConfigError::Io)?;
     Ok(())

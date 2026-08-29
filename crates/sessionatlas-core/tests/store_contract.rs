@@ -9,7 +9,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sessionatlas_core::content_index::ContentIndexOptions;
 use sessionatlas_core::model::{Project, Session, ToolUsage};
 use sessionatlas_core::path;
-use sessionatlas_core::store::{SqliteStore, StoreError};
+use sessionatlas_core::store::{
+    content_index_sanitizer_is_current, SqliteStore, StoreError, CONTENT_INDEX_SANITIZER_VERSION,
+};
 
 fn utc(year: i32, month: u32, day: u32) -> DateTime<Utc> {
     NaiveDate::from_ymd_opt(year, month, day)
@@ -91,6 +93,7 @@ fn store_schema_matches_expected_tables_and_indexes() {
         .collect::<Result<_, _>>()
         .unwrap();
     for expected in [
+        "sessionatlas_meta",
         "projects",
         "tool_usages",
         "sessions",
@@ -212,6 +215,152 @@ fn store_content_index_is_incremental_compressed_searchable_and_deletes_stale_fi
         .list_projects(Some("replacement_symbol"), None, 10)
         .unwrap()
         .is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn store_repairs_default_data_root_database_and_sqlite_sidecar_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join(".sessionatlas");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let db = data.join("index.db");
+    std::fs::write(&db, []).unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    drop(SqliteStore::new(&db).unwrap());
+
+    assert_eq!(
+        std::fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+        if sidecar.exists() {
+            assert_eq!(
+                std::fs::metadata(sidecar).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn stale_content_sanitizer_purges_old_rows_and_forces_a_safe_rebuild() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let project_dir = root.path().join("privacy-migration-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let source = project_dir.join("main.rs");
+    let secret = "legacy_leaked_token_value_123456789";
+    std::fs::write(
+        &source,
+        format!("GITHUB_TOKEN={secret}\npub fn safe_rebuild_symbol() {{}}\n"),
+    )
+    .unwrap();
+    let project_path = path::normalize_native(&project_dir.to_string_lossy()).unwrap();
+
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &project_path,
+                "privacy-migration",
+                utc(2026, 8, 27),
+                &[usage("codex", utc(2026, 8, 27), 1, Some("session"))],
+            )],
+            &["codex"],
+        )
+        .unwrap();
+    store.refresh_project_content_index().unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let rowid: i64 = connection
+        .query_row("SELECT id FROM project_content_files LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let legacy_preview = lz4_flex::compress_prepend_size(secret.as_bytes());
+    connection
+        .execute(
+            "UPDATE project_content_files SET compressed_preview = ?1 WHERE id = ?2",
+            rusqlite::params![legacy_preview, rowid],
+        )
+        .unwrap();
+    connection
+        .execute("DELETE FROM project_content_fts WHERE rowid = ?1", [rowid])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO project_content_fts (rowid, relative_path, body)
+             VALUES (?1, 'main.rs', ?2)",
+            rusqlite::params![rowid, secret],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessionatlas_meta SET value = '1'
+             WHERE key = 'content_index_sanitizer_version'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut store = SqliteStore::new(&db).unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    assert!(content_index_sanitizer_is_current(&connection).unwrap());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM project_content_files", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(CONTENT_INDEX_SANITIZER_VERSION, 2);
+    drop(connection);
+    assert!(
+        !std::fs::read(&db)
+            .unwrap()
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()),
+        "VACUUM must remove the legacy plaintext from database pages"
+    );
+
+    let rebuilt = store.refresh_project_content_index().unwrap();
+    assert_eq!(rebuilt.files_indexed, 1);
+    assert!(store
+        .list_projects(Some(secret), None, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .list_projects(Some("safe_rebuild_symbol"), None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let preview: Vec<u8> = connection
+        .query_row(
+            "SELECT compressed_preview FROM project_content_files LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let preview = lz4_flex::decompress_size_prepended(&preview).unwrap();
+    assert!(!preview
+        .windows(secret.len())
+        .any(|window| window == secret.as_bytes()));
 }
 
 #[test]

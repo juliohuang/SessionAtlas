@@ -5,7 +5,7 @@
 //! or failed parses are deliberately never stored as successful entries.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use super::base::ScannedProject;
 use super::base::{no_follow_metadata, open_regular_file};
+use crate::private_fs;
 
 const CACHE_VERSION: u32 = 1;
 const CACHE_FILE: &str = "scanner-cache-v1.json";
@@ -60,8 +61,10 @@ impl FileCache {
 
     pub(crate) fn load_with_limit(home: &Path, parser_version: u32, max_bytes: u64) -> Self {
         let path = home.join(".sessionatlas").join(CACHE_FILE);
-        let document = no_follow_metadata(&path)
+        let document = private_fs::harden_existing_private_file(&path)
             .ok()
+            .filter(|exists| *exists)
+            .and_then(|_| no_follow_metadata(&path).ok())
             .filter(|metadata| metadata.is_file() && metadata.len() <= max_bytes)
             .and_then(|_| read_bounded_bytes(&path, max_bytes))
             .and_then(|bytes| serde_json::from_slice::<CacheDocument>(&bytes).ok())
@@ -153,7 +156,7 @@ impl FileCache {
         let Some(parent) = self.path.parent() else {
             return;
         };
-        if fs::create_dir_all(parent).is_err() {
+        if private_fs::ensure_private_directory(parent).is_err() {
             return;
         }
         let temporary = parent.join(format!(
@@ -163,10 +166,7 @@ impl FileCache {
         ));
         let write_result = (|| -> std::io::Result<()> {
             {
-                let file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&temporary)?;
+                let file = private_fs::open_private_create_new(&temporary)?;
                 let mut limited = LimitedWriter::new(file, self.max_bytes);
                 if serde_json::to_writer(&mut limited, &self.document).is_err() {
                     let _ = fs::remove_file(&temporary);
@@ -282,6 +282,30 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         fs::write(&source, b"changed").unwrap();
         assert!(cache.get("codex", &source).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_cache_repairs_private_directory_and_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("session.jsonl");
+        fs::write(&source, b"one").unwrap();
+        let mut cache = FileCache::load(home.path(), 7);
+        cache.record("codex", &source, &[project("/work/repo")]);
+        cache.save();
+
+        let data = home.path().join(".sessionatlas");
+        let path = data.join(CACHE_FILE);
+        assert_eq!(
+            fs::metadata(data).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
