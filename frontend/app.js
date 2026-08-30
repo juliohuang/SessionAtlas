@@ -153,6 +153,7 @@ const state = {
   ledgerRows: [],           // grouped rows used by the bounded ledger renderer
   ledgerHeightByKey: new Map(),
   ledgerLayout: null,
+  ledgerLayoutRevision: -1,
   ledgerRenderRevision: 0,  // invalidates a recycled window when row content changes
   ledgerVirtualWindowSignature: null,
 };
@@ -999,16 +1000,15 @@ function renderLedger(model = buildLedgerModel()) {
   renderVirtualLedger();
 }
 
-// Keep the cold estimate close to the measured compact CSS contract at the
-// desktop ledger width (about 80px including the contained entry margins and
-// border). Visited rows are still measured, but a realistic estimate prevents
-// a long untouched tail from inventing a phantom scrollbar before it is
-// visited.
+// The cold estimate only lasts until the first compact rows are measured.
+// Theme, density and viewport changes can all alter the real row height, so a
+// fixed estimate must not remain in use for thousands of untouched rows.
 const LEDGER_GROUP_HEIGHT = 32;
 const LEDGER_PROJECT_HEIGHT = 80;
 const LEDGER_EXPANDED_HEIGHT = 320;
 const LEDGER_OVERSCAN_PX = 480;
 let _ledgerRenderFrame = null;
+let _ledgerCompactProjectHeight = LEDGER_PROJECT_HEIGHT;
 let ledgerRenderContext = { activeTabs: new Map() };
 
 function ledgerVisibleRows() {
@@ -1027,7 +1027,7 @@ function estimatedLedgerRowHeight(row) {
   if (measured > 0) return measured;
   return row.type === "group"
     ? LEDGER_GROUP_HEIGHT
-    : (row.project.id === state.expandedId ? LEDGER_EXPANDED_HEIGHT : LEDGER_PROJECT_HEIGHT);
+    : (row.project.id === state.expandedId ? LEDGER_EXPANDED_HEIGHT : _ledgerCompactProjectHeight);
 }
 
 function ledgerLayoutFor(rows) {
@@ -1056,6 +1056,7 @@ function virtualRowHtml(row) {
 function measureVirtualRows(window, layout, start, previousScrollTop) {
   const oldLayout = state.ledgerLayout;
   const viewportHeight = Math.max(ledger.clientHeight || 0, 1);
+  const viewportBottom = previousScrollTop + viewportHeight;
   const wasAtBottom = Boolean(oldLayout)
     && previousScrollTop + viewportHeight >= oldLayout.totalHeight - 1;
   const oldAnchorIndex = oldLayout
@@ -1063,12 +1064,21 @@ function measureVirtualRows(window, layout, start, previousScrollTop) {
     : -1;
   const oldAnchorKey = oldAnchorIndex >= 0 ? ledgerRowKey(oldLayout.rows[oldAnchorIndex]) : null;
   const oldAnchorOffset = oldAnchorIndex >= 0 ? oldLayout.offsets[oldAnchorIndex] : 0;
+  const compactProjectHeights = [];
   let changed = false;
   [...window.children].forEach((element, index) => {
     const row = layout.rows[start + index];
     if (!row) return;
-    const measured = element.getBoundingClientRect().height;
+    const rowOffset = layout.offsets[start + index];
+    const estimatedHeight = layout.heights[start + index];
+    if (rowOffset + estimatedHeight <= previousScrollTop || rowOffset >= viewportBottom) return;
+    const entry = element.querySelector("article.entry");
+    const rowRect = element.getBoundingClientRect();
+    const measured = rowRect.height;
     if (!(measured > 0)) return;
+    if (row.type === "project" && !entry?.classList.contains("is-expanded")) {
+      compactProjectHeights.push(measured);
+    }
     const key = ledgerRowKey(row);
     const previous = state.ledgerHeightByKey.get(key);
     if (!previous || Math.abs(previous - measured) > 0.5) {
@@ -1076,9 +1086,18 @@ function measureVirtualRows(window, layout, start, previousScrollTop) {
       changed = true;
     }
   });
+  if (compactProjectHeights.length) {
+    compactProjectHeights.sort((left, right) => left - right);
+    const compactHeight = compactProjectHeights[Math.floor(compactProjectHeights.length / 2)];
+    if (Math.abs(_ledgerCompactProjectHeight - compactHeight) > 0.5) {
+      _ledgerCompactProjectHeight = compactHeight;
+      changed = true;
+    }
+  }
   if (!changed) return false;
   const updated = ledgerLayoutFor(layout.rows);
   state.ledgerLayout = updated;
+  state.ledgerLayoutRevision = state.ledgerRenderRevision;
   if (wasAtBottom) {
     // Grow the spacer before assigning the corrected bottom offset. Otherwise
     // the browser clamps scrollTop to the old, shorter spacer and the next
@@ -1129,7 +1148,13 @@ function renderVirtualLedger() {
   const layout = ledgerLayoutFor(rows);
   const { offsets, heights, totalHeight } = layout;
   const viewportHeight = Math.max(ledger.clientHeight || 600, 1);
-  const isAtBottom = previousScrollTop + viewportHeight >= ledger.scrollHeight - 1;
+  const hasVirtualLayout = Boolean(
+    state.ledgerLayout
+      && state.ledgerLayoutRevision === state.ledgerRenderRevision
+      && ledger.querySelector(".ledger__virtual-spacer"),
+  );
+  const isAtBottom = hasVirtualLayout
+    && previousScrollTop + viewportHeight >= ledger.scrollHeight - 1;
   const top = Math.max(previousScrollTop - LEDGER_OVERSCAN_PX, 0);
   const bottom = previousScrollTop + viewportHeight + LEDGER_OVERSCAN_PX;
   let start = 0;
@@ -1176,6 +1201,7 @@ function renderVirtualLedger() {
     requestAnimationFrame(renderVirtualLedger);
   } else {
     state.ledgerLayout = layout;
+    state.ledgerLayoutRevision = state.ledgerRenderRevision;
   }
 }
 
@@ -2331,16 +2357,22 @@ function toggleEntryExpand(projectId) {
   ledger.querySelectorAll(".is-dragging")
     .forEach(element => element.classList.remove("is-dragging"));
   clearDropIndicators();
+  const shouldRestoreFocus = document.activeElement instanceof Element
+    && document.activeElement.matches("[data-expand-toggle]");
   const previousId = state.expandedId;
   state.expandedId = state.expandedId === projectId ? null : projectId;
   if (previousId) state.ledgerHeightByKey.delete(`project:${previousId}`);
   state.ledgerHeightByKey.delete(`project:${projectId}`);
   state.ledgerLayout = null;
+  state.ledgerLayoutRevision = -1;
   applyFilters();
   // applyFilters() recycles the virtual row. Restore focus to the replacement
   // control so keyboard users can immediately collapse it again with Space
-  // or Enter and mouse users retain a clear visual state.
+  // or Enter and mouse users retain a clear visual state. Do not steal focus
+  // back if the user has already moved to search or another control while the
+  // replacement row waits for the next animation frame.
   requestAnimationFrame(() => {
+    if (!shouldRestoreFocus || document.activeElement !== document.body) return;
     const selector = `${projectEntrySelector(projectId)} [data-expand-toggle]`;
     ledger.querySelector(selector)?.focus({ preventScroll: true });
   });

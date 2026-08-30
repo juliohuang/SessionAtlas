@@ -119,10 +119,17 @@ test("opaque project IDs stay inert and addressable across entry actions", async
 
   await entry.click();
   await expect(entry).toHaveClass(/is-selected/);
-  await entry.locator("[data-expand-toggle]").click();
+  const searchInput = page.locator("#searchInput");
+  await entry.locator("[data-expand-toggle]").evaluate(button => {
+    button.focus();
+    button.click();
+    document.querySelector("#searchInput").focus();
+  });
   await expect(entry).toHaveClass(/is-expanded/);
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+  await expect(searchInput).toBeFocused();
 
-  await page.locator("#searchInput").press("ArrowDown");
+  await searchInput.press("ArrowDown");
   await expect(ordinaryEntry).toHaveClass(/is-selected/);
   expect(await page.locator("article.entry.is-selected").evaluate(element => element.dataset.id)).toBe(ordinaryProjectId);
   await page.waitForTimeout(50);

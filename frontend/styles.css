@@ -378,8 +378,6 @@ body.is-maximized .console {
   transition: background .14s;
   opacity: 0; transform: translateY(6px);
   animation: entryIn .32s cubic-bezier(.2,.7,.2,1) forwards;
-  content-visibility: auto;
-  contain-intrinsic-block-size: 80px;
 }
 @keyframes entryIn { to { opacity: 1; transform: none; } }
 .entry:hover { background: var(--ink-2); }

@@ -126,7 +126,7 @@ test("2000-project ledger keeps a bounded DOM and fast filtering", async ({ page
     domNodes: document.querySelector("#ledger").querySelectorAll("*").length,
     buttons: document.querySelector("#ledger").querySelectorAll("button").length,
     projectRows: document.querySelectorAll("#ledger article.entry").length,
-    compactHeight: document.querySelector("#ledger article.entry")?.getBoundingClientRect().height || 0,
+    compactHeight: document.querySelector("#ledger article.entry")?.parentElement?.getBoundingClientRect().height || 0,
     groupHeight: document.querySelector("#ledger [data-group-toggle]")?.getBoundingClientRect().height || 0,
   }));
   expect(initialMetrics.domNodes).toBeLessThan(6_000);
@@ -254,6 +254,81 @@ test("2000-project ledger keeps a bounded DOM and fast filtering", async ({ page
   await expect(page.locator("#ledgerCount")).toContainText("1");
   const filterMs = await page.evaluate(() => performance.now() - window.__filterStartedAt);
   expect(filterMs).toBeLessThan(300);
+});
+
+test("persisted collapsed group stays virtualized on its first expansion", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("sessionatlas.projectOrder", "grouped");
+    localStorage.setItem("sessionatlas.collapsedGroups", JSON.stringify(["1"]));
+    const projects = Array.from({ length: 2000 }, (_, index) => ({
+      id: `collapsed-project-${index}`,
+      path: `C:\\workspace\\collapsed-project-${index}`,
+      name: `collapsed-project-${index}`,
+      lastAccessedAt: "2026-08-17T00:00:00Z",
+      gitBranch: "main",
+      toolUsages: [],
+    }));
+    const assignments = Object.fromEntries(projects.map(project => [project.id, 1]));
+    window.__TAURI__ = {
+      core: {
+        invoke: async command => {
+          if (command === "local_index_exists") return true;
+          if (command === "list_projects") return projects;
+          if (command === "list_groups") {
+            return [{ id: 1, name: "Collapsed", sortOrder: 1, memberCount: projects.length }];
+          }
+          if (command === "list_group_assignments") return assignments;
+          if (command === "get_group_revision") return 0;
+          if (command === "get_git_info") return { isRepo: false, remotes: [] };
+          if (command === "probe_tui_capabilities") return { source: "local", tools: [] };
+          if ([
+            "list_tools", "list_remote_projects", "list_remote_servers",
+            "list_project_ignores", "list_opener_prefs", "list_sort_orders",
+            "list_web_development_tools", "search_remote_projects",
+          ].includes(command)) return [];
+          return null;
+        },
+      },
+      event: { listen: async () => () => {} },
+      window: { getCurrentWindow: () => ({ isMaximized: async () => false }) },
+    };
+  });
+
+  await page.goto("/index.html");
+  const group = page.locator('#ledger [data-group-toggle][data-group-key="1"]');
+  await expect(group).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator("#ledger article.entry")).toHaveCount(0);
+  await page.evaluate(() => {
+    window.__maxRenderedProjectRows = 0;
+    const ledger = document.querySelector("#ledger");
+    const record = () => {
+      window.__maxRenderedProjectRows = Math.max(
+        window.__maxRenderedProjectRows,
+        ledger.querySelectorAll("article.entry").length,
+      );
+    };
+    new MutationObserver(record).observe(ledger, { childList: true, subtree: true });
+    record();
+  });
+
+  await group.click();
+  await expect(group).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator('#ledger article.entry[data-id="collapsed-project-0"]')).toBeVisible();
+  await page.waitForTimeout(300);
+  const metrics = await page.evaluate(() => {
+    const ledger = document.querySelector("#ledger");
+    return {
+      renderedRows: ledger.querySelectorAll("article.entry").length,
+      maxRenderedRows: window.__maxRenderedProjectRows,
+      scrollTop: ledger.scrollTop,
+      scrollHeight: ledger.scrollHeight,
+      clientHeight: ledger.clientHeight,
+    };
+  });
+  expect(metrics.renderedRows).toBeLessThan(80);
+  expect(metrics.maxRenderedRows).toBeLessThan(80);
+  expect(metrics.scrollTop).toBe(0);
+  expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
 });
 
 test("virtualized group move and manual reorder use delegated mutations", async ({ page }) => {
