@@ -1,7 +1,7 @@
 name: Feature proposal
 description: Propose a focused improvement to SessionAtlas.
 title: "[Feature]: "
-labels: [enhancement, needs-triage]
+labels: [enhancement]
 body:
   - type: textarea
     id: problem

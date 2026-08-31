@@ -1,6 +1,9 @@
 # GitHub launch playbook
 
-This playbook separates repository readiness from public promotion. Do not drive traffic to the project until the exact public commit, security settings, and downloadable beta have been verified.
+This playbook separates repository readiness from public promotion. The
+repository is public and `v0.1.0-beta.3` is already downloadable; future
+promotion should wait for the exact commit, security settings, and release
+evidence to be verified.
 
 ## Positioning
 
@@ -14,15 +17,15 @@ Before launch, make an explicit keep-or-rename decision for `SessionAtlas`. An u
 
 ## GitHub settings checklist
 
-- Make the repository public only after the final secret/history scan.
+- Confirm the repository remains public and the final secret/history scan is recorded.
 - Set the description to: `Local-first workspace for finding and resuming projects across Claude Code, Codex, Kimi, OpenCode, Aider, and Pi Coding Agent.`
 - Add topics: `ai-cli`, `developer-tools`, `tauri`, `rust`, `terminal`, `claude-code`, `codex`, `local-first`.
 - Use `docs/images/sessionatlas-browser-demo.png` or a purpose-built 1280×640 derivative as the social preview.
 - Enable Issues and Discussions; seed a welcome/roadmap discussion.
-- Enable private vulnerability reporting, secret scanning, push protection, Dependabot alerts, dependency graph, and CodeQL.
-- Protect `main`: require a pull request, CI and Security checks, conversation resolution, and no force pushes or deletions.
+- Verify private vulnerability reporting, secret scanning, push protection, Dependabot alerts, dependency graph, and CodeQL. At present, secret scanning and push protection are enabled; private vulnerability reporting, Dependabot security updates, and branch protection still need follow-up.
+- Protect `main`: require a pull request, conversation resolution, and no force pushes or deletions. Add required CI/Security checks only when those hosted checks are intentionally enabled and verified.
 - Verify the Apache-2.0 license is detected and the community profile recognizes the contribution files.
-- Publish the next beta tag (currently `v0.1.0-beta.3`) with MSI, NSIS installer, SHA-256 checksums, SPDX SBOM, provenance attestation, and honest unsigned-beta notes.
+- `v0.1.0-beta.3` is already published with MSI, NSIS installer, SHA-256 checksums, SPDX SBOM (`sessionatlas.spdx.json`), and honest unsigned-beta notes. It has no GitHub build-provenance attestation. The 2026-08-31 local installer report covers a post-beta.3 candidate, not the exact published beta.3 assets.
 - Pin the beta release, roadmap discussion, and two newcomer-friendly issues.
 
 ## Launch sequence
@@ -36,7 +39,10 @@ Before launch, make an explicit keep-or-rename decision for `SessionAtlas`. An u
 
 ### Launch day
 
-- Publish the GitHub prerelease and verify a clean Windows installation.
+- For a future release, publish the GitHub prerelease only after the local
+  release gate and verify the exact candidate installers in a clean Windows
+  environment. The 2026-08-31 report covers a post-beta.3 candidate and cannot
+  substitute for exact-asset acceptance of the next release.
 - Post one clear demo to the maintainer's existing developer network first.
 - Share adapted versions on communities where the maintainer already participates; follow each community's self-promotion rules.
 - Be available for the first few hours to answer installation and privacy questions.

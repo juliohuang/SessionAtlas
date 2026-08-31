@@ -1,7 +1,7 @@
 name: Bug report
 description: Report a reproducible SessionAtlas defect without exposing private data.
 title: "[Bug]: "
-labels: [bug, needs-triage]
+labels: [bug]
 body:
   - type: markdown
     attributes:

@@ -1,6 +1,6 @@
 # SessionAtlas 剩余问题与完成执行手册
 
-**更新时间：** 2026-08-18
+**更新时间：** 2026-08-31
 
 **文档状态：** 当前剩余工作的唯一入口。仓库已切换为纯 Rust 工作区
 （见 [`rust-migration-plan.md`](./rust-migration-plan.md)）；本文件只整理 R13 之后
@@ -37,20 +37,20 @@
 
 | ID | 优先级 | 类型 | 当前状态 | 完成条件摘要 |
 | --- | --- | --- | --- | --- |
-| RI-01 | P1 | 测试隔离/原生证据 | IN PROGRESS | 临时 home 与 fixture 已完成；仍需原生过程真实数据根前后哈希证据 |
-| RI-02 | P1 | Tauri 原生验收 | BLOCKED by RI-01 | T1～T9 全部 PASS，并保存非生产 fixture 的证据 |
-| RI-04 | P1 | 托管 CI/发布 | BLOCKED | 需同一 commit 的 Windows + Ubuntu 托管 job 证据；本地 R14 自动化不能替代托管执行器 |
+| RI-01 | P1 | 测试隔离/原生证据 | PASS | Windows MSI/NSIS 安装、启动、截图、卸载均使用隔离 home；前后快照未改变真实用户数据 |
+| RI-02 | P1 | Tauri 原生验收 | IN PROGRESS | T1～T9 交互矩阵仍需逐项执行并保存非生产 fixture 证据；不再被 RI-01 阻塞 |
+| RI-04 | P1 | 托管 CI/发布 | BLOCKED | 本周期明确不调用 GitHub Actions；因此没有同一 commit 的 Windows + Ubuntu 托管 job 证据 |
 | RI-05 | P2 | 供应链检查 | PASS | 2026-08-18 本地 `cargo audit 0.22.2` 扫描 538 个锁定 crate：0 个漏洞；17 个上游 informational warning 已记录风险与依赖路径 |
-| RI-06 | P2 | 版本控制/交付 | BLOCKED by RI-01/RI-02 | 首次 GitHub 交付已完成；剩余门禁通过后执行最终交付复核 |
+| RI-06 | P2 | 版本控制/交付 | TODO | `v0.1.0-beta.3` 已公开；下一版本仍需在本地门禁、文档和安全证据收口后复核交付 |
 | RI-07 | P3 | 测试残留处置 | BLOCKED by 用户授权 | 5 个可恢复数据库备份被归档或删除，结果有记录 |
 
 ### 2.3 已知现场状态
 
-- 当前 `origin` 是私有 GitHub 仓库 `juliohuang/SessionAtlas`。
+- 当前 `origin` 是公开 GitHub 仓库 `juliohuang/SessionAtlas`；公开预发布版本为 `v0.1.0-beta.3`。
 - 2026-08-18 使用 `cargo-audit 0.22.2` 扫描 538 个锁定 Rust crate，结果为 0 个漏洞、
   17 个已分析的上游 informational warning；处置边界记录在
   `execution-security-contract.md`。本地 RI-05 判为 PASS；托管 Security workflow
-  仍须在交付 commit 上成功运行，本地结果不能替代托管证据。
+  在本周期未调用，因此不宣称存在托管证据；若未来启用，必须绑定交付 commit。
 - R14 自动化门禁（fmt/clippy/394 测试/前端 check+test/`cargo tauri build --ci`/
   release CLI 构建/隔离验收/`git diff --check`）已于 2026-08-15 在本机全部通过；
   托管 CI 未运行，RI-04 不因本地结果改判为 PASS。
@@ -68,7 +68,10 @@
 **当前实施进度：** 单一 home 解析函数、`db_path()`/`cli_config_path()`/`prefs_db_path()`
 统一调用、`scripts/New-AcceptanceFixture.ps1` 创建唯一临时 home 与两个合成项目并生成
 SHA-256 清单均已完成；R12 隔离 CLI 扫描在该环境中识别 2 个合成项目并退出 0。
-完整原生过程的真实数据根前后哈希尚未记录，因此 RI-01 仍保持 `IN PROGRESS`。
+2026-08-31 的 post-beta.3 候选安装闭环报告记录了 MSI/NSIS 在隔离数据根中的真实安装、启动、截图、卸载，
+并核对安装前后真实用户数据快照未变化；本地证据位于
+`target/installer-cycle-20260831-5bc6a8c/REPORT.md`（生成目录不纳入版本控制）。
+因此 RI-01 已为 `PASS`。该证据不替代 T1～T9 交互矩阵，后者单独追踪在 RI-02。
 
 **定向检查：**
 
@@ -106,7 +109,7 @@ Get-ChildItem -LiteralPath (Join-Path $acceptanceHome '.sessionatlas') -Force
 
 ### RI-02：完成 Tauri 原生交互矩阵
 
-**前置条件：** RI-01 为 PASS；自动化全套通过；使用临时 home 和虚构项目；
+**前置条件：** 自动化全套通过；使用临时 home 和虚构项目；
 准备一次性、本机隔离的 SSH 服务或等价离线故障注入，不连接真实服务器。
 
 **实施步骤：**
@@ -120,7 +123,7 @@ Get-ChildItem -LiteralPath (Join-Path $acceptanceHome '.sessionatlas') -Force
    仍在。禁止通过破坏真实 prefs 数据制造失败。
 5. 只连接一次性本机 SSH fixture，分别制造“一根成功一根失败”和“一台成功一台失败”，
    执行 T7、T9；确认 last-known-good 和 partial 状态。
-6. 在有隐藏成员的搜索/tool/recency 筛选下执行 T8，清除筛选并重启，核对完整顺序。
+6. 在有隐藏成员的搜索/tool 筛选下执行 T8，清除筛选并重启，核对完整顺序。
 7. 每个场景立即填写记录模板；失败时保存临时 home，不继续覆盖现场。
 
 **构建与自动检查：**
@@ -142,12 +145,12 @@ cargo tauri build
 
 ### RI-04：取得 Windows/Ubuntu 托管 CI 证据
 
-**目标不变量：** 同一 commit 必须在 Windows 和 Ubuntu 的托管执行器上运行相同的
+**目标不变量：** 若启用托管门禁，同一 commit 必须在 Windows 和 Ubuntu 的托管执行器上运行相同的
 Rust 测试与 CLI 构建。开发机和本地容器结果不能替代该门禁。
 
 **实施步骤：**
 
-1. 使用 `.github/workflows/ci.yml`，确认 `rust-core-cli` 与 `tauri` job 在同一 commit
+1. 如恢复托管门禁，使用 `.github/workflows/ci.yml`，确认 `rust-core-cli` 与 `tauri` job 在同一 commit
    上运行 `cargo test`、`cargo clippy --workspace --all-targets -- -D warnings`、
    `cargo fmt --all -- --check`。
 2. 在任何远端操作前记录目标仓库、可见性、分支保护和费用影响；需要用户明确授权后
@@ -158,7 +161,7 @@ Rust 测试与 CLI 构建。开发机和本地容器结果不能替代该门禁�
 
 **通过标准：** Windows 和 Ubuntu 均成功；两条记录指向同一 commit；无 skipped/failure。
 
-**失败处置：** 平台未选或未授权时保持 BLOCKED；CI 失败时保存完整日志，按失败平台复现，
+**失败处置：** 本周期不调用 Actions 时保持 BLOCKED；CI 失败时保存完整日志，按失败平台复现，
 修复后重新触发完整矩阵。不得删除或绕过失败 job。
 
 ### RI-05：完成 Rust 依赖漏洞检查
@@ -188,7 +191,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### RI-06：审阅、提交和远端交付
 
-**前置条件：** RI-01、RI-02、RI-04、RI-05 均为 PASS，或有维护者签字接受的例外；用户明确授权本次
+**前置条件：** RI-01、RI-02、RI-05 均为 PASS，或有维护者签字接受的例外；RI-04 若未启用托管门禁须有明确记录；用户明确授权本次
 stage/commit/push 的目标和范围。
 
 **实施步骤：**
@@ -270,15 +273,17 @@ git status --short
 `search` 读回两个 UTC 时间，
 manifest schemaVersion=2 完整记录两个项目/会话 ID/UTC 时间；`git diff --check`
 通过。修复了一处 kimi/opencode/parsing 测试共享 `ENV_LOCK` 的并发缺陷。
+该记录是历史本地构建，不是公开 `v0.1.0-beta.3` 资产的安装验证；公开资产与
+2026-08-31 post-beta.3 候选的哈希不同。
 
-**R14 未通过/未执行（仍为发布门禁）：** 本机未重跑 `cargo audit`（托管 Security
-workflow 仍是门禁）；托管 CI 未运行（RI-04 保持 BLOCKED）；第 10 节手工/真机
+**R14 未通过/未执行（历史发布门禁）：** 本机当时未重跑 `cargo audit`（后续已于
+2026-08-18 完成）；托管 Security workflow 未运行（RI-04 保持 BLOCKED）；第 10 节手工/真机
 门禁与原生 UI T1～T9 全部未通过。
 
 **2026-08-18 后续复核：** 已在当前工作区执行 `cargo audit 0.22.2`，扫描 538 个
 锁定 crate，结果为 0 个漏洞、17 个已分析的上游 informational warning，RI-05
-更新为 PASS。R14 当时未执行的历史记录保留不变；托管 Security workflow 仍需在
-交付 commit 上通过。
+更新为 PASS。R14 当时未执行的历史记录保留不变；托管 Security workflow 在本周期
+未调用，因此仍无托管结果可宣称。
 
 ## 5. 整体完成定义
 
@@ -286,7 +291,9 @@ workflow 仍是门禁）；托管 CI 未运行（RI-04 保持 BLOCKED）；第 1
 
 1. RI-01、RI-02、RI-04～RI-07 均为 PASS；任何例外都有维护者、原因、影响和后续期限。
 2. T1～T9 全部有可审计记录，不能用 headless 测试或启动截图替代交互结果。
-3. 同一 commit 的 Windows/Ubuntu 托管 CI 均通过。
+3. 若启用托管 CI/Security 门禁，同一 commit 的 Windows/Ubuntu job 均通过；
+   若本周期明确不启用托管门禁，必须记录维护者例外，并运行本地等价门禁，
+   但不得将本地结果表述为托管通过。
 4. R14 最终门禁无失败、无跳过、无新增 warning，测试数量不低于记录基线。
 5. 原生测试未启动真实 AI CLI、未连接真实 SSH、未读取或改变真实索引和凭据。
 6. Rust advisory scan 已执行并处置结果。

@@ -222,7 +222,8 @@ External process and untrusted-input rules live in
 ## Unverified manual/live gates (remaining)
 
 These are **not** claimed to have passed by local automation. They remain
-release gates and must be executed before release:
+follow-up gates for the next release; the post-beta.3 candidate installer cycle
+is recorded separately below.
 
 - Real-user read-only scan of actually installed Claude/Codex/Kimi/OpenCode/
   Aider/Pi data directories with project/session counts checked against the tool.
@@ -240,7 +241,32 @@ release gates and must be executed before release:
   informational warnings are tracked in `execution-security-contract.md`.
   The hosted Security workflow remains a separate release gate for the delivery
   commit; local evidence does not replace its result.
-- Install in a sandbox without any extra language runtime and first scan.
+- Formal canonical security-scan artifact bound to the delivery commit.
+
+## Post-beta.3 candidate installer evidence (2026-08-31, Windows x64)
+
+The 2026-08-31 candidate based on post-beta.3 commit `5bc6a8c` completed real
+isolated MSI and NSIS install → launch → real-window screenshot → uninstall
+cycles. The complete local report is
+`target/installer-cycle-20260831-5bc6a8c/REPORT.md` (generated evidence is
+intentionally not tracked). This candidate is not the exact published
+`v0.1.0-beta.3` asset set.
+
+Both installers displayed two synthetic projects from the isolated
+`SESSIONATLAS_HOME`, exited cleanly, and left no installer, shortcut, registry,
+or process residue after uninstall. This is Windows installer evidence only; it
+does not claim that the published beta.3 assets were tested. Its hashes are:
+
+- post-beta.3 candidate MSI: `B40EB200DABF471F2F9E47D9917E71F7261205EBEF907211772F54AEC602F4F7`;
+- post-beta.3 candidate NSIS: `3AAD86D3DCE300FA9E4780E04E05256465AF65809D63D7460FE56866FF94698F`;
+- published beta.3 MSI: `5ca2edcd8eef61c8bca00c2de676574d68d981db5738e7cd9b1e01abde871cfd`;
+- published beta.3 NSIS: `567f6f0277c4dd7c3ac806d19efed057a8e3d79f9b3b504be99558007ded68b5`.
+
+It also does not claim T1–T9, real-user compatibility for all six CLIs,
+cross-platform CLI launch, remote SSH acceptance, hosted
+CI/security, or a formal canonical security-scan artifact. The MSI, NSIS
+installer, and executable remain unsigned, so an unknown-publisher warning is
+expected.
 
 Earlier implementation baselines are archived only in
 [`rust-migration-plan.md`](./rust-migration-plan.md). They are not part of the

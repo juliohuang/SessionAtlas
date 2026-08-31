@@ -1,6 +1,6 @@
 # SessionAtlas 手工验收执行清单
 
-本清单用于 R14 之前的原生桌面验收。它不替代自动化测试，也不要求真实
+本清单用于后续原生桌面验收。它不替代自动化测试，也不要求真实
 AI CLI、SSH 凭据或生产数据。每个场景都必须记录“通过/失败/不适用”、平台、
 版本、时间和截图或日志位置。
 
@@ -8,11 +8,15 @@ AI CLI、SSH 凭据或生产数据。每个场景都必须记录“通过/失败
 
 1. 在仓库根目录执行 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --no-fail-fast`。
 2. 在 `frontend/` 执行 `npm test`。
-3. 在仓库根目录执行 `cargo tauri build` 构建候选程序。
+3. 在仓库根目录执行 `cargo tauri build --ci` 构建候选程序；若只验收安装器，记录 MSI/NSIS 文件哈希。
 4. 使用临时 `SESSIONATLAS_HOME`，只放合成工具历史和可丢弃的 SQLite 数据；不要配置真实凭据。
 5. 启动待验收程序前记录 OS、WebView2、Rust 和 Tauri 版本。
 
 前置条件任何一项失败，都先记录并停止手工矩阵，不得用“看起来能用”替代。
+
+2026-08-31 的 post-beta.3 候选 MSI/NSIS 安装、启动、截图和卸载闭环已记录在本地
+`target/installer-cycle-20260831-5bc6a8c/REPORT.md`（生成目录不纳入版本控制）。
+该报告不替代下列 T1–T9 交互矩阵；未完成的场景仍须逐项记录。
 
 ## 1. Tauri 原生矩阵
 

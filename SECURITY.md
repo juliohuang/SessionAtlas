@@ -8,8 +8,8 @@
 | Older beta releases | Best effort only |
 | Untagged development builds | No guaranteed support |
 
-Before the first public beta tag exists, only the latest commit on `main` is
-treated as the supported release candidate.
+The latest tagged `0.1.x` beta is the supported public release. Security fixes
+may also be available on `main` before the next beta is tagged.
 
 ## Project security boundary
 

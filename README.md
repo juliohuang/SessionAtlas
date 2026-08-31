@@ -26,7 +26,7 @@ SessionAtlas 由两个协作组件组成：
 
 ### Windows 桌面版（Beta）
 
-从 [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest) 下载最新的 `.msi` 或 `-setup.exe`。扫描由桌面版在进程内完成，安装包不捆绑独立扫描器，也无需额外语言运行时；首次启动且索引不存在时会自动扫描一次，之后可按需点击“重新扫描”。
+从 [v0.1.0-beta.3 预发布页](https://github.com/juliohuang/SessionAtlas/releases/tag/v0.1.0-beta.3) 下载 `.msi` 或 `-setup.exe`。扫描由桌面版在进程内完成，安装包不捆绑独立扫描器，也无需额外语言运行时；首次启动且索引不存在时会自动扫描一次，之后可按需点击“重新扫描”。
 
 要求：
 
@@ -34,7 +34,7 @@ SessionAtlas 由两个协作组件组成：
 - WebView2 Runtime（Windows 11 通常已包含）；
 - 受支持 AI CLI 必须已安装、适配器支持对应机器、已启用并完成登录，才可启动对应会话。若活动适配器声明了固定 npm/uv 软件包且机器具备对应管理器，可在“设置 → AI TUI 工具”中一键安装，并在后台检查版本后手动确认升级。
 
-首个公开版本是 Beta。升级前建议保留 `~/.sessionatlas/`；如遇问题请查看[支持说明](./SUPPORT.md)或提交 issue。
+当前公开预发布版本是 `v0.1.0-beta.3`。预发布页提供 MSI、NSIS、`SHA256SUMS.txt` 和 SPDX SBOM（`sessionatlas.spdx.json`）。这是未经 Authenticode 签名的 Windows Beta，安装时可能出现未知发布者提示；升级前建议保留 `~/.sessionatlas/`，并按预发布页提供的 SHA-256 校验和核对下载文件。如遇问题请查看[支持说明](./SUPPORT.md)或提交 issue。
 
 ### 从源码运行 CLI
 
@@ -98,7 +98,7 @@ CLI 源码在 Windows、macOS 和 Linux 上构建与测试；当前自动发布�
 - **正常权限策略**：批量 Claude 任务不会加入跳过权限检查的参数；需要批准的操作可能停下来等待用户。
 - **本地资源**：xterm.js、语法高亮和字体不依赖 CDN。第三方声明见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
 
-安全执行约束见 [`docs/execution-security-contract.md`](./docs/execution-security-contract.md)。发现安全问题时，请不要公开披露；正式私密报告流程会记录在 `SECURITY.md`。
+安全执行约束见 [`docs/execution-security-contract.md`](./docs/execution-security-contract.md)。发现安全问题时，请不要公开披露；请先查看 [SECURITY.md](./SECURITY.md) 中的私密报告入口（仓库设置可能尚未启用该入口，届时通过维护者的 GitHub 个人资料私下联系）。
 
 ## 本地开发
 
@@ -141,7 +141,7 @@ cargo tauri build
 
 ## 项目状态
 
-SessionAtlas 正在准备首个公开 Beta。当前路线图见 [ROADMAP.md](./ROADMAP.md)，版本变化见 [CHANGELOG.md](./CHANGELOG.md)。
+SessionAtlas 当前是公开的 Windows Beta，版本为 `v0.1.0-beta.3`；后续候选版本的安装器闭环证据，以及仍未完成的真实用户、跨平台及安全门禁见 [ROADMAP.md](./ROADMAP.md) 与 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 参与贡献
 

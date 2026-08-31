@@ -26,7 +26,7 @@ SessionAtlas helps people who use several AI coding CLIs and regularly lose trac
 
 ### Windows desktop beta
 
-Download the latest `.msi` or `-setup.exe` from [GitHub Releases](https://github.com/juliohuang/SessionAtlas/releases/latest). Scanning runs in-process inside the desktop app; the installer does not bundle a separate scanner binary or require an additional language runtime. When the index is missing, the first launch scans automatically; use **Rescan** for later refreshes.
+Download the `.msi` or `-setup.exe` from the [`v0.1.0-beta.3` prerelease](https://github.com/juliohuang/SessionAtlas/releases/tag/v0.1.0-beta.3). Scanning runs in-process inside the desktop app; the installer does not bundle a separate scanner binary or require an additional language runtime. When the index is missing, the first launch scans automatically; use **Rescan** for later refreshes.
 
 Requirements:
 
@@ -34,7 +34,7 @@ Requirements:
 - WebView2 Runtime (normally included with Windows 11);
 - a supported AI CLI must be installed, compatible with the adapter's platform/remote contract, enabled for that machine, and authenticated before SessionAtlas can launch its sessions. When an active adapter declares a fixed npm/uv package, it can be installed from **Settings → AI TUI tools** if that manager is available.
 
-The first public release is a beta. Keep a copy of `~/.sessionatlas/` before upgrading and see [SUPPORT.md](./SUPPORT.md) when reporting a problem.
+The current public prerelease is `v0.1.0-beta.3`. The prerelease provides the MSI, NSIS installer, `SHA256SUMS.txt`, and the SPDX SBOM (`sessionatlas.spdx.json`). The Windows installers are unsigned and may show an unknown-publisher warning; keep a copy of `~/.sessionatlas/` before upgrading and verify the SHA-256 checksum listed on the prerelease page. See [SUPPORT.md](./SUPPORT.md) when reporting a problem.
 
 ### Run the CLI from source
 
@@ -80,7 +80,7 @@ The legacy `sessionatlas config add-tool` command remains for compatibility.
 ## Highlights
 
 - Unified scanning, path deduplication, and SQLite FTS5 search;
-- tool and recency filters, persistent groups, and drag ordering;
+- tool filtering, persistent groups, and priority/recent/name/grouped ordering;
 - real multi-tab PTY terminals and recent-session resume actions;
 - configurable VS Code, file manager, terminal, and custom openers;
 - configurable browser-based development tools such as DSH; each requires an absolute credential-free HTTP(S) connection URL and opens in a sandboxed in-app web tab;
@@ -99,7 +99,7 @@ The legacy `sessionatlas config add-tool` command remains for compatibility.
 - **Normal permission policy:** queued Claude tasks do not add a permission-bypass flag; tasks requiring approval may pause for the user.
 - **Local assets:** xterm.js, highlighting, and fonts do not depend on a CDN. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 
-The execution boundary is documented in [`docs/execution-security-contract.md`](./docs/execution-security-contract.md). Do not disclose vulnerabilities in a public issue; the private reporting process will be documented in `SECURITY.md`.
+The execution boundary is documented in [`docs/execution-security-contract.md`](./docs/execution-security-contract.md). Do not disclose vulnerabilities in a public issue; see [SECURITY.md](./SECURITY.md) for private reporting (the repository setting may still need to be enabled, with private maintainer contact as fallback).
 
 ## Development
 
@@ -143,7 +143,7 @@ See [AGENTS.md](./AGENTS.md) for architecture, [`docs/scan-contract.md`](./docs/
 
 ## Project status
 
-SessionAtlas is preparing its first public beta. See [ROADMAP.md](./ROADMAP.md) and [CHANGELOG.md](./CHANGELOG.md).
+SessionAtlas is publicly available as the Windows `v0.1.0-beta.3` prerelease. Post-beta.3 candidate installer evidence and the remaining real-user, cross-platform, and security gates are tracked in [ROADMAP.md](./ROADMAP.md) and [CHANGELOG.md](./CHANGELOG.md).
 
 ## Contributing
 
