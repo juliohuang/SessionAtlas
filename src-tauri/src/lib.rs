@@ -15,7 +15,7 @@ use sessionatlas_core::scanner::{
     build_adapter_scanners, ScanDiagnostic, ScanDiagnosticSeverity, Scanner,
     UNEXPECTED_SCANNER_FAILURE,
 };
-use sessionatlas_core::store::{content_index_sanitizer_is_current, SqliteStore};
+use sessionatlas_core::store::{content_index_is_safe, validate_index_schema, SqliteStore};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -484,17 +484,17 @@ pub struct RemoteProject {
     tool_usages: Vec<ToolUsage>,
 }
 
-/// Cached read-write handles for the two SQLite files. Lazy-initialized
-/// on first use so the index DB can be missing at startup (the app shows
-/// an error card and waits for `sessionatlas scan` to populate it). WAL mode
-/// is enabled so concurrent readers never block each other.
+/// Cached SQLite handles: `index.db` is read-only and `prefs.db` is read-write.
+/// They are lazy-initialized so the index DB can be missing at startup (the app
+/// shows an error card and waits for a scan to populate it). WAL mode is used
+/// only for mutable preferences state.
 static INDEX_DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 static PREFS_DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
 fn configure_prefs_connection(c: &Connection) -> Result<(), String> {
     // WAL: readers don't block writers and vice versa. NORMAL synchronous
     // trades a sliver of crash-safety for big write speedups — acceptable
-    // since both DBs are derived caches (index.db) or user prefs (prefs.db).
+    // for this preferences database.
     c.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
     c.pragma_update(None, "synchronous", "NORMAL")
@@ -521,6 +521,14 @@ fn open_index_reader(path: &std::path::Path) -> Result<Connection, String> {
             path.display()
         ));
     }
+    let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("could not open read-only index {}: {e}", path.display()))?;
+    c.pragma_update(None, "query_only", "ON")
+        .map_err(|e| format!("could not configure read-only index: {e}"))?;
+    c.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("could not configure index timeout: {e}"))?;
+    validate_index_schema(&c)
+        .map_err(|error| format!("invalid index schema {}: {error}", path.display()))?;
     if let Some(parent) = path.parent() {
         private_fs::ensure_private_directory(parent).map_err(|error| {
             format!(
@@ -533,12 +541,6 @@ fn open_index_reader(path: &std::path::Path) -> Result<Connection, String> {
         .map_err(|error| format!("could not protect index {}: {error}", path.display()))?;
     private_fs::harden_sqlite_sidecars(path)
         .map_err(|error| format!("could not protect index sidecars: {error}"))?;
-    let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| format!("could not open read-only index {}: {e}", path.display()))?;
-    c.pragma_update(None, "query_only", "ON")
-        .map_err(|e| format!("could not configure read-only index: {e}"))?;
-    c.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|e| format!("could not configure index timeout: {e}"))?;
     Ok(c)
 }
 
@@ -1289,19 +1291,7 @@ fn search_projects_in_connection(
 }
 
 fn content_index_available(connection: &Connection) -> Result<bool, String> {
-    if !content_index_sanitizer_is_current(connection).map_err(|error| error.to_string())? {
-        return Ok(false);
-    }
-    let count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type IN ('table', 'view')
-               AND name IN ('project_content_files', 'project_content_fts')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(count == 2)
+    content_index_is_safe(connection).map_err(|error| error.to_string())
 }
 
 fn fetch_project_rows_by_ids(
@@ -7143,12 +7133,7 @@ mod baseline_tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("index.db");
-        {
-            let writer = Connection::open(&path).unwrap();
-            writer
-                .execute_batch("CREATE TABLE projects (id INTEGER PRIMARY KEY)")
-                .unwrap();
-        }
+        drop(SqliteStore::new(&path).unwrap());
         let before: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -8876,8 +8861,15 @@ mod baseline_tests {
         connection
             .execute_batch(
                 "CREATE TABLE sessionatlas_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE project_content_files (id INTEGER PRIMARY KEY);
-                 CREATE TABLE project_content_fts (rowid INTEGER PRIMARY KEY);
+                 CREATE TABLE project_content_files (
+                    id INTEGER PRIMARY KEY, project_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL, modified_ns INTEGER NOT NULL,
+                    file_size INTEGER NOT NULL, indexed_bytes INTEGER NOT NULL,
+                    compressed_preview BLOB NOT NULL
+                 );
+                 CREATE VIRTUAL TABLE project_content_fts USING fts5(
+                    relative_path, body, content='', contentless_delete=1
+                 );
                  INSERT INTO sessionatlas_meta (key, value)
                  VALUES ('content_index_sanitizer_version', '1');",
             )

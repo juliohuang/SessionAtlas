@@ -1,5 +1,6 @@
-//! SQLite index writer: schema creation, migration, path identity, snapshot
-//! replacement, FTS5, list/search/exact lookup, session recording.
+//! SQLite index reader/writer: schema validation, creation and migration, path
+//! identity, snapshot replacement, FTS5, list/search/exact lookup, and session
+//! recording.
 //!
 //! The store owns `index.db`
 //! and writes exactly the schema the Tauri console queries read-only:
@@ -22,6 +23,9 @@ use crate::private_fs;
 /// unchanged source file to be reopened and all stored previews/FTS terms to
 /// be rebuilt.
 pub const CONTENT_INDEX_SANITIZER_VERSION: i64 = 2;
+
+/// Version of the on-disk `index.db` schema.
+pub const INDEX_SCHEMA_VERSION: i64 = 1;
 
 /// Result alias for store operations.
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -59,6 +63,12 @@ pub enum StoreError {
     CorruptRow(String),
     /// A stored timestamp could not be parsed as RFC 3339.
     BadTimestamp(String),
+    /// The database schema version is not supported by this build.
+    UnsupportedSchemaVersion { found: i64, supported: i64 },
+    /// The database schema metadata is malformed.
+    InvalidSchema(String),
+    /// A required table or column is missing or has an invalid shape.
+    SchemaInvariant(String),
 }
 
 impl fmt::Display for StoreError {
@@ -105,6 +115,14 @@ impl fmt::Display for StoreError {
             }
             StoreError::BadTimestamp(text) => {
                 write!(f, "Stored timestamp is not valid RFC 3339: {text}")
+            }
+            StoreError::UnsupportedSchemaVersion { found, supported } => write!(
+                f,
+                "Unsupported index schema version {found}; this build supports versions 0 through {supported}."
+            ),
+            StoreError::InvalidSchema(detail) => write!(f, "Invalid index schema: {detail}"),
+            StoreError::SchemaInvariant(detail) => {
+                write!(f, "Index schema invariant failed: {detail}")
             }
         }
     }
@@ -303,8 +321,8 @@ const RECOMPUTE_PROJECT_ACTIVITY_SQL: &str = r#"
     )
 "#;
 
-/// Upsert for a single snapshot usage; the unique index is created by the
-/// legacy migration on every open.
+/// Upsert for a single snapshot usage; the versioned v0 -> v1 migration creates
+/// the unique identity index when needed.
 const USAGE_UPSERT_SQL: &str = r#"
     INSERT INTO tool_usages
         (project_id, tool_name, tool_key, last_used_at, session_count, last_session_id)
@@ -333,7 +351,8 @@ pub struct SqliteStore {
 /// Unlike [`SqliteStore`], opening this type never creates directories/files,
 /// initializes or migrates schema, repairs permissions, or rebuilds FTS. The
 /// database must already exist and be complete enough for the requested query;
-/// missing tables are returned as SQLite errors instead of being repaired.
+/// missing or malformed required structures are returned as schema-invariant
+/// errors instead of being repaired.
 pub struct IndexReader {
     connection: Connection,
 }
@@ -347,6 +366,7 @@ impl IndexReader {
             Connection::open_with_flags(database_path.as_ref(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA query_only = ON")?;
+        validate_index_schema(&connection)?;
         Ok(Self { connection })
     }
 
@@ -380,10 +400,16 @@ pub struct ContentIndexStats {
 
 impl SqliteStore {
     /// Opens (creating when missing) the database at `database_path`, creates
-    /// parent directories, initializes the schema, runs migrations, and
-    /// rebuilds the FTS index. No other business file is created or touched.
+    /// parent directories, validates the current schema, and runs any required
+    /// versioned migration. FTS is rebuilt only by a migration that requires
+    /// it. No other business file is created or touched.
     pub fn new(database_path: impl AsRef<Path>) -> Result<Self> {
         let path = database_path.as_ref();
+        if path.exists() {
+            let read_only = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let schema_version = read_index_schema_version(&read_only)?;
+            ensure_supported_schema_version(schema_version)?;
+        }
         private_fs::prepare_private_database(path)?;
         let mut connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys = ON")?;
@@ -925,7 +951,7 @@ fn search_projects_rows(
         return Ok(Vec::new());
     };
     let content_query = build_content_fts_prefix_query(search);
-    let content_search_enabled = content_query.is_some() && content_search_is_safe(connection)?;
+    let content_search_enabled = content_query.is_some() && content_index_is_safe(connection)?;
     let rows = if let Some(content_query) = content_query.filter(|_| content_search_enabled) {
         let sql = format!(
             "SELECT p.{PROJECT_COLUMNS} FROM projects p
@@ -968,15 +994,44 @@ fn search_projects_rows(
     Ok(rows)
 }
 
-fn content_search_is_safe(connection: &Connection) -> Result<bool> {
-    let optional_tables: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-         WHERE type = 'table'
-           AND name IN ('project_content_files', 'project_content_fts')",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(optional_tables == 2 && content_index_sanitizer_is_current(connection)?)
+/// Whether optional content search is safe to expose. Any missing, malformed,
+/// or non-FTS5 content structure fails closed while name/path search remains
+/// available.
+pub fn content_index_is_safe(connection: &Connection) -> Result<bool> {
+    if !content_index_sanitizer_is_current(connection)? {
+        return Ok(false);
+    }
+    if !optional_schema_is_valid(validate_table_columns(
+        connection,
+        "project_content_files",
+        &[
+            "id",
+            "project_id",
+            "relative_path",
+            "modified_ns",
+            "file_size",
+            "indexed_bytes",
+            "compressed_preview",
+        ],
+    ))? {
+        return Ok(false);
+    }
+    if !optional_schema_is_valid(validate_content_fts5_table(
+        connection,
+        "project_content_fts",
+        &["relative_path", "body"],
+    ))? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn optional_schema_is_valid(result: Result<()>) -> Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(StoreError::SchemaInvariant(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn list_projects_by_tool_rows(
@@ -1023,16 +1078,354 @@ fn project_fields(row: &rusqlite::Row) -> rusqlite::Result<ProjectFields> {
 }
 
 fn initialize_schema(connection: &mut Connection) -> Result<()> {
-    connection.execute_batch(SCHEMA_SQL)?;
-    migrate_content_index_sanitizer(connection)?;
-    migrate_tool_usage_identity(connection)?;
-    if cfg!(windows) {
-        connection.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_projects_path_nocase ON projects(path COLLATE NOCASE)",
-        )?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let schema_version = read_index_schema_version(&tx)?;
+    ensure_supported_schema_version(schema_version)?;
+    if schema_version == 0 {
+        // All structural changes, legacy deduplication, FTS rebuilding and the
+        // version marker are one transaction. A failed migration therefore
+        // leaves the v0 database byte-for-byte usable for a retry.
+        tx.execute_batch(SCHEMA_SQL)?;
+        migrate_tool_usage_identity_tx(&tx)?;
+        if cfg!(windows) {
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_projects_path_nocase ON projects(path COLLATE NOCASE)",
+            )?;
+        }
+        tx.execute_batch(TOOL_KEY_NOCASE_INDEX_SQL)?;
+        rebuild_fts(&tx)?;
+        validate_writer_schema(&tx)?;
+        tx.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
+    } else {
+        validate_writer_schema(&tx)?;
     }
-    connection.execute_batch(TOOL_KEY_NOCASE_INDEX_SQL)?;
-    rebuild_fts(connection)?;
+
+    tx.commit()?;
+
+    // Content sanitization is an independent cache-generation maintenance
+    // pass. It intentionally runs only after the schema transaction commits;
+    // VACUUM/checkpoint must never be part of the schema migration.
+    migrate_content_index_sanitizer(connection)?;
+    Ok(())
+}
+
+fn read_index_schema_version(connection: &Connection) -> Result<i64> {
+    connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| {
+            StoreError::InvalidSchema(format!("cannot read PRAGMA user_version: {error}"))
+        })
+}
+
+fn ensure_supported_schema_version(version: i64) -> Result<()> {
+    if !(0..=INDEX_SCHEMA_VERSION).contains(&version) {
+        return Err(StoreError::UnsupportedSchemaVersion {
+            found: version,
+            supported: INDEX_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Validates the shared reader contract without creating, repairing or
+/// otherwise mutating the database. Both v0 legacy indexes and v1 indexes use
+/// the same required query schema.
+pub fn validate_index_schema(connection: &Connection) -> Result<i64> {
+    let version = read_index_schema_version(connection)?;
+    if !(0..=INDEX_SCHEMA_VERSION).contains(&version) {
+        return Err(StoreError::UnsupportedSchemaVersion {
+            found: version,
+            supported: INDEX_SCHEMA_VERSION,
+        });
+    }
+
+    for (table, columns) in [
+        (
+            "projects",
+            [
+                "id",
+                "path",
+                "last_accessed_at",
+                "first_seen_at",
+                "git_branch",
+                "git_remote_url",
+            ]
+            .as_slice(),
+        ),
+        (
+            "tool_usages",
+            [
+                "project_id",
+                "tool_name",
+                "tool_key",
+                "last_used_at",
+                "session_count",
+                "last_session_id",
+            ]
+            .as_slice(),
+        ),
+        (
+            "sessions",
+            [
+                "id",
+                "project_path",
+                "tool_key",
+                "tool_name",
+                "started_at",
+                "ended_at",
+                "session_id_from_tool",
+            ]
+            .as_slice(),
+        ),
+        ("projects_fts", ["name", "path"].as_slice()),
+    ] {
+        validate_table_columns(connection, table, columns)?;
+        if table == "projects_fts" {
+            validate_fts5_table(connection, table, columns)?;
+        }
+    }
+    Ok(version)
+}
+
+fn validate_writer_schema(connection: &Connection) -> Result<i64> {
+    let version = validate_index_schema(connection)?;
+    validate_table_columns(
+        connection,
+        "tool_usages",
+        &[
+            "id",
+            "project_id",
+            "tool_name",
+            "tool_key",
+            "last_used_at",
+            "session_count",
+            "last_session_id",
+        ],
+    )?;
+    validate_integer_primary_key(connection, "tool_usages", "id")?;
+    validate_table_columns(connection, "sessionatlas_meta", &["key", "value"])?;
+    validate_table_columns(
+        connection,
+        "project_content_files",
+        &[
+            "id",
+            "project_id",
+            "relative_path",
+            "modified_ns",
+            "file_size",
+            "indexed_bytes",
+            "compressed_preview",
+        ],
+    )?;
+    validate_integer_primary_key(connection, "project_content_files", "id")?;
+    validate_content_fts5_table(
+        connection,
+        "project_content_fts",
+        &["relative_path", "body"],
+    )?;
+    validate_table_columns(
+        connection,
+        "project_content_status",
+        &[
+            "project_id",
+            "indexed_files",
+            "indexed_bytes",
+            "skipped_files",
+            "truncated",
+        ],
+    )?;
+    validate_unique_usage_index(connection)?;
+    Ok(version)
+}
+
+fn validate_table_columns(connection: &Connection, table: &str, columns: &[&str]) -> Result<()> {
+    let table_type: Option<String> = connection
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_type.as_deref() != Some("table") {
+        return Err(StoreError::SchemaInvariant(format!(
+            "required table '{table}' is missing"
+        )));
+    }
+
+    let pragma = format!("PRAGMA table_info('{}')", table.replace('\'', "''"));
+    let actual = connection
+        .prepare(&pragma)?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
+    let missing = columns
+        .iter()
+        .filter(|column| !actual.contains(**column))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(StoreError::SchemaInvariant(format!(
+            "required table '{table}' is missing columns: {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn validate_integer_primary_key(connection: &Connection, table: &str, column: &str) -> Result<()> {
+    let pragma = format!("PRAGMA table_info('{}')", table.replace('\'', "''"));
+    let declared_columns = connection
+        .prepare(&pragma)?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let primary_key_columns = declared_columns
+        .iter()
+        .filter(|(_, _, primary_key_order)| *primary_key_order > 0)
+        .count();
+    let valid = declared_columns.iter().any(|(name, declared_type, order)| {
+        name == column && declared_type.eq_ignore_ascii_case("INTEGER") && *order == 1
+    }) && primary_key_columns == 1;
+    if !valid {
+        return Err(StoreError::SchemaInvariant(format!(
+            "required column '{table}.{column}' must be the single INTEGER PRIMARY KEY"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_fts5_table(connection: &Connection, table: &str, columns: &[&str]) -> Result<()> {
+    validate_fts5_definition(connection, table)?;
+    validate_table_columns(connection, table, columns)
+}
+
+fn validate_fts5_definition(connection: &Connection, table: &str) -> Result<String> {
+    let table_kind: Option<String> = connection
+        .query_row(
+            "SELECT type FROM pragma_table_list
+             WHERE schema = 'main' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_kind.as_deref() != Some("virtual") {
+        return Err(StoreError::SchemaInvariant(format!(
+            "required table '{table}' is not a virtual table"
+        )));
+    }
+
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let normalized = sql
+        .as_deref()
+        .map(|definition| {
+            definition
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    let module = normalized
+        .split_once(" using ")
+        .map(|(_, remainder)| remainder)
+        .and_then(|remainder| {
+            remainder
+                .split(|character: char| character == '(' || character.is_whitespace())
+                .find(|part| !part.is_empty())
+        });
+    let is_fts5 = module == Some("fts5");
+    if !is_fts5 {
+        return Err(StoreError::SchemaInvariant(format!(
+            "required table '{table}' is not an FTS5 virtual table"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn validate_content_fts5_table(
+    connection: &Connection,
+    table: &str,
+    columns: &[&str],
+) -> Result<()> {
+    let definition = validate_fts5_definition(connection, table)?;
+    validate_table_columns(connection, table, columns)?;
+    let compact_definition = definition
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let content_shadow = format!("{table}_content");
+    let has_content_shadow: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [content_shadow],
+        |row| row.get(0),
+    )?;
+    let is_contentless = has_content_shadow == 0
+        && compact_definition.contains("content=''")
+        && compact_definition.contains("contentless_delete=1");
+    if !is_contentless {
+        return Err(StoreError::SchemaInvariant(format!(
+            "required table '{table}' must use content='' and contentless_delete=1"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_unique_usage_index(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA index_list('tool_usages')")?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if indexes
+        .iter()
+        .find(|(name, _, _)| name == "idx_usages_project_tool")
+        .map(|(_, unique, partial)| (*unique, *partial))
+        != Some((1, 0))
+    {
+        return Err(StoreError::SchemaInvariant(
+            "idx_usages_project_tool must be a non-partial unique index".to_string(),
+        ));
+    }
+
+    let mut statement = connection.prepare("PRAGMA index_xinfo('idx_usages_project_tool')")?;
+    let index_columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, _, is_key)| *is_key == 1)
+        .map(|(name, collation, _)| (name, collation))
+        .collect::<Vec<_>>();
+    let has_expected_identity = index_columns.len() == 2
+        && index_columns[0].0.as_deref() == Some("project_id")
+        && index_columns[0].1.eq_ignore_ascii_case("BINARY")
+        && index_columns[1].0.as_deref() == Some("tool_key")
+        && index_columns[1].1.eq_ignore_ascii_case("NOCASE");
+    if !has_expected_identity {
+        return Err(StoreError::SchemaInvariant(
+            "idx_usages_project_tool must index project_id and tool_key COLLATE NOCASE".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1104,10 +1497,8 @@ pub fn content_index_sanitizer_is_current(connection: &Connection) -> Result<boo
     Ok(version.as_deref() == Some(&CONTENT_INDEX_SANITIZER_VERSION.to_string()))
 }
 
-fn migrate_tool_usage_identity(connection: &Connection) -> Result<()> {
-    let tx = connection.unchecked_transaction()?;
+fn migrate_tool_usage_identity_tx(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(MIGRATE_TOOL_USAGE_IDENTITY_SQL)?;
-    tx.commit()?;
     Ok(())
 }
 

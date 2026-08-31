@@ -10,8 +10,8 @@ use sessionatlas_core::content_index::ContentIndexOptions;
 use sessionatlas_core::model::{Project, Session, ToolUsage};
 use sessionatlas_core::path;
 use sessionatlas_core::store::{
-    content_index_sanitizer_is_current, IndexReader, SqliteStore, StoreError,
-    CONTENT_INDEX_SANITIZER_VERSION,
+    content_index_is_safe, content_index_sanitizer_is_current, IndexReader, SqliteStore,
+    StoreError, CONTENT_INDEX_SANITIZER_VERSION, INDEX_SCHEMA_VERSION,
 };
 
 fn utc(year: i32, month: u32, day: u32) -> DateTime<Utc> {
@@ -99,6 +99,633 @@ fn database_fingerprint(
         metadata.modified().unwrap(),
         entries,
     )
+}
+
+fn seed_legacy_base_schema(connection: &rusqlite::Connection, project_path: &str) {
+    connection
+        .execute_batch(
+            "CREATE TABLE projects (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                last_accessed_at TEXT,
+                first_seen_at TEXT,
+                git_branch TEXT,
+                git_remote_url TEXT
+            );
+            CREATE VIRTUAL TABLE projects_fts USING fts5(name, path);
+            CREATE TABLE tool_usages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_key TEXT NOT NULL,
+                last_used_at TEXT,
+                session_count INTEGER DEFAULT 1,
+                last_session_id TEXT
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                tool_key TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                started_at TEXT,
+                ended_at TEXT,
+                session_id_from_tool TEXT
+            );",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects (id, path, last_accessed_at, first_seen_at)
+             VALUES ('legacy-project', ?1, '2026-07-02T12:00:00Z', '2026-07-01T12:00:00Z')",
+            [project_path],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO projects_fts (rowid, name, path)
+             SELECT rowid, 'legacy-project', path FROM projects;
+             INSERT INTO tool_usages
+                 (project_id, tool_name, tool_key, last_used_at, session_count)
+             VALUES
+                 ('legacy-project', 'Codex', 'codex', '2026-07-01T12:00:00Z', 1),
+                 ('legacy-project', 'Codex', 'CODEX', '2026-07-02T12:00:00Z', 4);",
+        )
+        .unwrap();
+}
+
+#[test]
+fn fresh_store_sets_explicit_index_schema_version() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, INDEX_SCHEMA_VERSION);
+}
+
+#[test]
+fn legacy_store_migrates_atomically_and_preserves_data_and_fts() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    seed_legacy_base_schema(&connection, &abs_path(&["legacy-project"]));
+    drop(connection);
+
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, INDEX_SCHEMA_VERSION);
+    let usage_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM tool_usages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(usage_count, 1);
+    let usage_count: i64 = connection
+        .query_row("SELECT session_count FROM tool_usages", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(usage_count, 4);
+    let fts_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM projects_fts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(fts_count, 1);
+}
+
+#[test]
+fn v1_store_open_does_not_change_database_fingerprint() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .upsert_project(&project_at(
+            &abs_path(&["v1-fingerprint"]),
+            "v1-fingerprint",
+            utc(2026, 7, 1),
+            &[usage("codex", utc(2026, 7, 2), 1, None)],
+        ))
+        .unwrap();
+    drop(store);
+    let before = database_fingerprint(&db);
+    drop(SqliteStore::new(&db).unwrap());
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn unsupported_schema_version_is_rejected_without_sanitizer_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessionatlas_meta (key, value) VALUES ('sentinel', 'keep')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects (id, path) VALUES ('v2-content', ?1)",
+            [abs_path(&["v2-content"])],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO project_content_files
+                (project_id, relative_path, modified_ns, file_size, indexed_bytes, compressed_preview)
+             VALUES ('v2-content', 'secret.txt', 1, 1, 1, X'01')",
+            [],
+        )
+        .unwrap();
+    let content_rowid = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO project_content_fts (rowid, relative_path, body)
+             VALUES (?1, 'secret.txt', 'sentinel-content')",
+            [content_rowid],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessionatlas_meta SET value = '1'
+             WHERE key = 'content_index_sanitizer_version'",
+            [],
+        )
+        .unwrap();
+    connection
+        .pragma_update(None, "user_version", 2_i64)
+        .unwrap();
+    drop(connection);
+    let before = database_fingerprint(&db);
+    let error = match SqliteStore::new(&db) {
+        Ok(_) => panic!("unsupported schema unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::UnsupportedSchemaVersion { found: 2, .. }
+    ));
+    assert_eq!(database_fingerprint(&db), before);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM sessionatlas_meta WHERE key = 'sentinel'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM sessionatlas_meta WHERE key = 'content_index_sanitizer_version'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM project_content_files", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        1
+    );
+    connection
+        .pragma_update(None, "user_version", -1_i64)
+        .unwrap();
+    drop(connection);
+    let error = match SqliteStore::new(&db) {
+        Ok(_) => panic!("negative schema unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::UnsupportedSchemaVersion { found: -1, .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_writer_version_does_not_harden_existing_modes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join(".sessionatlas");
+    std::fs::create_dir(&data).unwrap();
+    let db = data.join("index.db");
+    drop(SqliteStore::new(&db).unwrap());
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .pragma_update(None, "user_version", 2_i64)
+        .unwrap();
+    drop(connection);
+    let before_dir = std::fs::metadata(&data).unwrap().mode() & 0o777;
+    let before_db = std::fs::metadata(&db).unwrap().mode() & 0o777;
+    assert!(matches!(
+        SqliteStore::new(&db),
+        Err(StoreError::UnsupportedSchemaVersion { found: 2, .. })
+    ));
+    assert_eq!(std::fs::metadata(&data).unwrap().mode() & 0o777, before_dir);
+    assert_eq!(std::fs::metadata(&db).unwrap().mode() & 0o777, before_db);
+}
+
+#[test]
+fn reader_rejects_unsupported_schema_version_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .pragma_update(None, "user_version", 2_i64)
+        .unwrap();
+    drop(connection);
+    let before = database_fingerprint(&db);
+    let error = match IndexReader::open_existing(&db) {
+        Ok(_) => panic!("unsupported schema unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::UnsupportedSchemaVersion { found: 2, .. }
+    ));
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn reader_rejects_a_plain_table_that_masquerades_as_projects_fts() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE projects_fts;
+             CREATE TABLE projects_fts (name TEXT, path TEXT);",
+        )
+        .unwrap();
+    drop(connection);
+    let error = match IndexReader::open_existing(&db) {
+        Ok(_) => panic!("plain projects_fts table unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::SchemaInvariant(_)), "{error}");
+}
+
+#[test]
+fn reader_rejects_a_plain_table_with_fts_markers_in_its_sql() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE projects_fts;
+             CREATE TABLE projects_fts (
+                name TEXT DEFAULT 'virtual table',
+                path TEXT DEFAULT 'using fts5'
+             );",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match IndexReader::open_existing(&db) {
+        Ok(_) => panic!("plain projects_fts table with marker text unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::SchemaInvariant(_)), "{error}");
+}
+
+#[test]
+fn content_index_is_fail_closed_for_a_plain_content_fts_table() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE project_content_fts;
+             CREATE TABLE project_content_fts (relative_path TEXT, body TEXT);",
+        )
+        .unwrap();
+    assert!(!content_index_is_safe(&connection).unwrap());
+}
+
+#[test]
+fn content_index_is_fail_closed_for_a_contentful_fts5_table() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE project_content_fts;
+             CREATE VIRTUAL TABLE project_content_fts USING fts5(relative_path, body);",
+        )
+        .unwrap();
+
+    assert!(!content_index_is_safe(&connection).unwrap());
+}
+
+#[test]
+fn content_index_propagates_malformed_metadata_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE sessionatlas_meta;
+             CREATE TABLE sessionatlas_meta (key TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        content_index_is_safe(&connection),
+        Err(StoreError::Sql(_))
+    ));
+}
+
+#[test]
+fn reader_ignores_content_search_for_a_plain_content_table_but_keeps_name_search() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let path_text = abs_path(&["content-ordinary-table"]);
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &path_text,
+                "content-ordinary-table",
+                utc(2026, 7, 1),
+                &[usage("codex", utc(2026, 7, 2), 1, None)],
+            )],
+            &["codex"],
+        )
+        .unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE project_content_fts;
+             CREATE TABLE project_content_fts (relative_path TEXT, body TEXT);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reader = IndexReader::open_existing(&db).unwrap();
+    assert!(reader
+        .list_projects(Some("ordinary-content-secret"), None, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        reader
+            .list_projects(Some("content-ordinary-table"), None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn v1_writer_rejects_a_missing_unique_usage_index_without_repairing() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute("DROP INDEX idx_usages_project_tool", [])
+        .unwrap();
+    drop(connection);
+    let before = database_fingerprint(&db);
+    let error = match SqliteStore::new(&db) {
+        Ok(_) => panic!("writer repaired a missing unique index"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::SchemaInvariant(_)), "{error}");
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn v1_writer_rejects_a_misleading_unique_usage_index() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX idx_usages_project_tool;
+             CREATE UNIQUE INDEX idx_usages_project_tool ON tool_usages(id);",
+        )
+        .unwrap();
+    drop(connection);
+    let before = database_fingerprint(&db);
+
+    let error = match SqliteStore::new(&db) {
+        Ok(_) => panic!("writer accepted a unique index with the wrong identity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::SchemaInvariant(_)), "{error}");
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn v1_writer_rejects_tool_usages_without_a_writer_id_column() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX idx_usages_project_tool;
+             DROP INDEX idx_usages_project;
+             DROP INDEX idx_usages_tool;
+             DROP INDEX idx_usages_tool_nocase;
+             ALTER TABLE tool_usages RENAME TO old_tool_usages;
+             CREATE TABLE tool_usages (
+                project_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_key TEXT NOT NULL,
+                last_used_at TEXT,
+                session_count INTEGER DEFAULT 1,
+                last_session_id TEXT
+             );
+             CREATE UNIQUE INDEX idx_usages_project_tool
+             ON tool_usages(project_id, tool_key COLLATE NOCASE);
+             DROP TABLE old_tool_usages;",
+        )
+        .unwrap();
+    drop(connection);
+    let before = database_fingerprint(&db);
+
+    let error = match SqliteStore::new(&db) {
+        Ok(_) => panic!("writer accepted tool_usages without its row identity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::SchemaInvariant(_)), "{error}");
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn v1_writer_rejects_a_non_integer_tool_usage_primary_key() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX idx_usages_project_tool;
+             DROP INDEX idx_usages_project;
+             DROP INDEX idx_usages_tool;
+             DROP INDEX idx_usages_tool_nocase;
+             ALTER TABLE tool_usages RENAME TO old_tool_usages;
+             CREATE TABLE tool_usages (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_key TEXT NOT NULL,
+                last_used_at TEXT,
+                session_count INTEGER DEFAULT 1,
+                last_session_id TEXT
+             );
+             CREATE UNIQUE INDEX idx_usages_project_tool
+             ON tool_usages(project_id, tool_key COLLATE NOCASE);
+             DROP TABLE old_tool_usages;",
+        )
+        .unwrap();
+    drop(connection);
+    let before = database_fingerprint(&db);
+
+    let error = match SqliteStore::new(&db) {
+        Ok(_) => panic!("writer accepted a non-integer tool usage row identity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::SchemaInvariant(_)), "{error}");
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn failed_v0_migration_rolls_back_all_schema_and_fts_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE projects (
+                id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                last_accessed_at TEXT, first_seen_at TEXT,
+                git_branch TEXT, git_remote_url TEXT
+             );
+             CREATE VIRTUAL TABLE projects_fts USING fts5(name, path);
+             CREATE TABLE tool_usages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL, tool_name TEXT NOT NULL,
+                tool_key TEXT NOT NULL, last_used_at TEXT,
+                session_count INTEGER DEFAULT 1, last_session_id TEXT
+             );
+             CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, project_path TEXT NOT NULL,
+                tool_key TEXT NOT NULL, tool_name TEXT NOT NULL,
+                started_at TEXT, ended_at TEXT, session_id_from_tool TEXT
+             );
+             CREATE TABLE sessionatlas_meta (key TEXT PRIMARY KEY);
+             INSERT INTO projects_fts (rowid, name, path)
+             VALUES (1, 'fts-sentinel', 'fts-sentinel');",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects (id, path) VALUES ('rollback', ?1)",
+            [abs_path(&["rollback"])],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO tool_usages
+                (project_id, tool_name, tool_key, last_used_at, session_count)
+             VALUES
+                ('rollback', 'Codex', 'codex', '2026-07-01T12:00:00Z', 1),
+                ('rollback', 'Codex', 'CODEX', '2026-07-02T12:00:00Z', 4);",
+        )
+        .unwrap();
+    drop(connection);
+    let before = database_fingerprint(&db);
+    assert!(SqliteStore::new(&db).is_err());
+    assert_eq!(database_fingerprint(&db), before);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 0);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM projects_fts", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT name FROM projects_fts LIMIT 1", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "fts-sentinel"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM tool_usages", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert!(
+        connection
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sessionatlas_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+            == 1
+    );
+    for table in [
+        "project_content_files",
+        "project_content_fts",
+        "project_content_status",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "migration must not leave {table}"
+        );
+    }
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessionatlas_meta')
+                 WHERE name = 'value'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -1286,10 +1913,32 @@ fn index_reader_rejects_incomplete_schema_without_repairing_it() {
     drop(connection);
 
     let before = database_fingerprint(&db);
-    let reader = IndexReader::open_existing(&db).unwrap();
-    let error = reader.list_projects(None, None, 10).unwrap_err();
-    assert!(error.to_string().contains("no such table"), "{error}");
-    drop(reader);
+    let error = match IndexReader::open_existing(&db) {
+        Ok(_) => panic!("incomplete schema unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::SchemaInvariant(_)), "{error}");
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn index_reader_rejects_incomplete_v1_schema_without_repairing_it() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+    let before = database_fingerprint(&db);
+    let error = match IndexReader::open_existing(&db) {
+        Ok(_) => panic!("incomplete v1 schema unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::SchemaInvariant(_)), "{error}");
     assert_eq!(database_fingerprint(&db), before);
 }
 
@@ -1316,7 +1965,8 @@ fn index_reader_searches_legacy_name_index_without_optional_content_tables() {
         .execute_batch(
             "DROP TABLE project_content_fts;
              DROP TABLE project_content_files;
-             DROP TABLE project_content_status;",
+             DROP TABLE project_content_status;
+             PRAGMA user_version = 0;",
         )
         .unwrap();
     drop(connection);
