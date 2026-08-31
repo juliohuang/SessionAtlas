@@ -8,9 +8,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::content_index::{collect_project_content, ContentFingerprint, ContentIndexOptions};
 use crate::model::{project_path_missing, Project, Session, ToolUsage};
@@ -325,6 +326,44 @@ const PROJECT_COLUMNS: &str =
 /// connection is single-threaded and owned by this struct.
 pub struct SqliteStore {
     connection: Connection,
+}
+
+/// Read-only view of an existing index database.
+///
+/// Unlike [`SqliteStore`], opening this type never creates directories/files,
+/// initializes or migrates schema, repairs permissions, or rebuilds FTS. The
+/// database must already exist and be complete enough for the requested query;
+/// missing tables are returned as SQLite errors instead of being repaired.
+pub struct IndexReader {
+    connection: Connection,
+}
+
+impl IndexReader {
+    /// Opens an existing index with SQLite's read-only flag and query-only
+    /// protection. This is intentionally a separate facade from the writer so
+    /// callers cannot accidentally obtain any mutation methods.
+    pub fn open_existing(database_path: impl AsRef<Path>) -> Result<Self> {
+        let connection =
+            Connection::open_with_flags(database_path.as_ref(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA query_only = ON")?;
+        Ok(Self { connection })
+    }
+
+    /// Lists projects using the same query and rendering model as the writer.
+    pub fn list_projects(
+        &self,
+        search: Option<&str>,
+        tool_key: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Project>> {
+        list_projects_from_connection(&self.connection, search, tool_key, limit)
+    }
+
+    /// Returns the most recent sessions ordered by start time descending.
+    pub fn get_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
+        get_recent_sessions_from_connection(&self.connection, limit)
+    }
 }
 
 /// Summary of one incremental content-index refresh.
@@ -703,34 +742,7 @@ impl SqliteStore {
         tool_key: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Project>> {
-        if !(1..=10_000).contains(&limit) {
-            return Err(StoreError::InvalidLimit);
-        }
-        let rows = if let Some(search) = search.filter(|value| !value.trim().is_empty()) {
-            self.search_projects_rows(search, limit)?
-        } else if let Some(tool_key) = tool_key.filter(|value| !value.trim().is_empty()) {
-            self.list_projects_by_tool_rows(tool_key, limit)?
-        } else {
-            self.list_all_projects_rows(limit)?
-        };
-        let mut projects = Vec::with_capacity(rows.len());
-        for (id, project_path, last, first, branch, remote) in rows {
-            let path_missing = project_path_missing(&project_path);
-            projects.push(Project {
-                id,
-                path: project_path,
-                path_missing,
-                last_accessed_at: parse_timestamp(&last)?,
-                first_seen_at: parse_timestamp(&first)?,
-                git_branch: branch,
-                git_remote_url: remote,
-                tool_usages: Vec::new(),
-            });
-        }
-        for project in &mut projects {
-            project.tool_usages = load_usages(&self.connection, &project.id)?;
-        }
-        Ok(projects)
+        list_projects_from_connection(&self.connection, search, tool_key, limit)
     }
 
     /// Exact project lookup by native path identity; returns `None` when the
@@ -794,139 +806,7 @@ impl SqliteStore {
 
     /// Returns the most recent sessions ordered by `started_at` descending.
     pub fn get_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
-        if !(1..=1000).contains(&limit) {
-            return Err(StoreError::InvalidLimit);
-        }
-        let mut stmt = self.connection.prepare(
-            "SELECT id, project_path, tool_key, tool_name, started_at, ended_at, session_id_from_tool
-             FROM sessions
-             ORDER BY started_at DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut sessions = Vec::with_capacity(rows.len());
-        for (id, project_path, tool_key, tool_name, started, ended, session_id_from_tool) in rows {
-            sessions.push(Session {
-                id,
-                project_path,
-                tool_key,
-                tool_name,
-                started_at: parse_timestamp(&started)?,
-                ended_at: match ended {
-                    Some(text) => Some(parse_timestamp(&text)?),
-                    None => None,
-                },
-                session_id_from_tool,
-            });
-        }
-        Ok(sessions)
-    }
-
-    fn search_projects_rows(&self, search: &str, limit: usize) -> Result<Vec<ProjectFields>> {
-        let exact = path::normalize_native(search).filter(|candidate| {
-            path::display_name_native(candidate).as_deref() == Some(candidate.as_str())
-        });
-        if let Some(root) = exact {
-            let path_where = path_equality_clause("p.");
-            let sql = format!(
-                "SELECT p.{PROJECT_COLUMNS} FROM projects p
-                 WHERE {path_where}
-                 ORDER BY p.last_accessed_at DESC
-                 LIMIT ?2"
-            );
-            let mut stmt = self.connection.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params![root, limit as i64], project_fields)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            return Ok(rows);
-        }
-        let Some(fts_query) = build_fts_prefix_query(search) else {
-            return Ok(Vec::new());
-        };
-        let rows = if let Some(content_query) = build_content_fts_prefix_query(search) {
-            let sql = format!(
-                "SELECT p.{PROJECT_COLUMNS} FROM projects p
-                 WHERE p.rowid IN (
-                           SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1
-                       )
-                    OR p.id IN (
-                           SELECT content_file.project_id
-                           FROM project_content_fts
-                           JOIN project_content_files content_file
-                             ON content_file.id = project_content_fts.rowid
-                           WHERE project_content_fts MATCH ?2
-                       )
-                 ORDER BY p.last_accessed_at DESC
-                 LIMIT ?3"
-            );
-            let mut stmt = self.connection.prepare(&sql)?;
-            let collected = stmt
-                .query_map(
-                    params![fts_query, content_query, limit as i64],
-                    project_fields,
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            collected
-        } else {
-            let sql = format!(
-                "SELECT p.{PROJECT_COLUMNS} FROM projects p
-                 WHERE p.rowid IN (
-                     SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1
-                 )
-                 ORDER BY p.last_accessed_at DESC
-                 LIMIT ?2"
-            );
-            let mut stmt = self.connection.prepare(&sql)?;
-            let collected = stmt
-                .query_map(params![fts_query, limit as i64], project_fields)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            collected
-        };
-        Ok(rows)
-    }
-
-    fn list_projects_by_tool_rows(
-        &self,
-        tool_key: &str,
-        limit: usize,
-    ) -> Result<Vec<ProjectFields>> {
-        let sql = format!(
-            "SELECT DISTINCT p.{PROJECT_COLUMNS} FROM projects p
-             JOIN tool_usages u ON u.project_id = p.id
-             WHERE u.tool_key = ?1 COLLATE NOCASE
-             ORDER BY p.last_accessed_at DESC
-             LIMIT ?2"
-        );
-        let mut stmt = self.connection.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![tool_key, limit as i64], project_fields)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    fn list_all_projects_rows(&self, limit: usize) -> Result<Vec<ProjectFields>> {
-        let sql = format!(
-            "SELECT {PROJECT_COLUMNS} FROM projects
-             ORDER BY last_accessed_at DESC
-             LIMIT ?1"
-        );
-        let mut stmt = self.connection.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![limit as i64], project_fields)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        get_recent_sessions_from_connection(&self.connection, limit)
     }
 }
 
@@ -938,6 +818,198 @@ type ProjectFields = (
     Option<String>,
     Option<String>,
 );
+
+fn list_projects_from_connection(
+    connection: &Connection,
+    search: Option<&str>,
+    tool_key: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Project>> {
+    if !(1..=10_000).contains(&limit) {
+        return Err(StoreError::InvalidLimit);
+    }
+    let rows = if let Some(search) = search.filter(|value| !value.trim().is_empty()) {
+        search_projects_rows(connection, search, limit)?
+    } else if let Some(tool_key) = tool_key.filter(|value| !value.trim().is_empty()) {
+        list_projects_by_tool_rows(connection, tool_key, limit)?
+    } else {
+        list_all_projects_rows(connection, limit)?
+    };
+    let mut projects = Vec::with_capacity(rows.len());
+    for (id, project_path, last, first, branch, remote) in rows {
+        let path_missing = project_path_missing(&project_path);
+        projects.push(Project {
+            id,
+            path: project_path,
+            path_missing,
+            last_accessed_at: parse_timestamp(&last)?,
+            first_seen_at: parse_timestamp(&first)?,
+            git_branch: branch,
+            git_remote_url: remote,
+            tool_usages: Vec::new(),
+        });
+    }
+    for project in &mut projects {
+        project.tool_usages = load_usages(connection, &project.id)?;
+    }
+    Ok(projects)
+}
+
+fn get_recent_sessions_from_connection(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<Session>> {
+    if !(1..=1000).contains(&limit) {
+        return Err(StoreError::InvalidLimit);
+    }
+    let mut stmt = connection.prepare(
+        "SELECT id, project_path, tool_key, tool_name, started_at, ended_at, session_id_from_tool
+         FROM sessions
+         ORDER BY started_at DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut sessions = Vec::with_capacity(rows.len());
+    for (id, project_path, tool_key, tool_name, started, ended, session_id_from_tool) in rows {
+        sessions.push(Session {
+            id,
+            project_path,
+            tool_key,
+            tool_name,
+            started_at: parse_timestamp(&started)?,
+            ended_at: match ended {
+                Some(text) => Some(parse_timestamp(&text)?),
+                None => None,
+            },
+            session_id_from_tool,
+        });
+    }
+    Ok(sessions)
+}
+
+fn search_projects_rows(
+    connection: &Connection,
+    search: &str,
+    limit: usize,
+) -> Result<Vec<ProjectFields>> {
+    let exact = path::normalize_native(search).filter(|candidate| {
+        path::display_name_native(candidate).as_deref() == Some(candidate.as_str())
+    });
+    if let Some(root) = exact {
+        let path_where = path_equality_clause("p.");
+        let sql = format!(
+            "SELECT p.{PROJECT_COLUMNS} FROM projects p
+             WHERE {path_where}
+             ORDER BY p.last_accessed_at DESC
+             LIMIT ?2"
+        );
+        let mut stmt = connection.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![root, limit as i64], project_fields)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return Ok(rows);
+    }
+    let Some(fts_query) = build_fts_prefix_query(search) else {
+        return Ok(Vec::new());
+    };
+    let content_query = build_content_fts_prefix_query(search);
+    let content_search_enabled = content_query.is_some() && content_search_is_safe(connection)?;
+    let rows = if let Some(content_query) = content_query.filter(|_| content_search_enabled) {
+        let sql = format!(
+            "SELECT p.{PROJECT_COLUMNS} FROM projects p
+             WHERE p.rowid IN (
+                       SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1
+                   )
+                OR p.id IN (
+                       SELECT content_file.project_id
+                       FROM project_content_fts
+                       JOIN project_content_files content_file
+                         ON content_file.id = project_content_fts.rowid
+                       WHERE project_content_fts MATCH ?2
+                   )
+             ORDER BY p.last_accessed_at DESC
+             LIMIT ?3"
+        );
+        let mut stmt = connection.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![fts_query, content_query, limit as i64],
+                project_fields,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    } else {
+        let sql = format!(
+            "SELECT p.{PROJECT_COLUMNS} FROM projects p
+             WHERE p.rowid IN (
+                 SELECT rowid FROM projects_fts WHERE projects_fts MATCH ?1
+             )
+             ORDER BY p.last_accessed_at DESC
+             LIMIT ?2"
+        );
+        let mut stmt = connection.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![fts_query, limit as i64], project_fields)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    Ok(rows)
+}
+
+fn content_search_is_safe(connection: &Connection) -> Result<bool> {
+    let optional_tables: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN ('project_content_files', 'project_content_fts')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(optional_tables == 2 && content_index_sanitizer_is_current(connection)?)
+}
+
+fn list_projects_by_tool_rows(
+    connection: &Connection,
+    tool_key: &str,
+    limit: usize,
+) -> Result<Vec<ProjectFields>> {
+    let sql = format!(
+        "SELECT DISTINCT p.{PROJECT_COLUMNS} FROM projects p
+         JOIN tool_usages u ON u.project_id = p.id
+         WHERE u.tool_key = ?1 COLLATE NOCASE
+         ORDER BY p.last_accessed_at DESC
+         LIMIT ?2"
+    );
+    let mut stmt = connection.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![tool_key, limit as i64], project_fields)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn list_all_projects_rows(connection: &Connection, limit: usize) -> Result<Vec<ProjectFields>> {
+    let sql = format!(
+        "SELECT {PROJECT_COLUMNS} FROM projects
+         ORDER BY last_accessed_at DESC
+         LIMIT ?1"
+    );
+    let mut stmt = connection.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![limit as i64], project_fields)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
 
 fn project_fields(row: &rusqlite::Row) -> rusqlite::Result<ProjectFields> {
     Ok((

@@ -10,7 +10,8 @@ use sessionatlas_core::content_index::ContentIndexOptions;
 use sessionatlas_core::model::{Project, Session, ToolUsage};
 use sessionatlas_core::path;
 use sessionatlas_core::store::{
-    content_index_sanitizer_is_current, SqliteStore, StoreError, CONTENT_INDEX_SANITIZER_VERSION,
+    content_index_sanitizer_is_current, IndexReader, SqliteStore, StoreError,
+    CONTENT_INDEX_SANITIZER_VERSION,
 };
 
 fn utc(year: i32, month: u32, day: u32) -> DateTime<Utc> {
@@ -72,6 +73,32 @@ fn session(id: &str, path_text: &str, started: DateTime<Utc>) -> Session {
 
 fn db_path(root: &tempfile::TempDir) -> std::path::PathBuf {
     root.path().join("index.db")
+}
+
+fn database_fingerprint(
+    path: &std::path::Path,
+) -> (Vec<u8>, u64, std::time::SystemTime, Vec<String>) {
+    let metadata = std::fs::metadata(path).unwrap();
+    let mut entries = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            format!(
+                "{}:{}:{}",
+                entry.file_name().to_string_lossy(),
+                metadata.len(),
+                metadata.is_dir()
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    (
+        std::fs::read(path).unwrap(),
+        metadata.len(),
+        metadata.modified().unwrap(),
+        entries,
+    )
 }
 
 #[test]
@@ -1185,4 +1212,207 @@ fn store_record_and_recent_sessions_preserve_ended_timestamps_and_ordering() {
         store.get_recent_sessions(0),
         Err(StoreError::InvalidLimit)
     ));
+}
+
+#[test]
+fn index_reader_queries_without_mutating_database_or_creating_sidecars() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let path_text = abs_path(&["reader-project"]);
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &path_text,
+                "reader-project-id",
+                utc(2026, 7, 1),
+                &[usage("codex", utc(2026, 7, 2), 1, None)],
+            )],
+            &["codex"],
+        )
+        .unwrap();
+    store
+        .record_session(&session("reader-session", &path_text, utc(2026, 7, 3)))
+        .unwrap();
+    drop(store);
+
+    let before = database_fingerprint(&db);
+    let reader = IndexReader::open_existing(&db).unwrap();
+    assert_eq!(database_fingerprint(&db), before);
+    assert_eq!(reader.list_projects(None, None, 10).unwrap().len(), 1);
+    assert_eq!(
+        reader
+            .list_projects(Some("reader"), None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(reader.get_recent_sessions(10).unwrap().len(), 1);
+    assert_eq!(database_fingerprint(&db), before);
+    drop(reader);
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn index_reader_rejects_incomplete_schema_without_repairing_it() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE projects (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                last_accessed_at TEXT,
+                first_seen_at TEXT,
+                git_branch TEXT,
+                git_remote_url TEXT
+            );",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects
+                (id, path, last_accessed_at, first_seen_at, git_branch, git_remote_url)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+            rusqlite::params![
+                "incomplete-project",
+                abs_path(&["incomplete"]),
+                utc(2026, 7, 1).to_rfc3339(),
+                utc(2026, 7, 1).to_rfc3339()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let before = database_fingerprint(&db);
+    let reader = IndexReader::open_existing(&db).unwrap();
+    let error = reader.list_projects(None, None, 10).unwrap_err();
+    assert!(error.to_string().contains("no such table"), "{error}");
+    drop(reader);
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn index_reader_searches_legacy_name_index_without_optional_content_tables() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let path_text = abs_path(&["legacy-reader-name"]);
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &path_text,
+                "legacy-reader-id",
+                utc(2026, 7, 1),
+                &[usage("codex", utc(2026, 7, 2), 1, None)],
+            )],
+            &["codex"],
+        )
+        .unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE project_content_fts;
+             DROP TABLE project_content_files;
+             DROP TABLE project_content_status;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let before = database_fingerprint(&db);
+    let reader = IndexReader::open_existing(&db).unwrap();
+    let projects = reader
+        .list_projects(Some("legacy-reader"), None, 10)
+        .unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].id, "legacy-reader-id");
+    assert_eq!(database_fingerprint(&db), before);
+    drop(reader);
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[test]
+fn index_reader_hides_stale_content_terms_but_keeps_project_name_search() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let path_text = abs_path(&["visible-project-name"]);
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &path_text,
+                "stale-content-id",
+                utc(2026, 7, 1),
+                &[usage("codex", utc(2026, 7, 2), 1, None)],
+            )],
+            &["codex"],
+        )
+        .unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "INSERT INTO project_content_files
+                (project_id, relative_path, modified_ns, file_size, indexed_bytes, compressed_preview)
+             VALUES (?1, 'secret.txt', 1, 1, 1, X'00')",
+            ["stale-content-id"],
+        )
+        .unwrap();
+    let content_rowid = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO project_content_fts (rowid, relative_path, body)
+             VALUES (?1, 'secret.txt', 'archivedcredentialword')",
+            [content_rowid],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessionatlas_meta SET value = '1'
+             WHERE key = 'content_index_sanitizer_version'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let before = database_fingerprint(&db);
+    let reader = IndexReader::open_existing(&db).unwrap();
+    assert!(reader
+        .list_projects(Some("archivedcredentialword"), None, 10)
+        .unwrap()
+        .is_empty());
+    let projects = reader
+        .list_projects(Some("visible-project"), None, 10)
+        .unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(database_fingerprint(&db), before);
+    drop(reader);
+    assert_eq!(database_fingerprint(&db), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn index_reader_does_not_change_unix_directory_or_database_modes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    drop(SqliteStore::new(&db).unwrap());
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let before_dir_mode = std::fs::metadata(root.path()).unwrap().mode() & 0o777;
+    let before_db_mode = std::fs::metadata(&db).unwrap().mode() & 0o777;
+
+    let reader = IndexReader::open_existing(&db).unwrap();
+    assert!(reader.list_projects(None, None, 10).unwrap().is_empty());
+    assert_eq!(
+        std::fs::metadata(root.path()).unwrap().mode() & 0o777,
+        before_dir_mode
+    );
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().mode() & 0o777,
+        before_db_mode
+    );
 }

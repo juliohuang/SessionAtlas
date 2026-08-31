@@ -465,3 +465,61 @@ fn list_supports_explicit_absolute_database_path_argument_flow() {
     assert!(stdout.contains("api-server"), "{stdout}");
     assert!(stdout.contains("web-frontend"), "{stdout}");
 }
+
+/// Captures the complete observable state of the database directory that a
+/// read-only command is allowed to touch.  In particular, this catches
+/// implicit schema/FTS maintenance and SQLite sidecar creation.
+fn database_fingerprint(path: &Path) -> (Vec<u8>, u64, SystemTime, Vec<String>) {
+    let metadata = std::fs::metadata(path).unwrap();
+    let mut entries = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            format!(
+                "{}:{}:{}",
+                entry.file_name().to_string_lossy(),
+                metadata.len(),
+                metadata.is_dir()
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    (
+        std::fs::read(path).unwrap(),
+        metadata.len(),
+        metadata.modified().unwrap(),
+        entries,
+    )
+}
+
+#[test]
+fn non_interactive_read_commands_leave_index_directory_byte_for_byte_untouched() {
+    let commands = [
+        Cli {
+            command: Some(Command::List(list_args(false))),
+        },
+        Cli {
+            command: Some(Command::Search(SearchArgs {
+                query: "api".to_string(),
+                interactive: false,
+            })),
+        },
+        Cli {
+            command: Some(Command::Recent(RecentArgs {
+                count: 10,
+                open: false,
+            })),
+        },
+    ];
+
+    for cli in commands {
+        let dir = TestDir::new();
+        seed_db(&dir);
+        let before = database_fingerprint(&dir.db());
+        let (code, _, stderr) = run_with(&dir, cli, "");
+        assert_eq!(code, 0, "read command failed: {stderr}");
+        let after = database_fingerprint(&dir.db());
+        assert_eq!(after, before, "read command changed {}", dir.db().display());
+    }
+}
