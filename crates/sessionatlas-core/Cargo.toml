@@ -7,7 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/juliohuang/SessionAtlas"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
