@@ -29,6 +29,7 @@ pub mod model;
 pub mod path;
 pub mod private_fs;
 pub mod process;
+pub mod scan_coordinator;
 pub mod scanner;
 pub mod security;
 pub mod store;

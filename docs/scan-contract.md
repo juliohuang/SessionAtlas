@@ -37,7 +37,25 @@ It is intentionally independent of any single tool's current on-disk format.
 - A project with no remaining tool usages is removed from the derived index.
 - The index and FTS view change atomically: readers see either the previous
   complete snapshot or the next complete snapshot, never a partial scan.
-- Repeating a scan over unchanged inputs produces identical database contents.
+- Repeating a scan over unchanged inputs produces identical project, usage,
+  session, and FTS contents. The internal `scan_generation` metadata advances
+  after every committed snapshot replacement so a slower scanner can detect
+  and refresh a result collected before a newer commit.
+- CLI and Tauri scan writers share the persistent sibling `index.db.lock`.
+  A writer holds that lock through snapshot replacement and content-cache
+  refresh; the lock file remains after release and is not business data.
+- Tauri coalesces each batch into at most one active scan and one follow-up.
+  Requests arriving during that follow-up share its result without extending
+  the batch; an operation panic releases the batch for a later retry.
+- The lock and generation protocol requires cooperating writers. Mixed older
+  application versions and direct external SQLite writes are outside this
+  guarantee; update the CLI and desktop together before concurrency acceptance.
+- A scan with zero trustworthy tool outcomes returns failure before acquiring
+  the writer lock and does not create or modify the database, its SQLite
+  sidecars, or `index.db.lock`.
+
+The local coordination regression record is in
+[`scan-coordination-validation.md`](./scan-coordination-validation.md).
 
 ## Time handling
 
@@ -94,6 +112,16 @@ It is intentionally independent of any single tool's current on-disk format.
   fixtures in place.
 
 ## Scanner outcome states
+
+Content indexing is a separate stage after project snapshot replacement. Its
+persisted switch is re-read under `index.db.lock`, so a scan collected before a
+disable cannot re-enable content indexing. Disabled refreshes do not traverse
+project source/document files. Pending cleanup is retried first, even while
+disabled; pending rebuilds discard partial fingerprints before retrying. Project
+metadata scanning still runs while content indexing is disabled. A project scan
+success is not proof that optional content indexing succeeded: inspect
+`sessionatlas content-index status --json` for its lifecycle state. See
+[`content-index-controls.md`](./content-index-controls.md).
 
 - `Succeeded` is the only state allowed to replace a tool snapshot. It may
   contain zero projects when the source was inspected successfully.

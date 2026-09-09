@@ -32,6 +32,8 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// their own disposable root.
 struct TestDir(PathBuf);
 
+type IndexArtifact = (PathBuf, Option<(Vec<u8>, SystemTime)>);
+
 impl TestDir {
     fn new() -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +64,26 @@ impl TestDir {
     /// Whether any `.sessionatlas` artifact exists yet.
     fn data_created(&self) -> bool {
         self.0.join(".sessionatlas").exists()
+    }
+
+    fn index_artifacts(&self) -> Vec<IndexArtifact> {
+        [
+            self.db(),
+            self.db().with_extension("db.lock"),
+            PathBuf::from(format!("{}-journal", self.db().display())),
+            PathBuf::from(format!("{}-wal", self.db().display())),
+            PathBuf::from(format!("{}-shm", self.db().display())),
+        ]
+        .into_iter()
+        .map(|path| {
+            let fingerprint = match std::fs::metadata(&path) {
+                Ok(metadata) => Some((std::fs::read(&path).unwrap(), metadata.modified().unwrap())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("could not fingerprint {}: {error}", path.display()),
+            };
+            (path, fingerprint)
+        })
+        .collect()
     }
 }
 
@@ -212,6 +234,36 @@ fn scan_args(tool: Option<&str>) -> ScanArgs {
     ScanArgs {
         tool: tool.map(str::to_string),
     }
+}
+
+/// Runs `scan` with fake scanners and empty initial diagnostics.
+#[test]
+fn cli_scan_honors_content_policy_set_by_shared_service() {
+    use sessionatlas_core::store::{
+        change_content_index_at, content_index_status_at, ContentIndexAction,
+    };
+    let dir = TestDir::new();
+    let source = dir.0.join("synthetic-project");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("README.md"), "synthetic nebula documentation").unwrap();
+    let scanners = vec![boxed(FakeScanner::succeeded(
+        "codex",
+        vec![scanned_project(
+            &source.to_string_lossy(),
+            SystemTime::now(),
+            "fixture",
+        )],
+    ))];
+    assert_eq!(run_scan_with(&dir, scan_args(None), &scanners).0, 0);
+    assert_eq!(content_index_status_at(dir.db()).unwrap().indexed_files, 1);
+    change_content_index_at(dir.db(), ContentIndexAction::Disable).unwrap();
+    assert_eq!(run_scan_with(&dir, scan_args(None), &scanners).0, 0);
+    let status = content_index_status_at(dir.db()).unwrap();
+    assert!(!status.enabled && !status.searchable);
+    assert_eq!(status.indexed_files, 0);
+    change_content_index_at(dir.db(), ContentIndexAction::Enable).unwrap();
+    assert_eq!(run_scan_with(&dir, scan_args(None), &scanners).0, 0);
+    assert_eq!(content_index_status_at(dir.db()).unwrap().indexed_files, 1);
 }
 
 /// Runs `scan` with fake scanners and empty initial diagnostics.
@@ -447,6 +499,7 @@ fn scan_partial_failure_writes_successes_and_preserves_failed_snapshots() {
 #[test]
 fn scan_all_fail_never_touches_the_database() {
     let dir = TestDir::new();
+    let before = dir.index_artifacts();
     let scanners: Vec<Box<dyn Scanner>> = vec![
         boxed(FakeScanner::failed("codex")),
         boxed(FakeScanner::unavailable("claude")),
@@ -461,6 +514,11 @@ fn scan_all_fail_never_touches_the_database() {
     assert!(
         !dir.data_created(),
         "zero successful tools must not create the index"
+    );
+    assert_eq!(
+        dir.index_artifacts(),
+        before,
+        "zero-success must not create any index artifact"
     );
 }
 
@@ -481,6 +539,7 @@ fn scan_zero_successful_tools_does_not_modify_an_existing_database() {
             )
             .unwrap();
     }
+    let before = dir.index_artifacts();
 
     let scanners: Vec<Box<dyn Scanner>> = vec![boxed(FakeScanner::unavailable("codex"))];
     let (code, _, stderr) = run_scan_with(&dir, scan_args(None), &scanners);
@@ -493,6 +552,11 @@ fn scan_zero_successful_tools_does_not_modify_an_existing_database() {
         "existing snapshot must be preserved untouched"
     );
     assert!(projects[0].path.ends_with("web-frontend"));
+    assert_eq!(
+        dir.index_artifacts(),
+        before,
+        "zero-success must preserve DB and sidecars"
+    );
 }
 
 #[test]

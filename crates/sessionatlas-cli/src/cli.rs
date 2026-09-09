@@ -43,6 +43,31 @@ pub enum Command {
     Recent(RecentArgs),
     /// 管理配置和自定义工具
     Config(ConfigArgs),
+    /// 管理本地内容索引（不删除源文件、项目和会话）
+    ContentIndex(ContentIndexArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ContentIndexAction {
+    /// 只读查看开关、清理状态与文件数量
+    Status,
+    /// 开启后允许下次扫描索引内容（不会立即重建）
+    Enable,
+    /// 关闭并清理已有内容索引
+    Disable,
+    /// 清理内容索引；若仍开启，下次扫描会重新生成
+    Clear,
+    /// 完整重建内容索引（必须先开启）
+    Rebuild,
+}
+
+#[derive(Debug, Args)]
+pub struct ContentIndexArgs {
+    #[arg(value_enum, default_value = "status")]
+    pub action: ContentIndexAction,
+    /// 输出稳定的 JSON 状态，适合脚本验证
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `scan`.

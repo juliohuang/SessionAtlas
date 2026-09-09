@@ -35,7 +35,7 @@ Cargo workspace
 
 - 核心 crate 不依赖 Tauri、前端或 CLI 显示库。
 - CLI 与 Tauri 都是同一核心的输入输出适配层；两者链接同一个 `sessionatlas-core`。
-- 数据目录统一为 `~/.sessionatlas/`：`index.db`（CLI 所有、Tauri 只读）、
+- 数据目录统一为 `~/.sessionatlas/`：`index.db`（core 存储层所有；CLI/Tauri 扫描入口受锁写入，普通查询只读）、
   `config.json`、`adapters/<id>/<version>/adapter.json`、`prefs.db`（Tauri 所有：
   分组、打开器、Web 开发工具连接地址、远程项目、逐机器 TUI 选择和项目忽略规则）。
 
@@ -62,9 +62,11 @@ Cargo workspace
 `project_content_status`，以及 FTS5 `projects_fts`、contentless
 `project_content_fts`。正文原文不写入普通表；FTS 只保留词项，结果字幕来自
 LZ4 压缩的 32 KiB 预览。
-schema 幂等创建/迁移；`store.rs` 同时负责旧数据去重迁移与只读异常行检查。
-Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任何连接都不创建或
-修改 WAL/SHM/journal 文件。
+schema 通过 `PRAGMA user_version` 显式版本化；`store.rs` 同时负责旧数据去重迁移、
+结构门禁与只读异常行检查。所有写者持有 owner-only 的持久 `index.db.lock`，快照事务
+提交时同步递增 `scan_generation`。
+Tauri 普通查询对 `index.db` 使用只读标志并启用 `query_only`，查询连接不创建或修改
+WAL/SHM/journal 文件；只有显式本地扫描通过共享 core writer 写入。
 
 ## 五、配置与原子写
 
@@ -142,9 +144,11 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 
 ## 九、数据流与并发
 
-- CLI `scan` 是唯一写者，原子替换快照；Tauri 只读读者始终看到完整旧快照或完整
-  新快照，绝无半写状态。
-- Tauri 扫描在 `spawn_blocking` 上运行，不与前端命令争抢 async 线程。
+- CLI 与 Tauri 的本地扫描入口都通过 core 的持久 `index.db.lock` 串行写入；普通查询连接
+  始终只读，并只会看到完整旧快照或完整新快照，绝无半写状态。
+- 扫描前后复核 `scan_generation`；若等待写锁期间已有新快照提交，旧扫描会在持锁期间
+  重扫一次再提交，避免慢扫描覆盖新结果。零可信结果在获取写锁前失败，不创建索引或锁文件。
+- Tauri 扫描在 `spawn_blocking` 上运行，并由进程内 `ScanCoordinator` 合并并发请求。
 - `prefs.db` 的分组/排序写入使用事务与 revision 冲突检查；frontend 按 mutation
   队列串行化写操作，成功后发布服务端权威快照。
 - 60 秒自动刷新在没有搜索词时静默重拉；full/auto/search 使用独立 gate，避免
@@ -163,6 +167,15 @@ Tauri 侧对 `index.db` 的打开使用只读标志并启用 `query_only`，任�
 - xterm/高亮/字体全部本地加载，不依赖 CDN。
 
 ## 十一、测试与验收
+
+内容索引开关与生命周期由 core 的 `store/content_control.rs` 统一实现，SQLite
+`sessionatlas_meta` 为唯一状态来源，不另写配置文件。关闭会清理全文词项、预览、
+指纹和内容统计；所有控制与扫描共用 `index.db.lock`。清理先提交禁止内容搜索的
+标记，再执行 FTS `delete-all`、元数据删除、VACUUM 和 WAL checkpoint；任一步失败
+均返回错误，已提交的 `cleanupPending` 保留供重试。完整重建未完成时保留
+`rebuildPending`，不会展示部分结果。普通项目查询仍只读，项目/会话不被这些控制删除。
+默认保持开启以兼容现有索引；完整行为及当前验证证据见
+[`docs/content-index-controls.md`](./docs/content-index-controls.md)。
 
 - 根命令：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets
   -- -D warnings`、`cargo test --workspace`、`npm --prefix frontend run check` /

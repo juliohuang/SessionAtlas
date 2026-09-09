@@ -9,6 +9,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sessionatlas_core::content_index::ContentIndexOptions;
 use sessionatlas_core::model::{Project, Session, ToolUsage};
 use sessionatlas_core::path;
+use sessionatlas_core::scan_coordinator::{IndexWriteGuard, IndexWriteLockError};
 use sessionatlas_core::store::{
     content_index_is_safe, content_index_sanitizer_is_current, IndexReader, SqliteStore,
     StoreError, CONTENT_INDEX_SANITIZER_VERSION, INDEX_SCHEMA_VERSION,
@@ -99,6 +100,24 @@ fn database_fingerprint(
         metadata.modified().unwrap(),
         entries,
     )
+}
+
+/// Fingerprint for a writer transaction that deliberately permits creation of
+/// the persistent sibling coordination lock but no other database mutation.
+fn database_fingerprint_ignoring_coordination_lock(
+    path: &std::path::Path,
+) -> (Vec<u8>, u64, std::time::SystemTime, Vec<String>) {
+    let (bytes, length, modified, entries) = database_fingerprint(path);
+    let lock_name = IndexWriteGuard::lock_path(path)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let entries = entries
+        .into_iter()
+        .filter(|entry| !entry.starts_with(&format!("{lock_name}:")))
+        .collect();
+    (bytes, length, modified, entries)
 }
 
 fn seed_legacy_base_schema(connection: &rusqlite::Connection, project_path: &str) {
@@ -311,6 +330,237 @@ fn unsupported_schema_version_is_rejected_without_sanitizer_cleanup() {
         error,
         StoreError::UnsupportedSchemaVersion { found: -1, .. }
     ));
+}
+
+#[test]
+fn unsupported_schema_versions_are_rejected_before_creating_the_write_lock() {
+    for version in [2_i64, -1_i64] {
+        let root = tempfile::tempdir().unwrap();
+        let db = db_path(&root);
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(connection);
+
+        let lock = IndexWriteGuard::lock_path(&db);
+        assert!(!lock.exists(), "test fixture unexpectedly has {lock:?}");
+        let error = match SqliteStore::new(&db) {
+            Ok(_) => panic!("unsupported schema unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StoreError::UnsupportedSchemaVersion { found, .. } if found == version
+        ));
+        assert!(
+            !lock.exists(),
+            "schema rejection for version {version} must not create {lock:?}"
+        );
+    }
+}
+
+#[test]
+fn successful_snapshot_replacements_advance_scan_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let project_path = abs_path(&["generation"]);
+    let mut store = SqliteStore::new(&db).unwrap();
+
+    assert_eq!(SqliteStore::read_scan_generation_at(&db).unwrap(), 0);
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &project_path,
+                "generation-id",
+                utc(2026, 8, 1),
+                &[usage("codex", utc(2026, 8, 2), 1, Some("first"))],
+            )],
+            &["codex"],
+        )
+        .unwrap();
+    assert_eq!(SqliteStore::read_scan_generation_at(&db).unwrap(), 1);
+
+    store.replace_tool_snapshots(&[], &["codex"]).unwrap();
+    assert_eq!(SqliteStore::read_scan_generation_at(&db).unwrap(), 2);
+}
+
+#[test]
+fn failed_snapshot_replacement_does_not_advance_scan_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let baseline_path = abs_path(&["generation-baseline"]);
+    let mut store = SqliteStore::new(&db).unwrap();
+    store
+        .replace_tool_snapshots(
+            &[project_at(
+                &baseline_path,
+                "generation-baseline-id",
+                utc(2026, 8, 1),
+                &[usage("codex", utc(2026, 8, 2), 1, Some("baseline"))],
+            )],
+            &["codex"],
+        )
+        .unwrap();
+    let before = SqliteStore::read_scan_generation_at(&db).unwrap();
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_generation_test_usage
+             BEFORE INSERT ON tool_usages
+             WHEN NEW.tool_key = 'blocked-generation-test'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced generation test failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let result = store.replace_tool_snapshots(
+        &[project_at(
+            &abs_path(&["generation-rejected"]),
+            "generation-rejected-id",
+            utc(2026, 8, 3),
+            &[
+                usage("codex", utc(2026, 8, 4), 1, Some("rejected")),
+                usage(
+                    "blocked-generation-test",
+                    utc(2026, 8, 4),
+                    1,
+                    Some("blocked"),
+                ),
+            ],
+        )],
+        &["codex", "blocked-generation-test"],
+    );
+    assert!(matches!(result, Err(StoreError::Sql(_))), "{result:?}");
+    assert_eq!(SqliteStore::read_scan_generation_at(&db).unwrap(), before);
+}
+
+#[test]
+fn writer_guard_for_another_database_does_not_create_a_second_database() {
+    let root = tempfile::tempdir().unwrap();
+    let first_db = root.path().join("first.db");
+    let second_db = root.path().join("second.db");
+    let guard = IndexWriteGuard::acquire(&first_db).unwrap();
+
+    let error = match SqliteStore::new_with_guard(&second_db, guard) {
+        Ok(_) => panic!("writer unexpectedly accepted a guard for another database"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::WriteLock(IndexWriteLockError::WrongDatabase { .. })
+    ));
+    assert!(
+        !second_db.exists(),
+        "wrong guard must not create a database"
+    );
+    assert!(
+        !IndexWriteGuard::lock_path(&second_db).exists(),
+        "wrong guard must not create a second lock"
+    );
+}
+
+#[test]
+fn generation_read_distinguishes_a_missing_index_from_a_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    assert_eq!(SqliteStore::read_scan_generation_at(&db).unwrap(), 0);
+    assert!(!db.exists());
+    std::fs::create_dir(&db).unwrap();
+    assert!(SqliteStore::read_scan_generation_at(&db).is_err());
+    assert!(!IndexWriteGuard::lock_path(&db).exists());
+}
+
+#[test]
+fn invalid_or_overflowing_generation_rolls_back_snapshot_changes() {
+    for value in ["invalid-generation", "18446744073709551615"] {
+        let root = tempfile::tempdir().unwrap();
+        let db = db_path(&root);
+        let baseline_path = abs_path(&["generation-kept"]);
+        let mut store = SqliteStore::new(&db).unwrap();
+        store
+            .replace_tool_snapshots(
+                &[project_at(
+                    &baseline_path,
+                    "generation-kept-id",
+                    utc(2026, 8, 1),
+                    &[usage("codex", utc(2026, 8, 2), 1, None)],
+                )],
+                &["codex"],
+            )
+            .unwrap();
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "UPDATE sessionatlas_meta SET value = ?1 WHERE key = 'scan_generation'",
+                [value],
+            )
+            .unwrap();
+        drop(connection);
+        let before = database_fingerprint(&db);
+        let error = store.replace_tool_snapshots(&[], &["codex"]).unwrap_err();
+        assert!(matches!(error, StoreError::CorruptRow(_)), "{error}");
+        assert_eq!(database_fingerprint(&db), before);
+        assert_eq!(
+            store.list_projects(None, None, 10).unwrap()[0].path,
+            baseline_path
+        );
+        assert_eq!(
+            store
+                .list_projects(Some("generation-kept"), None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn writer_lock_contention_zero_timeout_is_busy_after_one_attempt() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let first = IndexWriteGuard::acquire(&db).unwrap();
+    let started = std::time::Instant::now();
+    let error = IndexWriteGuard::acquire_with_timeout(&db, std::time::Duration::ZERO).unwrap_err();
+    assert!(matches!(error, IndexWriteLockError::Busy { timeout, .. } if timeout.is_zero()));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "zero timeout should not wait for the lock"
+    );
+    drop(first);
+    drop(IndexWriteGuard::acquire_with_timeout(&db, std::time::Duration::ZERO).unwrap());
+}
+
+#[test]
+fn writer_lock_path_directory_is_reported_as_io_not_busy() {
+    let root = tempfile::tempdir().unwrap();
+    let db = db_path(&root);
+    let lock = IndexWriteGuard::lock_path(&db);
+    std::fs::create_dir(&lock).unwrap();
+    let error = IndexWriteGuard::acquire_with_timeout(&db, std::time::Duration::ZERO).unwrap_err();
+    assert!(matches!(error, IndexWriteLockError::Io { .. }), "{error:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn writer_lock_and_data_directory_use_private_modes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join(".sessionatlas");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let db = data.join("index.db");
+    let guard = IndexWriteGuard::acquire(&db).unwrap();
+
+    assert_eq!(std::fs::metadata(&data).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(guard.path()).unwrap().mode() & 0o777,
+        0o600
+    );
 }
 
 #[cfg(unix)]
@@ -659,9 +909,9 @@ fn failed_v0_migration_rolls_back_all_schema_and_fts_changes() {
         )
         .unwrap();
     drop(connection);
-    let before = database_fingerprint(&db);
+    let before = database_fingerprint_ignoring_coordination_lock(&db);
     assert!(SqliteStore::new(&db).is_err());
-    assert_eq!(database_fingerprint(&db), before);
+    assert_eq!(database_fingerprint_ignoring_coordination_lock(&db), before);
     let connection = rusqlite::Connection::open(&db).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -1747,7 +1997,10 @@ fn store_isolated_database_path_creates_no_other_business_files() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     files.sort();
-    assert_eq!(files, vec!["index.db".to_string()]);
+    assert_eq!(
+        files,
+        vec!["index.db".to_string(), "index.db.lock".to_string()]
+    );
 }
 
 #[test]

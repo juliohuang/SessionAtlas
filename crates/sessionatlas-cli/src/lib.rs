@@ -113,6 +113,7 @@ pub fn run_with_open_environment(
             commands::recent::run_recent(io, db_path, config_path, &args, env)
         }
         Some(Command::Config(args)) => commands::config::run_config(io, config_path, &args),
+        Some(Command::ContentIndex(args)) => commands::content_index::run(io, db_path, &args),
     }
 }
 

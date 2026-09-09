@@ -18,6 +18,13 @@ use crate::content_index::{collect_project_content, ContentFingerprint, ContentI
 use crate::model::{project_path_missing, Project, Session, ToolUsage};
 use crate::path;
 use crate::private_fs;
+use crate::scan_coordinator::{IndexWriteGuard, IndexWriteLockError};
+
+mod content_control;
+pub use content_control::{
+    change_content_index_at, content_index_status_at, ContentIndexAction, ContentIndexPhase,
+    ContentIndexStatus,
+};
 
 /// Bump whenever content sanitization changes in a way that requires every
 /// unchanged source file to be reopened and all stored previews/FTS terms to
@@ -26,6 +33,9 @@ pub const CONTENT_INDEX_SANITIZER_VERSION: i64 = 2;
 
 /// Version of the on-disk `index.db` schema.
 pub const INDEX_SCHEMA_VERSION: i64 = 1;
+/// Metadata key used to reject stale scan results before they can replace a
+/// newer snapshot.
+pub const SCAN_GENERATION_KEY: &str = "scan_generation";
 
 /// Result alias for store operations.
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -69,6 +79,8 @@ pub enum StoreError {
     InvalidSchema(String),
     /// A required table or column is missing or has an invalid shape.
     SchemaInvariant(String),
+    /// The shared index writer lock could not be acquired.
+    WriteLock(IndexWriteLockError),
 }
 
 impl fmt::Display for StoreError {
@@ -124,6 +136,7 @@ impl fmt::Display for StoreError {
             StoreError::SchemaInvariant(detail) => {
                 write!(f, "Index schema invariant failed: {detail}")
             }
+            StoreError::WriteLock(error) => write!(f, "{error}"),
         }
     }
 }
@@ -133,6 +146,7 @@ impl std::error::Error for StoreError {
         match self {
             StoreError::Sql(error) => Some(error),
             StoreError::Io(error) => Some(error),
+            StoreError::WriteLock(error) => Some(error),
             _ => None,
         }
     }
@@ -344,6 +358,9 @@ const PROJECT_COLUMNS: &str =
 /// connection is single-threaded and owned by this struct.
 pub struct SqliteStore {
     connection: Connection,
+    // Keeping the guard on the store makes every mutation performed through
+    // this writer serialize with CLI/Tauri scans for the store's lifetime.
+    _write_guard: IndexWriteGuard,
 }
 
 /// Read-only view of an existing index database.
@@ -384,6 +401,17 @@ impl IndexReader {
     pub fn get_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
         get_recent_sessions_from_connection(&self.connection, limit)
     }
+
+    /// Exact project lookup by native path identity without opening a writer.
+    pub fn get_project_by_path(&self, candidate: &str) -> Result<Option<Project>> {
+        get_project_by_path_from_connection(&self.connection, candidate)
+    }
+
+    /// Returns the committed scan generation, or zero for an older index that
+    /// predates this marker.
+    pub fn scan_generation(&self) -> Result<u64> {
+        read_scan_generation(&self.connection)
+    }
 }
 
 /// Summary of one incremental content-index refresh.
@@ -404,19 +432,57 @@ impl SqliteStore {
     /// versioned migration. FTS is rebuilt only by a migration that requires
     /// it. No other business file is created or touched.
     pub fn new(database_path: impl AsRef<Path>) -> Result<Self> {
+        preflight_supported_schema_version(database_path.as_ref())?;
+        let guard =
+            IndexWriteGuard::acquire(database_path.as_ref()).map_err(StoreError::WriteLock)?;
+        Self::new_with_guard(database_path, guard)
+    }
+
+    /// Opens a writer while taking ownership of an already acquired index
+    /// guard. The guard is held until this store is dropped.
+    pub fn new_with_guard(
+        database_path: impl AsRef<Path>,
+        write_guard: IndexWriteGuard,
+    ) -> Result<Self> {
         let path = database_path.as_ref();
-        if path.exists() {
-            let read_only = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            let schema_version = read_index_schema_version(&read_only)?;
-            ensure_supported_schema_version(schema_version)?;
+        if !write_guard.protects(path) {
+            return Err(StoreError::WriteLock(IndexWriteLockError::WrongDatabase {
+                lock_path: write_guard.path().to_path_buf(),
+                database: std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+            }));
         }
+        preflight_supported_schema_version(path)?;
         private_fs::prepare_private_database(path)?;
         let mut connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys = ON")?;
         initialize_schema(&mut connection)?;
         private_fs::harden_existing_private_file(path)?;
         private_fs::harden_sqlite_sidecars(path)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            _write_guard: write_guard,
+        })
+    }
+
+    /// Counts projects through the writer connection while its guard remains
+    /// held, avoiding a second uncoordinated database handle after a scan.
+    pub fn count_projects(&self) -> Result<i64> {
+        Ok(self
+            .connection
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?)
+    }
+
+    /// Returns the generation without creating or migrating an index. Missing
+    /// databases and older indexes (which have no marker) are generation zero.
+    pub fn read_scan_generation_at(database_path: impl AsRef<Path>) -> Result<u64> {
+        let path = database_path.as_ref();
+        if !path.try_exists()? {
+            return Ok(0);
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        ensure_supported_schema_version(read_index_schema_version(&connection)?)?;
+        read_scan_generation(&connection)
     }
 
     /// Atomically inserts or updates one project (legacy upsert path) together
@@ -543,6 +609,14 @@ impl SqliteStore {
         tx.execute_batch(DELETE_STALE_SNAPSHOT_ROWS_SQL)?;
         tx.execute_batch(RECOMPUTE_PROJECT_ACTIVITY_SQL)?;
         rebuild_fts(&tx)?;
+        let generation = read_scan_generation(&tx)?
+            .checked_add(1)
+            .ok_or_else(|| StoreError::CorruptRow("scan generation overflow".to_string()))?;
+        tx.execute(
+            "INSERT INTO sessionatlas_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCAN_GENERATION_KEY, generation.to_string()],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -567,6 +641,21 @@ impl SqliteStore {
     /// Same as [`Self::refresh_project_content_index`] with injectable limits
     /// for deterministic tests.
     pub fn refresh_project_content_index_with(
+        &mut self,
+        options: ContentIndexOptions,
+    ) -> Result<ContentIndexStats> {
+        // The policy is re-read under the writer lock, never captured before
+        // scanning. Interrupted cleanup/rebuild is retried without exposing
+        // partial content to either CLI or desktop readers.
+        if !self.prepare_content_refresh()? {
+            return Ok(ContentIndexStats::default());
+        }
+        let stats = self.index_project_content_with(options)?;
+        self.finish_content_refresh()?;
+        Ok(stats)
+    }
+
+    fn index_project_content_with(
         &mut self,
         options: ContentIndexOptions,
     ) -> Result<ContentIndexStats> {
@@ -774,40 +863,7 @@ impl SqliteStore {
     /// Exact project lookup by native path identity; returns `None` when the
     /// path is not valid or not indexed.
     pub fn get_project_by_path(&self, candidate: &str) -> Result<Option<Project>> {
-        let Some(normalized) = path::normalize_native(candidate) else {
-            return Ok(None);
-        };
-        let path_where = path_equality_clause("");
-        let sql = format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE {path_where} LIMIT 1");
-        let row = self
-            .connection
-            .query_row(&sql, params![normalized], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            })
-            .optional()?;
-        let Some((id, project_path, last, first, branch, remote)) = row else {
-            return Ok(None);
-        };
-        let path_missing = project_path_missing(&project_path);
-        let mut project = Project {
-            id,
-            path: project_path,
-            path_missing,
-            last_accessed_at: parse_timestamp(&last)?,
-            first_seen_at: parse_timestamp(&first)?,
-            git_branch: branch,
-            git_remote_url: remote,
-            tool_usages: Vec::new(),
-        };
-        project.tool_usages = load_usages(&self.connection, &project.id)?;
-        Ok(Some(project))
+        get_project_by_path_from_connection(&self.connection, candidate)
     }
 
     /// Records a session with its native-normalized project path.
@@ -845,6 +901,68 @@ type ProjectFields = (
     Option<String>,
 );
 
+fn get_project_by_path_from_connection(
+    connection: &Connection,
+    candidate: &str,
+) -> Result<Option<Project>> {
+    let Some(normalized) = path::normalize_native(candidate) else {
+        return Ok(None);
+    };
+    let path_where = path_equality_clause("");
+    let sql = format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE {path_where} LIMIT 1");
+    let row = connection
+        .query_row(&sql, params![normalized], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .optional()?;
+    let Some((id, project_path, last, first, branch, remote)) = row else {
+        return Ok(None);
+    };
+    let mut project = Project {
+        id,
+        path: project_path.clone(),
+        path_missing: project_path_missing(&project_path),
+        last_accessed_at: parse_timestamp(&last)?,
+        first_seen_at: parse_timestamp(&first)?,
+        git_branch: branch,
+        git_remote_url: remote,
+        tool_usages: Vec::new(),
+    };
+    project.tool_usages = load_usages(connection, &project.id)?;
+    Ok(Some(project))
+}
+
+fn read_scan_generation(connection: &Connection) -> Result<u64> {
+    let has_meta: bool = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessionatlas_meta'",
+        [],
+        |row| row.get::<_, i64>(0).map(|count| count != 0),
+    )?;
+    if !has_meta {
+        return Ok(0);
+    }
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM sessionatlas_meta WHERE key = ?1",
+            [SCAN_GENERATION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match value {
+        None => Ok(0),
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| StoreError::CorruptRow(format!("invalid scan generation: {value}"))),
+    }
+}
+
 fn list_projects_from_connection(
     connection: &Connection,
     search: Option<&str>,
@@ -854,6 +972,10 @@ fn list_projects_from_connection(
     if !(1..=10_000).contains(&limit) {
         return Err(StoreError::InvalidLimit);
     }
+    // The content policy check and FTS reads must see the same committed
+    // snapshot, including project and usage rows used to assemble the result.
+    let tx = connection.unchecked_transaction()?;
+    let connection: &Connection = &tx;
     let rows = if let Some(search) = search.filter(|value| !value.trim().is_empty()) {
         search_projects_rows(connection, search, limit)?
     } else if let Some(tool_key) = tool_key.filter(|value| !value.trim().is_empty()) {
@@ -878,6 +1000,7 @@ fn list_projects_from_connection(
     for project in &mut projects {
         project.tool_usages = load_usages(connection, &project.id)?;
     }
+    tx.commit()?;
     Ok(projects)
 }
 
@@ -1001,6 +1124,9 @@ pub fn content_index_is_safe(connection: &Connection) -> Result<bool> {
     if !content_index_sanitizer_is_current(connection)? {
         return Ok(false);
     }
+    if !content_control::content_policy_allows_search(connection)? {
+        return Ok(false);
+    }
     if !optional_schema_is_valid(validate_table_columns(
         connection,
         "project_content_files",
@@ -1115,6 +1241,15 @@ fn read_index_schema_version(connection: &Connection) -> Result<i64> {
         .map_err(|error| {
             StoreError::InvalidSchema(format!("cannot read PRAGMA user_version: {error}"))
         })
+}
+
+fn preflight_supported_schema_version(path: &Path) -> Result<()> {
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    let read_only = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let schema_version = read_index_schema_version(&read_only)?;
+    ensure_supported_schema_version(schema_version)
 }
 
 fn ensure_supported_schema_version(version: i64) -> Result<()> {

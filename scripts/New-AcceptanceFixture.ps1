@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$OutputRoot,
-    [string]$ScannerPath
+    [string]$ScannerPath,
+    [switch]$VerifyContentIndex
 )
 
 $ErrorActionPreference = "Stop"
@@ -88,11 +89,13 @@ foreach ($session in $sessions) {
 }
 
 $previousHome = [Environment]::GetEnvironmentVariable("SESSIONATLAS_HOME", "Process")
+$contentIndexVerification = $null
 try {
     [Environment]::SetEnvironmentVariable("SESSIONATLAS_HOME", $OutputRoot, "Process")
 
     # 1. The release scanner must exit 0 and create the isolated index.
-    $scanOutput = Invoke-ScannerCommand "scan"
+    $fixtureScanArgs = if ($VerifyContentIndex) { @("scan", "--tool", "codex") } else { @("scan") }
+    $scanOutput = Invoke-ScannerCommand -Arguments $fixtureScanArgs
     $scanExit = $LASTEXITCODE
     if ($scanExit -ne 0) {
         throw "The isolated scanner exited with code $scanExit."
@@ -166,6 +169,68 @@ try {
     }
     Write-Output "SEARCH_UTC_TIMES_FOUND=2"
 
+    if ($VerifyContentIndex) {
+        # Content validation only scans the invented Codex records. No AI CLI
+        # is launched; the scanner executable is the freshly built local one.
+        function Invoke-ContentControl {
+            param([string]$Action)
+            $json = Invoke-ScannerCommand -Arguments @("content-index", $Action, "--json")
+            if ($LASTEXITCODE -ne 0) { throw "Content operation failed: $Action" }
+            return ($json -join "`n" | ConvertFrom-Json)
+        }
+        $sourceFiles = @((Join-Path $projectAlpha "docs\README.md"), (Join-Path $projectBeta "src\demo.txt"))
+        $sourceHashes = @($sourceFiles | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
+        $initialContent = Invoke-ContentControl "status"
+        if (-not $initialContent.enabled -or $initialContent.indexedFiles -lt 1) {
+            throw "Initial content indexing did not produce searchable fixture files."
+        }
+        $disabledContent = Invoke-ContentControl "disable"
+        if ($disabledContent.enabled -or $disabledContent.searchable -or $disabledContent.indexedFiles -ne 0) {
+            throw "Disabling did not clear the content index."
+        }
+        $null = Invoke-ScannerCommand -Arguments $fixtureScanArgs
+        if ($LASTEXITCODE -ne 0) { throw "Disabled project rescan failed." }
+        $afterScanContent = Invoke-ContentControl "status"
+        if ($afterScanContent.enabled -or $afterScanContent.indexedFiles -ne 0) {
+            throw "Project rescan ignored the disabled content policy."
+        }
+        $enabledContent = Invoke-ContentControl "enable"
+        if (-not $enabledContent.enabled -or $enabledContent.indexedFiles -ne 0) {
+            throw "Enable must not implicitly rebuild content."
+        }
+        $rebuiltContent = Invoke-ContentControl "rebuild"
+        if ($rebuiltContent.indexedFiles -ne $initialContent.indexedFiles -or -not $rebuiltContent.searchable) {
+            throw "Explicit rebuild did not restore content search."
+        }
+        $clearedContent = Invoke-ContentControl "clear"
+        if (-not $clearedContent.enabled -or $clearedContent.indexedFiles -ne 0) {
+            throw "Clear must remove content without changing the indexing switch."
+        }
+        $finalContent = Invoke-ContentControl "rebuild"
+        if ($finalContent.indexedFiles -ne $initialContent.indexedFiles -or $finalContent.phase -ne "ready") {
+            throw "Final fixture rebuild was incomplete."
+        }
+        $finalList = Invoke-ScannerCommand "list"
+        if ($LASTEXITCODE -ne 0 -or @($finalList | Where-Object { $_ -match '^[0-9]+\s' }).Count -ne 2) {
+            throw "Content controls changed the project catalog."
+        }
+        $finalHashes = @($sourceFiles | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
+        if (@(Compare-Object $sourceHashes $finalHashes).Count -ne 0) { throw "Content controls modified source files." }
+        $contentIndexVerification = [ordered]@{
+            status = "PASS"
+            indexedFiles = $finalContent.indexedFiles
+            disabledScanPreserved = $true
+            enableDoesNotReadSources = $true
+            clearKeepsEnabled = $true
+            rebuildRestoresSearch = $true
+            sourceHashesPreserved = $true
+            projectCountPreserved = 2
+        }
+        $indexDbBytes = (Get-Item -LiteralPath $indexPath).Length
+        Write-Output "CONTENT_INDEX_CONTROLS=PASS"
+        Write-Output "CONTENT_INDEX_FILES=$($finalContent.indexedFiles)"
+    }
+
     $databaseSidecars = @(
         "$indexPath-journal",
         "$indexPath-wal",
@@ -232,6 +297,9 @@ $verification = [ordered]@{
     searchUtcTimes = @("2026-08-15 01:00", "2026-08-15 02:00")
     manifestSyntheticProjects = 2
     manifestSyntheticSessions = $syntheticSessions.Count
+}
+if ($null -ne $contentIndexVerification) {
+    $verification["contentIndex"] = $contentIndexVerification
 }
 
 $manifest = [ordered]@{

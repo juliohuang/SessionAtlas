@@ -20,12 +20,14 @@ use sessionatlas_core::config::AppConfig;
 use sessionatlas_core::model::{Project, Session, ToolSource, ToolUsage};
 use sessionatlas_core::path;
 use sessionatlas_core::process::{ProgramResolver, RecordingProcessRunner};
-use sessionatlas_core::store::SqliteStore;
+use sessionatlas_core::store::{IndexReader, SqliteStore};
 
 /// Unique temporary directory removed on drop. `tempfile` is not a dependency
 /// of this crate (its Cargo.toml is frozen for this task), so tests create
 /// their own disposable root.
 struct TestDir(PathBuf);
+
+type IndexArtifact = (PathBuf, Option<(Vec<u8>, SystemTime)>);
 
 impl TestDir {
     fn new() -> Self {
@@ -63,6 +65,30 @@ impl TestDir {
     /// `seed` so DB projects point at real directories.
     fn project_path(&self, name: &str) -> String {
         self.existing_project(name)
+    }
+
+    fn data_created(&self) -> bool {
+        self.0.join(".sessionatlas").exists()
+    }
+
+    fn index_artifacts(&self) -> Vec<IndexArtifact> {
+        [
+            self.db(),
+            self.db().with_extension("db.lock"),
+            PathBuf::from(format!("{}-journal", self.db().display())),
+            PathBuf::from(format!("{}-wal", self.db().display())),
+            PathBuf::from(format!("{}-shm", self.db().display())),
+        ]
+        .into_iter()
+        .map(|path| {
+            let fingerprint = match std::fs::metadata(&path) {
+                Ok(metadata) => Some((std::fs::read(&path).unwrap(), metadata.modified().unwrap())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("could not fingerprint {}: {error}", path.display()),
+            };
+            (path, fingerprint)
+        })
+        .collect()
     }
 }
 
@@ -163,6 +189,13 @@ fn seed(dir: &TestDir) {
             Some("codex-old"),
         ))
         .unwrap();
+}
+
+fn read_sessions(dir: &TestDir) -> Vec<Session> {
+    IndexReader::open_existing(dir.db())
+        .unwrap()
+        .get_recent_sessions(20)
+        .unwrap()
 }
 
 /// Resolver that pretends only the listed programs are on PATH.
@@ -306,9 +339,8 @@ fn open_recent_launches_recent_project_and_resumes_recent_session_id() {
     let web = dir.project_path("web-frontend");
     assert_eq!(started[0].working_directory, web);
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let sessions = store.get_recent_sessions(1).unwrap();
-    assert_eq!(sessions.len(), 1);
+    let sessions = read_sessions(&dir);
+    assert!(!sessions.is_empty());
     assert_eq!(sessions[0].tool_key, "claude");
     assert_eq!(sessions[0].project_path, web);
     assert_eq!(
@@ -342,8 +374,7 @@ fn recent_open_launches_the_selected_session_through_the_injected_runner() {
     assert!(launched_arguments.contains("resume"));
     assert!(!launched_arguments.contains("--resume"));
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let latest = store.get_recent_sessions(1).unwrap().remove(0);
+    let latest = read_sessions(&dir).remove(0);
     assert_eq!(latest.tool_key, "codex");
     assert_eq!(latest.session_id_from_tool.as_deref(), Some("codex-old"));
 }
@@ -371,8 +402,7 @@ fn open_recent_with_a_different_explicit_tool_does_not_reuse_foreign_session_id(
         .join(" ")
         .contains("claude-recent"));
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let latest = store.get_recent_sessions(1).unwrap().remove(0);
+    let latest = read_sessions(&dir).remove(0);
     assert_eq!(latest.tool_key, "codex");
     assert_eq!(latest.session_id_from_tool, None);
 }
@@ -481,8 +511,7 @@ fn open_existing_directory_launches_with_project_last_session_id() {
     assert!(launched_arguments.contains("resume"));
     assert!(!launched_arguments.contains("--resume"));
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let sessions = store.get_recent_sessions(1).unwrap();
+    let sessions = read_sessions(&dir);
     assert_eq!(sessions[0].tool_key, "codex");
     assert_eq!(sessions[0].project_path, project_path);
     assert_eq!(
@@ -575,14 +604,16 @@ fn open_fuzzy_multi_match_cancel_exits_zero_without_launch() {
     let resolver = resolver_with_tools();
     let env = open_env(&runner, &resolver, None);
 
+    let before = dir.index_artifacts();
     let (code, _, _) = run_open_with(&dir, &path_args("api", Some("codex")), "0\n", &env);
     assert_eq!(code, 0);
     assert_eq!(runner.start_count(), 0);
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    assert!(
-        store.get_recent_sessions(10).unwrap().is_empty(),
-        "cancel must not record"
+    assert!(read_sessions(&dir).is_empty(), "cancel must not record");
+    assert_eq!(
+        dir.index_artifacts(),
+        before,
+        "cancel must not write DB or sidecars"
     );
 }
 
@@ -601,6 +632,61 @@ fn open_fuzzy_no_match_is_an_error() {
         "{stderr}"
     );
     assert_eq!(runner.start_count(), 0);
+}
+
+#[test]
+fn open_missing_index_direct_path_launch_failure_creates_no_database_or_lock() {
+    let dir = TestDir::new();
+    let project_path = dir.existing_project("direct-path");
+    let runner = RecordingProcessRunner::new();
+    runner.fail_starts("terminal refused");
+    let resolver = resolver_with_tools();
+    let env = open_env(&runner, &resolver, None);
+    let before = dir.index_artifacts();
+
+    let (code, _, stderr) = run_open_with(&dir, &path_args(&project_path, Some("codex")), "", &env);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("启动失败"), "{stderr}");
+    assert_eq!(runner.start_count(), 1);
+    assert_eq!(dir.index_artifacts(), before);
+    assert!(
+        !dir.data_created(),
+        "failed direct launch must not create index data"
+    );
+}
+
+#[test]
+fn open_missing_index_direct_path_success_creates_and_records_after_launch() {
+    let dir = TestDir::new();
+    let project_path = dir.existing_project("direct-path");
+    let runner = RecordingProcessRunner::new();
+    let resolver = resolver_with_tools();
+    let env = open_env(&runner, &resolver, None);
+
+    let (code, _, stderr) = run_open_with(&dir, &path_args(&project_path, Some("codex")), "", &env);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(dir.db().is_file());
+    assert!(dir.db().with_extension("db.lock").is_file());
+    let sessions = read_sessions(&dir);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].project_path, project_path);
+    assert_eq!(sessions[0].tool_key, "codex");
+}
+
+#[test]
+fn open_missing_index_fuzzy_no_match_creates_no_database_or_lock() {
+    let dir = TestDir::new();
+    let runner = RecordingProcessRunner::new();
+    let resolver = resolver_with_tools();
+    let env = open_env(&runner, &resolver, None);
+    let before = dir.index_artifacts();
+
+    let (code, _, stderr) = run_open_with(&dir, &path_args("not-indexed", Some("codex")), "", &env);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("未找到匹配路径"), "{stderr}");
+    assert_eq!(runner.start_count(), 0);
+    assert_eq!(dir.index_artifacts(), before);
+    assert!(!dir.data_created());
 }
 
 #[test]
@@ -758,13 +844,13 @@ fn open_start_failure_does_not_record_session() {
     let resolver = resolver_with_tools();
     let env = open_env(&runner, &resolver, None);
 
+    let before = dir.index_artifacts();
     let (code, _, stderr) = run_open_with(&dir, &recent_args(), "", &env);
     assert_eq!(code, 1);
     assert!(stderr.contains("启动失败"), "{stderr}");
     assert_eq!(runner.start_count(), 1, "the launch was attempted once");
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let sessions = store.get_recent_sessions(10).unwrap();
+    let sessions = read_sessions(&dir);
     assert_eq!(
         sessions.len(),
         2,
@@ -772,6 +858,11 @@ fn open_start_failure_does_not_record_session() {
     );
     assert_eq!(sessions[0].id, "s-new");
     assert_eq!(sessions[1].id, "s-old");
+    assert_eq!(
+        dir.index_artifacts(),
+        before,
+        "failed launch must not write DB or sidecars"
+    );
 }
 
 #[test]
@@ -786,8 +877,7 @@ fn open_records_session_after_success() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(runner.start_count(), 1);
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let sessions = store.get_recent_sessions(10).unwrap();
+    let sessions = read_sessions(&dir);
     assert_eq!(
         sessions.len(),
         3,
@@ -840,8 +930,7 @@ fn open_invalid_stored_session_id_warns_and_starts_new_session() {
         "invalid stored ID must not reach --resume"
     );
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let sessions = store.get_recent_sessions(1).unwrap();
+    let sessions = read_sessions(&dir);
     assert_eq!(sessions[0].tool_key, "codex");
     assert_eq!(sessions[0].session_id_from_tool, None);
 }
@@ -862,8 +951,7 @@ fn open_unknown_tool_key_is_an_error() {
     assert!(stderr.contains("未配置可启动的工具"), "{stderr}");
     assert_eq!(runner.start_count(), 0);
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    assert!(store.get_recent_sessions(10).unwrap().is_empty());
+    assert!(read_sessions(&dir).is_empty());
 }
 
 #[test]
@@ -960,8 +1048,7 @@ fn open_custom_tool_from_config_launches() {
     assert!(stdout.contains("正在启动 myagent"), "{stdout}");
     assert_eq!(runner.start_count(), 1);
 
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let sessions = store.get_recent_sessions(1).unwrap();
+    let sessions = read_sessions(&dir);
     assert_eq!(sessions[0].tool_key, "myagent");
 }
 
@@ -989,8 +1076,7 @@ fn open_custom_tool_cannot_override_built_in() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("正在启动 claude"), "{stdout}");
     // The recorded session proves the built-in identity was launched.
-    let store = SqliteStore::new(dir.db()).unwrap();
-    let sessions = store.get_recent_sessions(1).unwrap();
+    let sessions = read_sessions(&dir);
     assert_eq!(sessions[0].tool_key, "claude");
 }
 

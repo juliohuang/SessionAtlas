@@ -26,6 +26,7 @@ desktop.ini
 *.db-shm
 *.db-wal
 *.db-journal
+*.db.lock
 
 # Node / frontend
 node_modules/

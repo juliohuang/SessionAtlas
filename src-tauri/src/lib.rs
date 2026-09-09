@@ -11,6 +11,7 @@ use sessionatlas_core::content_index::content_match_snippet;
 use sessionatlas_core::indexer::{build_index, IndexedToolScan};
 use sessionatlas_core::path as core_path;
 use sessionatlas_core::private_fs;
+use sessionatlas_core::scan_coordinator::{IndexWriteGuard, ScanCoordinator};
 use sessionatlas_core::scanner::{
     build_adapter_scanners, ScanDiagnostic, ScanDiagnosticSeverity, Scanner,
     UNEXPECTED_SCANNER_FAILURE,
@@ -26,12 +27,14 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_notification::NotificationExt;
 
+mod content_controls;
 mod process;
 mod pty;
 mod security;
 mod session_cleanup;
 mod tui_tools;
 
+use content_controls::{get_content_index_status, update_content_index};
 use process::{
     git_read_spec, git_user_operation_spec, output_with_timeout, ProcessOutput, ProcessRunner,
     SystemProcessRunner, TimeoutProcessRunner,
@@ -1203,6 +1206,12 @@ fn search_projects_in_connection(
     let Some(pattern) = build_fts_prefix_query(query) else {
         return Ok(Vec::new());
     };
+    // Keep the policy gate, content previews and project rows in one snapshot
+    // so a concurrent rebuild cannot publish partial content into this search.
+    let tx = connection
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    let connection: &Connection = &tx;
     let mut stmt = connection
         .prepare(
             "SELECT p.id, p.path, p.last_accessed_at, p.git_branch
@@ -1287,6 +1296,7 @@ fn search_projects_in_connection(
     for project in &mut projects {
         project.content_match = content_matches.remove(&project.id);
     }
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(projects)
 }
 
@@ -1429,6 +1439,8 @@ fn run_scan_with_scanners(
     scanners: &[Box<dyn Scanner>],
     initial_diagnostics: &[ScanDiagnostic],
 ) -> Result<i64, String> {
+    let mut expected_generation = SqliteStore::read_scan_generation_at(db_path)
+        .map_err(|error| format!("could not read index scan generation: {error}"))?;
     let mut diagnostics: Vec<ScanDiagnostic> = initial_diagnostics.to_vec();
     let mut successful: Vec<IndexedToolScan> = Vec::new();
 
@@ -1460,12 +1472,51 @@ fn run_scan_with_scanners(
         return Err(sanitize_scan_error(scanners.len()));
     }
 
-    let projects = build_index(&successful);
+    let guard = IndexWriteGuard::acquire(db_path).map_err(|error| {
+        format!(
+            "could not acquire index write lock {}: {error}",
+            db_path.display()
+        )
+    })?;
+    let mut retried_under_lock = false;
+    let projects = loop {
+        let current_generation = SqliteStore::read_scan_generation_at(db_path)
+            .map_err(|error| format!("could not verify index scan generation: {error}"))?;
+        if current_generation == expected_generation {
+            break build_index(&successful);
+        }
+        if retried_under_lock {
+            return Err(
+                "index scan generation changed while the writer lock was held; existing index preserved"
+                    .to_string(),
+            );
+        }
+        retried_under_lock = true;
+        expected_generation = current_generation;
+        successful.clear();
+        for scanner in scanners {
+            let outcome =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner.scan())) {
+                    Ok(outcome) => outcome,
+                    Err(_) => continue,
+                };
+            if outcome.is_successful() {
+                successful.push(IndexedToolScan {
+                    tool_key: scanner.tool_key().to_string(),
+                    tool_name: scanner.tool_name().to_string(),
+                    projects: outcome.into_projects(),
+                });
+            }
+        }
+        if successful.is_empty() {
+            return Err(sanitize_scan_error(scanners.len()));
+        }
+    };
     let scanned_keys: Vec<&str> = successful
         .iter()
         .map(|scan| scan.tool_key.as_str())
         .collect();
-    let mut store = SqliteStore::new(db_path)
+    let mut store = SqliteStore::new_with_guard(db_path, guard)
         .map_err(|error| format!("could not open index {}: {error}", db_path.display()))?;
     store
         .replace_tool_snapshots(&projects, &scanned_keys)
@@ -1474,25 +1525,9 @@ fn run_scan_with_scanners(
     // not turn a committed project snapshot into a false scan failure; the
     // next rescan retries while name/path search remains usable.
     let _ = store.refresh_project_content_index();
-    count_index_projects(db_path)
-}
-
-/// Counts the project rows of the freshly written index. A new read-only
-/// connection observes the committed snapshot written by the scan worker's own
-/// writer connection, so the count never depends on the app's cached reader.
-fn count_index_projects(db_path: &Path) -> Result<i64, String> {
-    let connection =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|error| {
-                format!(
-                    "could not open index {} for counting: {error}",
-                    db_path.display()
-                )
-            })?;
-    let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
-        .map_err(|error| format!("could not count indexed projects: {error}"))?;
-    Ok(count)
+    store
+        .count_projects()
+        .map_err(|error| format!("could not count indexed projects: {error}"))
 }
 
 /// Builds the sanitized error returned when no tool produced a trustworthy
@@ -1526,9 +1561,13 @@ fn sanitize_scan_error(tool_count: usize) -> String {
 async fn scan_projects() -> Result<i64, String> {
     let db_path = db_path();
     let config_path = cli_config_path();
-    tauri::async_runtime::spawn_blocking(move || run_local_scan(&db_path, &config_path))
-        .await
-        .map_err(|error| format!("local scan worker panicked: {error}"))?
+    static COORDINATOR: OnceLock<ScanCoordinator<Result<i64, String>>> = OnceLock::new();
+    let coordinator = COORDINATOR.get_or_init(ScanCoordinator::new).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        coordinator.run(move || run_local_scan(&db_path, &config_path))
+    })
+    .await
+    .map_err(|error| format!("local scan worker panicked: {error}"))?
 }
 
 /// Launch an AI CLI in the project directory via an external terminal.
@@ -6943,6 +6982,8 @@ pub fn run() {
             list_tools,
             local_index_exists,
             scan_projects,
+            get_content_index_status,
+            update_content_index,
             launch_project,
             pty_spawn,
             pty_attach,
@@ -8898,7 +8939,8 @@ mod local_scan_tests {
     use super::*;
     use sessionatlas_core::model::{Project as CoreProject, ToolUsage as CoreUsage};
     use sessionatlas_core::scanner::{ScanOutcome, ScannedProject};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, SystemTime};
 
     static SCAN_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -9064,6 +9106,40 @@ mod local_scan_tests {
         }
     }
 
+    /// The first call returns a deliberately stale snapshot after the test
+    /// releases it; a lock-internal retry returns the current snapshot.
+    struct StaleThenFreshScanner {
+        calls: Arc<AtomicUsize>,
+        started: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+        stale: ScannedProject,
+        fresh: ScannedProject,
+    }
+
+    impl Scanner for StaleThenFreshScanner {
+        fn tool_key(&self) -> &str {
+            "codex"
+        }
+
+        fn tool_name(&self) -> &str {
+            "Codex"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn scan(&self) -> ScanOutcome {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                ScanOutcome::succeeded(vec![self.stale.clone()], [])
+            } else {
+                ScanOutcome::succeeded(vec![self.fresh.clone()], [])
+            }
+        }
+    }
+
     fn boxed(scanner: FakeScanner) -> Box<dyn Scanner> {
         Box::new(scanner)
     }
@@ -9182,6 +9258,64 @@ mod local_scan_tests {
             "zero successful tools must not create the data directory"
         );
         assert!(!dir.db().exists());
+        assert!(!IndexWriteGuard::lock_path(dir.db()).exists());
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = dir.db().as_os_str().to_os_string();
+            sidecar.push(suffix);
+            assert!(!PathBuf::from(sidecar).exists(), "unexpected {suffix}");
+        }
+    }
+
+    #[test]
+    fn delayed_scan_cannot_overwrite_a_newer_committed_snapshot() {
+        let dir = TestDir::new();
+        let db = dir.db();
+        let stale_path = abs_path(&["work", "stale"]);
+        let fresh_path = abs_path(&["work", "fresh"]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+
+        let delayed = {
+            let db = db.clone();
+            let calls = Arc::clone(&calls);
+            let stale = scanned_project(&stale_path, now_minus(3600), "stale-session");
+            let fresh = scanned_project(&fresh_path, now_minus(30), "fresh-session");
+            std::thread::spawn(move || {
+                let scanners: Vec<Box<dyn Scanner>> = vec![Box::new(StaleThenFreshScanner {
+                    calls,
+                    started: started_tx,
+                    release: release_rx,
+                    stale,
+                    fresh,
+                })];
+                run_scan_with_scanners(&db, &scanners, &[])
+            })
+        };
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("delayed scan did not reach its controlled pause");
+
+        // B observes generation zero and commits the fresh source state first.
+        let current: Vec<Box<dyn Scanner>> = vec![boxed(FakeScanner::succeeded(
+            "codex",
+            vec![scanned_project(&fresh_path, now_minus(30), "fresh-session")],
+        ))];
+        assert_eq!(run_scan_with_scanners(&db, &current, &[]).unwrap(), 1);
+
+        // A now finishes with stale data. Generation revalidation must force a
+        // second source read while A owns the writer lock.
+        release_tx.send(()).unwrap();
+        assert_eq!(delayed.join().unwrap().unwrap(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let reader = sessionatlas_core::store::IndexReader::open_existing(&db).unwrap();
+        let projects = reader.list_projects(None, None, 10).unwrap();
+        assert_eq!(projects.len(), 1, "{projects:?}");
+        assert_eq!(projects[0].path, fresh_path);
+        assert_ne!(projects[0].path, stale_path);
+        assert_eq!(reader.scan_generation().unwrap(), 2);
     }
 
     #[test]
@@ -9213,6 +9347,22 @@ mod local_scan_tests {
             &["claude"],
         );
 
+        // Keep one read-only handle open across the write, matching the
+        // desktop's cached INDEX_DB connection rather than opening a fresh
+        // reader only after the scan has committed.
+        let connection = rusqlite::Connection::open_with_flags(
+            dir.db(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
         let scanners: Vec<Box<dyn Scanner>> = vec![boxed(FakeScanner::succeeded(
             "codex",
             vec![scanned_project(
@@ -9224,13 +9374,7 @@ mod local_scan_tests {
         let count = run_scan_with_scanners(&dir.db(), &scanners, &[]).unwrap();
         assert_eq!(count, 2);
 
-        // A fresh read-only connection (like the console's reader) can still
-        // query both the preserved and the newly written rows after the scan.
-        let connection = rusqlite::Connection::open_with_flags(
-            dir.db(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        // The same cached handle must observe the committed generation.
         let rows: Vec<(String, i64)> = connection
             .prepare(
                 "SELECT path,

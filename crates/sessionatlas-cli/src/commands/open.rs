@@ -15,8 +15,9 @@ use sessionatlas_core::launcher::{Launcher, ToolCommands};
 use sessionatlas_core::model::Session;
 use sessionatlas_core::path;
 use sessionatlas_core::process::{ProcessRunner, ProgramResolver};
+use sessionatlas_core::scan_coordinator::IndexWriteGuard;
 use sessionatlas_core::security;
-use sessionatlas_core::store::SqliteStore;
+use sessionatlas_core::store::{IndexReader, SqliteStore};
 
 use crate::cli::OpenArgs;
 use crate::render::sanitize;
@@ -44,16 +45,21 @@ pub fn run_open(
     args: &OpenArgs,
     env: &OpenEnvironment<'_>,
 ) -> i32 {
-    // `open` records sessions, so it may create the index database.
-    let store = match SqliteStore::new(db_path) {
-        Ok(store) => store,
-        Err(error) => {
-            io.err(&format!(
-                "打开索引数据库失败: {}\n",
-                sanitize(&error.to_string())
-            ));
-            return 1;
+    // All lookup and selection work is strictly read-only.  In particular,
+    // cancellation or a failed launch must not create/migrate the index.
+    let reader = if db_path.is_file() {
+        match IndexReader::open_existing(db_path) {
+            Ok(reader) => Some(reader),
+            Err(error) => {
+                io.err(&format!(
+                    "打开索引数据库失败: {}\n",
+                    sanitize(&error.to_string())
+                ));
+                return 1;
+            }
         }
+    } else {
+        None
     };
     let config = sessionatlas_core::config::try_load(config_path).unwrap_or_default();
     let registry = AdapterRegistry::load(&adapter_root_for_config(config_path), &config)
@@ -68,7 +74,11 @@ pub fn run_open(
 
     let mut recent_session: Option<Session> = None;
     let resolved_path = if args.recent {
-        match store.get_recent_sessions(1) {
+        match reader
+            .as_ref()
+            .map(|reader| reader.get_recent_sessions(1))
+            .unwrap_or_else(|| Ok(Vec::new()))
+        {
             Ok(sessions) => match sessions.into_iter().next() {
                 Some(session) => {
                     recent_session = Some(session.clone());
@@ -88,12 +98,12 @@ pub fn run_open(
             }
         }
     } else if let Some(input) = args.project_path.as_deref() {
-        match resolve_existing_or_fuzzy(&store, io, input) {
+        match resolve_existing_or_fuzzy(reader.as_ref(), io, input) {
             ResolveOutcome::Path(path) => path,
             ResolveOutcome::Exit(code) => return code,
         }
     } else {
-        match select_project_interactively(&store, io) {
+        match select_project_interactively(reader.as_ref(), io) {
             ResolveOutcome::Path(path) => path,
             ResolveOutcome::Exit(code) => return code,
         }
@@ -115,7 +125,11 @@ pub fn run_open(
     let tool_key = match tool_key {
         Some(key) if !args.interactive => key,
         _ => {
-            let project = match store.get_project_by_path(&resolved_path) {
+            let project = match reader
+                .as_ref()
+                .map(|reader| reader.get_project_by_path(&resolved_path))
+                .unwrap_or_else(|| Ok(None))
+            {
                 Ok(project) => project,
                 Err(error) => {
                     io.err(&format!(
@@ -175,7 +189,11 @@ pub fn run_open(
             .as_ref()
             .and_then(|session| session.session_id_from_tool.clone())
     } else {
-        match store.get_project_by_path(&resolved_path) {
+        match reader
+            .as_ref()
+            .map(|reader| reader.get_project_by_path(&resolved_path))
+            .unwrap_or_else(|| Ok(None))
+        {
             Ok(Some(project)) => project
                 .tool_usages
                 .iter()
@@ -227,8 +245,31 @@ pub fn run_open(
         session_id_from_tool: resume_session_id.clone(),
         ..Session::default()
     };
+    let guard = match IndexWriteGuard::acquire(db_path) {
+        Ok(guard) => guard,
+        Err(error) => {
+            io.err(&format!(
+                "终端已启动，但记录会话时索引写锁不可用: {}\n",
+                sanitize(&error.to_string())
+            ));
+            return 1;
+        }
+    };
+    let store = match SqliteStore::new_with_guard(db_path, guard) {
+        Ok(store) => store,
+        Err(error) => {
+            io.err(&format!(
+                "终端已启动，但打开索引数据库以记录会话失败: {}\n",
+                sanitize(&error.to_string())
+            ));
+            return 1;
+        }
+    };
     if let Err(error) = store.record_session(&session) {
-        io.err(&format!("记录会话失败: {}\n", sanitize(&error.to_string())));
+        io.err(&format!(
+            "终端已启动，但记录会话失败: {}\n",
+            sanitize(&error.to_string())
+        ));
         return 1;
     }
     0
@@ -244,7 +285,11 @@ enum ResolveOutcome {
 /// (normalized to its native absolute form); otherwise at most 10 fuzzy matches
 /// are considered, a single match wins, multiple matches prompt, and none is an
 /// error.
-fn resolve_existing_or_fuzzy(store: &SqliteStore, io: &mut Io<'_>, input: &str) -> ResolveOutcome {
+fn resolve_existing_or_fuzzy(
+    reader: Option<&IndexReader>,
+    io: &mut Io<'_>,
+    input: &str,
+) -> ResolveOutcome {
     if Path::new(input).is_dir() {
         return match absolute_normalize(input) {
             Some(path) => ResolveOutcome::Path(path),
@@ -254,7 +299,10 @@ fn resolve_existing_or_fuzzy(store: &SqliteStore, io: &mut Io<'_>, input: &str) 
             }
         };
     }
-    let matches = match store.list_projects(Some(input), None, 10) {
+    let matches = match reader
+        .map(|reader| reader.list_projects(Some(input), None, 10))
+        .unwrap_or_else(|| Ok(Vec::new()))
+    {
         Ok(matches) => matches,
         Err(error) => {
             io.err(&format!("搜索项目失败: {}\n", sanitize(&error.to_string())));
@@ -289,8 +337,11 @@ fn resolve_existing_or_fuzzy(store: &SqliteStore, io: &mut Io<'_>, input: &str) 
 }
 
 /// Fully interactive project selection when no path and `--recent` are given.
-fn select_project_interactively(store: &SqliteStore, io: &mut Io<'_>) -> ResolveOutcome {
-    let projects = match store.list_projects(None, None, 100) {
+fn select_project_interactively(reader: Option<&IndexReader>, io: &mut Io<'_>) -> ResolveOutcome {
+    let projects = match reader
+        .map(|reader| reader.list_projects(None, None, 100))
+        .unwrap_or_else(|| Ok(Vec::new()))
+    {
         Ok(projects) => projects,
         Err(error) => {
             io.err(&format!("读取索引失败: {}\n", sanitize(&error.to_string())));

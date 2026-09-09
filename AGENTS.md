@@ -7,9 +7,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 `SessionAtlas` aggregates projects that have been worked on by multiple AI CLI coding tools (Claude Code, Codex, Kimi, OpenCode, Aider, Pi Coding Agent). The repo is a **pure Rust workspace** with two cooperating components sharing one data directory (`~/.sessionatlas/`):
 
 1. **`sessionatlas` CLI** (`crates/sessionatlas-cli`, Rust) — the canonical scanner. Walks each AI tool's data directory, deduplicates by normalized path, and writes a unified index to `~/.sessionatlas/index.db` (SQLite + FTS5). Also launches AI CLIs in project dirs via `sessionatlas open`.
-2. **Tauri desktop console** (`src-tauri/` + `frontend/`, Rust + plain HTML/JS) — the **current primary GUI**. Opens the CLI's SQLite index read-only, browses/searches projects, and runs interactive AI-CLI terminals in-app via PTY. This is the actively-developed frontend.
+2. **Tauri desktop console** (`src-tauri/` + `frontend/`, Rust + plain HTML/JS) — the **current primary GUI**. Opens the shared SQLite index read-only for queries, browses/searches projects, runs the same core scan pipeline on demand, and hosts interactive AI-CLI terminals in-app via PTY. This is the actively-developed frontend.
 
-Both binaries link the shared `crates/sessionatlas-core` library in-process. The Tauri console **does not own its data** — it opens a read-only view of the index the shared scanner maintains. On first launch, the frontend checks for a missing `index.db` and runs the in-process scan once before loading the project list. Existing indexes, including intentionally empty ones, are never rescanned automatically; failed first scans keep the index absent and show an actionable retry state.
+Both binaries link the shared `crates/sessionatlas-core` library in-process. The core store owns index writes: CLI and Tauri scan entry points share `index.db.lock`, while all ordinary Tauri query connections remain read-only. On first launch, the frontend checks for a missing `index.db` and runs the in-process scan once before loading the project list. Existing indexes, including intentionally empty ones, are never rescanned automatically; failed first scans keep the index absent and show an actionable retry state.
 
 **Identity contract:** the only supported identities are the `sessionatlas` CLI,
 `SessionAtlas` product identifiers, Tauri crate `sessionatlas-tauri`,
@@ -58,6 +58,11 @@ libraries. CLI and Tauri are I/O adapters over the same core.
 - **`src/content_index.rs`** — bounded/incremental source and documentation
   discovery. Excludes dependencies, build output, AI-session data, credential
   shapes, binary/oversized files; stores only FTS terms plus compressed previews.
+- **`src/store/content_control.rs`** — shared content-index enable/disable/clear/
+  rebuild lifecycle. Policy and cleanup/rebuild markers live in `sessionatlas_meta`,
+  not config.json. All writes hold the index lock; disabled or pending content is
+  hidden from both readers. Missing-index status is read-only and controls require
+  an existing project index. See `docs/content-index-controls.md`.
 - **`src/path.rs`** — path normalization, root-path display, and same-or-child
   parent/child semantics (Windows case-insensitive, Unix byte-sensitive).
 - **`src/scanner/`** — adapter-selected scanners: official `builtin.<id>`
@@ -73,7 +78,11 @@ libraries. CLI and Tauri are I/O adapters over the same core.
   `tool_usages`, `sessions`, content metadata/status, plus FTS5 `projects_fts`
   and contentless `project_content_fts`. Snapshot replacement,
   orphan cleanup, activity-time recomputation, and FTS rebuild happen in one
-  SQLite transaction. Schema created/migrated idempotently.
+  SQLite transaction. Schema versioning uses `PRAGMA user_version`; committed
+  snapshot replacements advance an internal scan generation.
+- **`src/scan_coordinator.rs`** — in-process scan coalescing plus the persistent,
+  owner-only `index.db.lock` used by every core index writer. A stale scan
+  revalidates its generation and rescans while holding the lock before commit.
 - **`src/config.rs`** — `~/.sessionatlas/config.json` (adapter selections and
   active versions, legacy custom tools, per-path preferred tool, default terminal) with case-insensitive reads, a bounded
   cross-process lock, fingerprint conflict detection, and atomic replacement.
@@ -97,8 +106,9 @@ and the optional content-index tables. Older indexes still support name/path
 search until the next scan creates the content index.
 `scan_projects` invokes the `sessionatlas-core` scan pipeline **in-process** on
 `spawn_blocking` — it does not spawn a sidecar or subprocess — then returns
-`COUNT(*)`. CLI and Tauri share the same `index.db`; reads are read-only and
-successful scans replace snapshots atomically.
+`COUNT(*)`. CLI and Tauri share the same `index.db`; query connections are
+read-only, scan writers serialize through the core lock, and successful scans
+replace snapshots atomically.
 
 **Tauri commands**: registered in `run()`'s `generate_handler!`. Structs use
 `#[serde(rename = "camelCase")]` so Rust snake_case arrives in JS as
@@ -153,7 +163,7 @@ is in `docs/execution-security-contract.md`.
 
 ## Conventions
 
-- Data dir for all components: `~/.sessionatlas/` (`index.db`, `config.json`, `adapters/<id>/<version>/adapter.json`, `prefs.db`). `prefs.db` also owns source-scoped project ignore rules; any path component starting with `.` is always hidden in the desktop project view. `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
+- Data dir for all components: `~/.sessionatlas/` (`index.db`, persistent `index.db.lock`, `config.json`, `adapters/<id>/<version>/adapter.json`, `prefs.db`). `prefs.db` also owns source-scoped project ignore rules; any path component starting with `.` is always hidden in the desktop project view. `*.db`/`*.db-journal`/`*.db-shm`/`*.db-wal` are gitignored.
 - Tool keys are lowercase short strings. Official identities (`claude`, `codex`, `kimi`, `opencode`, `aider`, `pi`) come from `adapters/official/*.json`; do not reintroduce separate launch/install key maps. Unknown adapter keys use the frontend's generic icon/color fallback.
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` must stay green; use `#![deny(...)]`/strict clippy where the code already does.
 - Tauri frontend: keyboard is first-class (`/` search, `Esc` clear, `↑↓` nav, `Enter` launch) — don't break these. Match existing CSS tokens in `styles.css` rather than introducing new design primitives.

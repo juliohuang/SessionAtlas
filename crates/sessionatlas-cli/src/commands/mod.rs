@@ -3,6 +3,7 @@
 //! by R10.
 
 pub mod config;
+pub mod content_index;
 pub mod list;
 pub mod open;
 pub mod recent;

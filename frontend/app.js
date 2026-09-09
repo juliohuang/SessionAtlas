@@ -148,6 +148,12 @@ const state = {
   staleSources: { remote: false, tools: false, servers: false, ignores: false, groups: false, openers: false, webDevelopment: false },
   firstRunError: null,       // preserved across async preference/group renders until a retry succeeds
   settingsView: "menu",     // "menu" | "cleanup" | "tui" | "webDevelopment" | "openers" | "groups" | "remote" | "ignores" | "language"
+  contentIndex: null,
+  contentIndexBusy: false,
+  contentIndexLoading: false,
+  contentIndexRequest: 0,
+  contentIndexError: "",
+  contentIndexMessage: "",
   overviewCollapsed: readOverviewCollapsed(), // new users default to the full overview
   _dragId: null,            // project id being dragged (transient)
   ledgerRows: [],           // grouped rows used by the bounded ledger renderer
@@ -4211,6 +4217,7 @@ function setSettingsView(view) {
   renderDrawerBody();
   if (view === "tui") void refreshAllTuiCapabilities({ includeRemote: true });
   if (view === "cleanup") void refreshSessionCleanup();
+  if (view === "contentIndex") void loadContentIndexStatus();
   if (view === "webDevelopment" && !state.webDevelopmentToolsLoaded) void loadWebDevelopmentTools();
   focusDialogStart(drawer, view === "menu" ? "[data-settings-view]" : "#drawerBackBtn");
 }
@@ -4220,6 +4227,11 @@ function setSettingsView(view) {
 // body function below. `titleKey` / `blurbKey` are i18n keys so the menu
 // re-localizes when the language changes.
 const SETTINGS_VIEWS = {
+  contentIndex: {
+    titleKey: "settings.contentIndex.title",
+    blurbKey: "settings.contentIndex.blurb",
+    body: renderContentIndexViewBody,
+  },
   cleanup: {
     titleKey: "settings.cleanup.title",
     blurbKey: "settings.cleanup.blurb",
@@ -4261,7 +4273,103 @@ const SETTINGS_VIEWS = {
     body: renderLanguageViewBody,
   },
 };
-const SETTINGS_ORDER = ["language", "cleanup", "tui", "webDevelopment", "remote", "ignores", "groups", "openers"];
+const SETTINGS_ORDER = ["language", "contentIndex", "cleanup", "tui", "webDevelopment", "remote", "ignores", "groups", "openers"];
+
+function checkedContentIndexStatus(value) {
+  if (!value || typeof value.indexExists !== "boolean" || typeof value.enabled !== "boolean"
+      || typeof value.searchable !== "boolean"
+      || !["ready", "cleanupPending", "rebuildPending"].includes(value.phase)
+      || !Number.isSafeInteger(value.indexedFiles) || value.indexedFiles < 0
+      || !Number.isSafeInteger(value.indexedBytes) || value.indexedBytes < 0) {
+    throw new Error(tr("contentIndex.invalidStatus"));
+  }
+  return value;
+}
+
+function renderContentIndexIfOpen() {
+  if (!drawer.hidden && state.settingsView === "contentIndex") renderDrawerBody();
+}
+
+async function loadContentIndexStatus() {
+  if (!HAS_TAURI || state.contentIndexBusy) return;
+  const request = ++state.contentIndexRequest;
+  state.contentIndexLoading = true;
+  state.contentIndexError = "";
+  state.contentIndexMessage = "";
+  renderContentIndexIfOpen();
+  try {
+    const status = checkedContentIndexStatus(await invoke("get_content_index_status"));
+    if (request === state.contentIndexRequest) state.contentIndex = status;
+  } catch (error) {
+    if (request === state.contentIndexRequest) {
+      state.contentIndex = null;
+      state.contentIndexError = String(error);
+    }
+  } finally {
+    if (request === state.contentIndexRequest) {
+      state.contentIndexLoading = false;
+      renderContentIndexIfOpen();
+    }
+  }
+}
+
+async function updateContentIndex(action) {
+  if (!HAS_TAURI || state.contentIndexBusy || state.contentIndexLoading
+      || !state.contentIndex?.indexExists
+      || !["enable", "disable", "clear", "rebuild"].includes(action)) return;
+  if (!window.confirm(tr(`contentIndex.confirm.${action}`))) return;
+  state.contentIndexBusy = true;
+  ++state.contentIndexRequest;
+  state.contentIndexError = "";
+  state.contentIndexMessage = "";
+  renderContentIndexIfOpen();
+  try {
+    state.contentIndex = checkedContentIndexStatus(await invoke("update_content_index", { action }));
+    state.contentIndexMessage = tr(`contentIndex.done.${action}`);
+  } catch (error) {
+    state.contentIndexError = tr("contentIndex.operationFailed", { err: String(error) });
+    // A failed physical cleanup may already have disabled search. Never roll
+    // back the UI optimistically or report the old setting as authoritative.
+    state.contentIndex = null;
+    try {
+      state.contentIndex = checkedContentIndexStatus(await invoke("get_content_index_status"));
+    } catch (statusError) {
+      state.contentIndexError += ` ${tr("contentIndex.statusFailed", { err: String(statusError) })}`;
+    }
+  } finally {
+    // Discard previously displayed content snippets, including failed cleanup
+    // whose gate committed. Reload also invalidates outstanding searches.
+    state.searchResults = null;
+    state.all = state.query.trim() ? [] : state.catalog;
+    applyFilters();
+    await reload();
+    state.contentIndexBusy = false;
+    renderContentIndexIfOpen();
+  }
+}
+
+function renderContentIndexViewBody() {
+  const status = state.contentIndex;
+  const blocked = !HAS_TAURI || !status?.indexExists || state.contentIndexBusy || state.contentIndexLoading;
+  const button = (action, disabled = false) => `<button type="button" data-content-action="${action}" ${blocked || disabled ? "disabled" : ""}>${escapeHtml(tr(`contentIndex.${action}`))}</button>`;
+  return `<div class="cleanup-intro">${escapeHtml(tr("contentIndex.intro"))}</div>
+    ${!HAS_TAURI ? `<div class="drawer__empty">${escapeHtml(tr("contentIndex.demo"))}</div>` : ""}
+    <div role="status" aria-live="polite" data-content-status>
+      ${state.contentIndexBusy || state.contentIndexLoading ? `<p>${escapeHtml(tr("contentIndex.busy"))}</p>` : ""}
+      ${status ? `<div class="cleanup-summary"><span>${escapeHtml(tr(status.enabled ? "contentIndex.enabled" : "contentIndex.disabled"))}</span><span>${escapeHtml(tr(`contentIndex.phase.${status.phase}`))}</span></div>
+        <p>${escapeHtml(tr("contentIndex.counts", { count: status.indexedFiles, size: formatBytes(status.indexedBytes) }))}</p>
+        <p>${escapeHtml(tr(status.searchable ? "contentIndex.searchable" : "contentIndex.hidden"))}</p>
+        ${!status.indexExists ? `<p>${escapeHtml(tr("contentIndex.missing"))}</p>` : ""}` : ""}
+      ${state.contentIndexMessage ? `<p>${escapeHtml(state.contentIndexMessage)}</p>` : ""}
+    </div>
+    ${state.contentIndexError ? `<p role="alert">${escapeHtml(state.contentIndexError)}</p>` : ""}
+    <div class="cleanup-actions">
+      ${button("enable", status?.enabled)}${button("disable", status && !status.enabled && status.phase === "ready")}
+      ${button("clear")}${button("rebuild", !status?.enabled)}
+      <button type="button" data-content-refresh ${!HAS_TAURI || state.contentIndexBusy || state.contentIndexLoading ? "disabled" : ""}>${escapeHtml(tr("contentIndex.refresh"))}</button>
+    </div>
+    <div class="cleanup-intro">${escapeHtml(tr("contentIndex.clearHint"))}</div>`;
+}
 
 // Localized title/blurb for a settings view (used by the menu + header).
 function settingsTitleFor(view) {
@@ -4945,7 +5053,7 @@ function renderSessionCleanupViewBody() {
 }
 
 function renderDrawerBody() {
-  if (state.openerPrefsError && !state.openerPrefs.length && state.settingsView !== "menu") {
+  if (state.openerPrefsError && !state.openerPrefs.length && !["menu", "contentIndex"].includes(state.settingsView)) {
     drawerBody.innerHTML = `<div class="drawer__empty">${tr("settings.prefsUnavailable", { error: escapeHtml(state.openerPrefsError) })}</div>`;
     renderDrawerHead();
     renderDrawerFoot();
@@ -4976,6 +5084,11 @@ function renderDrawerBody() {
    per-row bindings the original renderDrawerBody set up on every paint. */
 const _debouncedCmdTimers = new Map();
 function wireDrawerDelegation() {
+  drawerBody.addEventListener("click", (e) => {
+    const action = e.target.closest("[data-content-action]");
+    if (action && !action.disabled) void updateContentIndex(action.dataset.contentAction);
+    if (e.target.closest("[data-content-refresh]") && !e.target.closest("[data-content-refresh]").disabled) void loadContentIndexStatus();
+  });
   drawerBody.addEventListener("change", async (e) => {
     const cb = e.target;
     if (cb?.matches?.("[data-cleanup-select]")) {
