@@ -79,6 +79,10 @@ The legacy `sessionatlas config add-tool` command remains for compatibility.
 
 ## Highlights
 
+- Per-project session history with title/preview search, tool filters and checked
+  local resume actions; read-only staged/unstaged Git diffs and changed-file
+  previews. See [scope and recovery details](./docs/session-history-review.md).
+
 - Unified scanning, path deduplication, and SQLite FTS5 search;
 - tool filtering, persistent groups, and priority/recent/name/grouped ordering;
 - real multi-tab PTY terminals and recent-session resume actions;

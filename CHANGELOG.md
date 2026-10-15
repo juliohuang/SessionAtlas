@@ -4,6 +4,15 @@ All notable changes to SessionAtlas will be documented here. The project follows
 
 ## [Unreleased]
 
+### Local 0.1.1 candidate (2026-10-15)
+
+- Per-project session history with bounded title/task previews, tool filters,
+  recovery checks and exact historical-session terminal selection.
+- Read-only staged/unstaged Git diffs and changed-file previews.
+- Windows MSI/NSIS candidate packaging uses version 0.1.1; this is a local
+  candidate and does not declare a public release. Native results are recorded
+  separately from browser tests.
+
 This section tracks work after the published `v0.1.0-beta.3` prerelease. The
 beta.3 installers are available from the [explicit prerelease page](https://github.com/juliohuang/SessionAtlas/releases/tag/v0.1.0-beta.3).
 

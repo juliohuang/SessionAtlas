@@ -503,3 +503,23 @@ function compareRecentFirst(left, right) {
       ? -1
       : 0;
 }
+
+// Conservative hints from the rendered live screen, never from output silence.
+// Unknown/custom TUIs retain their previous state until a lifecycle signal arrives.
+export function terminalScreenStatus(toolKey, screen, completionBaseline = "") {
+  if (!["claude", "codex", "kimi", "opencode", "aider", "pi"].includes(toolKey)) return null;
+  const tail = screen.trimEnd().split("\n").slice(-16).join("\n");
+  const lines = tail.split("\n").map(line => line.trim()).filter(Boolean);
+  const completion = /(?:worked|cooked|churned|baked|brewed|sautéed) for \d/i;
+  if (["claude", "codex"].includes(toolKey) && /^[❯›>]$/.test(lines.at(-1) || "")) {
+    const summary = lines.at(-2) || "";
+    if (completion.test(summary)) {
+      return completionBaseline.includes(summary) ? null : "completed";
+    }
+    return "ready";
+  }
+  if (/(?:do you want to proceed|would you like to (?:proceed|run)|allow this (?:action|command)|是否(?:允许|继续)|请选择)[?？:]?/i.test(tail)
+      && /(?:\b(?:yes|no)\b|允许|拒绝|确认|取消)/i.test(tail)) return "waiting";
+  if (/(?:esc(?:ape)? to (?:interrupt|cancel)|press esc to interrupt|ctrl\+c to interrupt)/i.test(tail)) return "running";
+  return null;
+}

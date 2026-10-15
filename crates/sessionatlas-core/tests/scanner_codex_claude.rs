@@ -16,8 +16,9 @@ use sessionatlas_core::scanner::claude::ClaudeScanner;
 use sessionatlas_core::scanner::codex::CodexScanner;
 use sessionatlas_core::scanner::{
     ScanDiagnosticSeverity, ScanOutcome, ScanStatus, ScannedProject, Scanner,
-    MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, MISSING_SESSION_ID, NO_VALID_SESSIONS,
-    SESSION_READ_FAILED, SOURCE_READ_FAILED, SOURCE_UNAVAILABLE, TIMESTAMP_FALLBACK,
+    AUXILIARY_SESSION_FILTERED, MALFORMED_SESSION_RECORD, MISSING_PROJECT_PATH, MISSING_SESSION_ID,
+    NO_VALID_SESSIONS, SESSION_READ_FAILED, SOURCE_READ_FAILED, SOURCE_UNAVAILABLE,
+    TIMESTAMP_FALLBACK,
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -248,6 +249,184 @@ fn codex_recursive_jsonl_extracts_minimal_fields() {
         let b = project_by_path(projects, &path::normalize_native(&cwd_b).unwrap());
         assert_eq!(b.session_id.as_deref(), Some("codex-session-b"));
         assert_eq!(b.last_accessed_at, rfc3339("2026-08-01T08:30:00Z"));
+    });
+}
+
+#[test]
+fn codex_auxiliary_sessions_keep_activity_but_are_not_resume_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    with_home(dir.path(), || {
+        let sessions = codex_sessions(dir.path());
+        let source = sessions.join("2026/09/19");
+        std::fs::create_dir_all(&source).unwrap();
+        let cwd = home_join(dir.path(), "work/repo");
+
+        write_jsonl(
+            &source.join("main.jsonl"),
+            &[serde_json::json!({
+                "timestamp": "2026-09-19T01:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "main-session",
+                    "cwd": cwd,
+                    "timestamp": "2026-09-19T01:00:00Z",
+                    "thread_source": "user"
+                }
+            })],
+        );
+        write_jsonl(
+            &source.join("child.jsonl"),
+            &[serde_json::json!({
+                "timestamp": "2026-09-19T02:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "child-session",
+                    "cwd": cwd,
+                    "timestamp": "2026-09-19T02:00:00Z",
+                    "thread_source": "subagent",
+                    "source": { "subagent": { "thread_spawn": { "parent_thread_id": "main-session" } } }
+                }
+            })],
+        );
+        write_jsonl(
+            &source.join("guardian.jsonl"),
+            &[serde_json::json!({
+                "timestamp": "2026-09-19T03:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "guardian-session",
+                    "cwd": cwd,
+                    "timestamp": "2026-09-19T03:00:00Z",
+                    "thread_source": "subagent",
+                    "source": { "subagent": { "other": "guardian" } }
+                }
+            })],
+        );
+        write_jsonl(
+            &source.join("auxiliary.jsonl"),
+            &[serde_json::json!({
+                "timestamp": "2026-09-19T04:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "auxiliary-session",
+                    "cwd": cwd,
+                    "timestamp": "2026-09-19T04:00:00Z",
+                    "source": { "subagent": { "other": "future-kind" } }
+                }
+            })],
+        );
+        write_jsonl(
+            &source.join("mixed.jsonl"),
+            &[
+                serde_json::json!({
+                    "timestamp": "2026-09-19T05:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "mixed-guardian",
+                        "cwd": cwd,
+                        "timestamp": "2026-09-19T05:00:00Z",
+                        "thread_source": "subagent",
+                        "source": { "subagent": { "other": "guardian" } }
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-09-19T06:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "mixed-primary",
+                        "cwd": cwd,
+                        "timestamp": "2026-09-19T06:00:00Z",
+                        "thread_source": "user"
+                    }
+                }),
+            ],
+        );
+
+        let outcome = CodexScanner::with_availability(|| true).scan();
+
+        assert_eq!(outcome.status(), ScanStatus::Succeeded);
+        assert_eq!(outcome.projects().len(), 5);
+        assert_eq!(
+            outcome
+                .projects()
+                .iter()
+                .filter(|project| project.session_id.is_some())
+                .count(),
+            1
+        );
+        assert!(outcome
+            .projects()
+            .iter()
+            .any(|project| project.session_id.as_deref() == Some("main-session")));
+        let diagnostic = outcome
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == AUXILIARY_SESSION_FILTERED)
+            .expect("auxiliary-session diagnostic");
+        assert!(diagnostic.message.contains("1 child session"));
+        assert!(diagnostic.message.contains("2 guardian review session"));
+        assert!(diagnostic.message.contains("1 other auxiliary session"));
+
+        let mixed = outcome
+            .projects()
+            .iter()
+            .find(|project| project.last_accessed_at == rfc3339("2026-09-19T06:00:00Z"))
+            .expect("mixed rollout activity");
+        assert_eq!(mixed.session_id, None);
+
+        let indexed = build_index(&[IndexedToolScan {
+            tool_key: "codex".to_string(),
+            tool_name: "Codex CLI".to_string(),
+            projects: outcome.projects().to_vec(),
+        }]);
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].last_accessed_at, rfc3339("2026-09-19T06:00:00Z"));
+        assert_eq!(indexed[0].tool_usages[0].session_count, 1);
+        assert_eq!(
+            indexed[0].tool_usages[0].last_session_id.as_deref(),
+            Some("main-session")
+        );
+    });
+}
+
+#[test]
+fn codex_auxiliary_only_project_indexes_activity_without_resume_id() {
+    let dir = tempfile::tempdir().unwrap();
+    with_home(dir.path(), || {
+        let sessions = codex_sessions(dir.path());
+        let source = sessions.join("2026/09/20");
+        std::fs::create_dir_all(&source).unwrap();
+        let cwd = home_join(dir.path(), "work/auxiliary-only");
+        write_jsonl(
+            &source.join("child.jsonl"),
+            &[serde_json::json!({
+                "timestamp": "2026-09-20T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "child-only",
+                    "cwd": cwd,
+                    "timestamp": "2026-09-20T12:00:00Z",
+                    "thread_source": "subagent",
+                    "source": { "subagent": { "thread_spawn": { "parent_thread_id": "parent" } } }
+                }
+            })],
+        );
+
+        let outcome = CodexScanner::with_availability(|| false).scan();
+        assert_eq!(outcome.status(), ScanStatus::Succeeded);
+        assert_eq!(outcome.projects().len(), 1);
+        assert_eq!(outcome.projects()[0].session_id, None);
+
+        let indexed = build_index(&[IndexedToolScan {
+            tool_key: "codex".to_string(),
+            tool_name: "Codex CLI".to_string(),
+            projects: outcome.projects().to_vec(),
+        }]);
+        assert_eq!(indexed.len(), 1);
+        let usage = &indexed[0].tool_usages[0];
+        assert_eq!(usage.session_count, 0);
+        assert_eq!(usage.last_session_id, None);
+        assert_eq!(indexed[0].last_accessed_at, rfc3339("2026-09-20T12:00:00Z"));
     });
 }
 

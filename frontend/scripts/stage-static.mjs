@@ -8,6 +8,8 @@ const files = [
   "index.html",
   "app.js",
   "core.js",
+  "project-review.js",
+  "project-review.css",
   "i18n.js",
   "icons.js",
   "lang-init.js",

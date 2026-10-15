@@ -1,5 +1,76 @@
 import { expect, test } from "@playwright/test";
 
+test("Git repository groups are lazy, collapsible and preserve manual groups", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__repoCalls = [];
+    window.__groupWrites = [];
+    const projects = ["one", "two", "none", "failed"].map(id => ({
+      id, name: id, path: `C:/work/${id}`, source: "local", lastAccessedAt: "2026-09-09T00:00:00Z", toolUsages: [],
+    }));
+    window.__TAURI__ = {
+      core: { invoke: async (command, payload) => {
+        if (command === "local_index_exists") return true;
+        if (command === "list_projects") return projects;
+        if (command === "list_group_assignments") return { one: 1 };
+        if (command === "list_groups") return [{ id: 1, name: "Manual group", position: 0 }];
+        if (command === "get_group_revision") return 0;
+        if (command === "get_git_info") return { isRepo: false, remotes: [] };
+        if (command === "get_git_repository_group") {
+          window.__repoCalls.push(payload);
+          if (payload.path.endsWith("failed")) throw new Error("unavailable");
+          return payload.path.endsWith("none") ? null : "github.com/team/shared";
+        }
+        if (command.startsWith("set_group") || command === "assign_project_group") window.__groupWrites.push(command);
+        return [];
+      } },
+      event: { listen: async () => () => {} },
+      window: { getCurrentWindow: () => ({ isMaximized: async () => false }) },
+    };
+  });
+  await page.goto("/index.html");
+  await expect(page.locator("article.entry")).toHaveCount(4);
+  expect(await page.evaluate(() => window.__repoCalls.length)).toBe(0);
+  await page.locator('[data-project-order="git"]').click();
+  await expect(page.locator('.ledger__group[data-group-key="git:repo:github.com/team/shared"]')).toContainText("2");
+  await expect(page.locator('.ledger__group[data-group-key="git:none"]')).toBeVisible();
+  await expect(page.locator('.ledger__group[data-group-key="git:error"]')).toBeVisible();
+  await expect(page.locator("article.entry")).toHaveCount(4);
+  const group = page.locator('.ledger__group[data-group-key="git:repo:github.com/team/shared"]');
+  await group.click();
+  await expect(page.locator("article.entry")).toHaveCount(2);
+  await group.click();
+  await expect(page.locator("article.entry")).toHaveCount(4);
+  await expect(page.locator('article.entry[draggable="true"]')).toHaveCount(0);
+  expect(await page.evaluate(() => window.__repoCalls.length)).toBe(4);
+  await page.locator('[data-project-order="grouped"]').click();
+  await expect(page.locator('.ledger__group[data-group-key="1"]')).toContainText("Manual group");
+  expect(await page.evaluate(() => window.__groupWrites)).toEqual([]);
+});
+
+test("official harness artwork loads locally in both app themes", async ({ page }) => {
+  const failures = [];
+  page.on("response", response => {
+    if (response.url().includes("/tool-icons/") && !response.ok()) failures.push(response.url());
+  });
+  await page.goto("/index.html");
+  for (const theme of ["dark", "light"]) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme);
+    for (const key of ["claude", "codex", "kimi", "opencode", "aider", "pi"]) {
+      const mark = page.locator(`#filters [data-tool="${key}"] .tool-icon--brand`);
+      await expect(mark).toBeVisible();
+      await expect(mark).toHaveAttribute("aria-label", key);
+      if (key === "pi") {
+        await expect(mark.locator(".tool-icon__mask")).toHaveCSS("mask-image", /pi\.svg/);
+      } else {
+        const artwork = mark.locator("img:visible");
+        await expect(artwork).toHaveCount(1);
+        await expect.poll(() => artwork.evaluate(img => img.complete && img.naturalWidth > 0)).toBe(true);
+      }
+    }
+  }
+  expect(failures).toEqual([]);
+});
+
 test("browser demo loads the real static application", async ({ page }) => {
   const errors = [];
   const externalRequests = [];

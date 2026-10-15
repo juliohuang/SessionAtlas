@@ -17,11 +17,14 @@
    base key is absent but a suffixed variant exists.
    ============================================================ */
 
+import { REVIEW_STRINGS } from "./project-review.js";
+
 export const LANGS = ["en", "zh"];
 const DEFAULT_LANG = "en";
 
 const STRINGS = {
   en: {
+    ...REVIEW_STRINGS.en,
     // ── generic ──
     "common.loading": "loading…",
     "common.close": "Close",
@@ -72,6 +75,11 @@ const STRINGS = {
     "filter.orderRecent": "Recent",
     "filter.orderName": "Name",
     "filter.orderGrouped": "Groups",
+    "filter.orderGit": "Git repos",
+    "filter.orderGitHint": "Group by remote repository, preferring origin. Click again to retry failed reads.",
+    "group.gitPending": "Reading repository addresses…",
+    "group.gitError": "Repository unavailable · click Git repos to retry",
+    "group.gitNone": "No supported remote repository",
     "filter.orderPriorityHint": "Live, available, recently active, and frequently used projects first",
     "filter.orderGroupedHint": "Show groups and enable drag-to-adjust manual order",
     "filter.byInstrument": "filter by instrument",
@@ -397,7 +405,16 @@ const STRINGS = {
     "tui.updateCheckFailed": "Update check failed",
     "tui.updateAvailable": "Version {version} is available",
     "tui.upToDate": "Latest version {version}",
+    "tui.toolbarUpdate": "UPDATE",
+    "tui.toolbarUpdateHint": "{tool} on this computer: {current} → {latest}. Open update settings",
     "tui.upgrade": "UPGRADE",
+    "tui.confirmUpgradeTitle": "Upgrade {tool}",
+    "tui.confirmInstallTitle": "Install {tool}",
+    "tui.confirmChangeDescription": "The package manager will install or update this tool on the selected machine.",
+    "tui.confirmDetails": "Package details",
+    "tui.confirmCancel": "Cancel",
+    "tui.confirmUpgradeAction": "Upgrade now",
+    "tui.confirmInstallAction": "Install now",
     "tui.upgrading": "UPGRADING…",
     "tui.upgradeWith": "Upgrade {package} with {manager}",
     "tui.upgradeConfirm": "Upgrade {tool} on {machine} to version {version} using the fixed {manager} package {package}? The package manager will modify that machine.",
@@ -523,6 +540,13 @@ const STRINGS = {
     "status.readFailed": "Failed to read {path}.",
 
     // ── terminal inline ──
+    "term.state.ready": "Ready",
+    "term.state.running": "Running",
+    "term.state.waiting": "Waiting for choice",
+    "term.state.completed": "Task completed",
+    "term.state.ended": "Ended",
+    "term.state.failed": "Failed",
+    "term.statusHint": "Activity inferred from terminal display; unknown output keeps the last state.",
     "term.sessionEnded": "[session ended]",
     "term.sessionEndedCode": "[session ended · exit {code}]",
     "term.streamFailed": "[terminal stream closed unexpectedly]",
@@ -596,6 +620,7 @@ const STRINGS = {
   },
 
   zh: {
+    ...REVIEW_STRINGS.zh,
     // ── generic ──
     "common.loading": "加载中…",
     "common.close": "关闭",
@@ -646,6 +671,11 @@ const STRINGS = {
     "filter.orderRecent": "最近",
     "filter.orderName": "名称",
     "filter.orderGrouped": "分组",
+    "filter.orderGit": "Git 仓库",
+    "filter.orderGitHint": "按远程仓库地址分组，优先 origin；再次点击可重试失败的读取",
+    "group.gitPending": "正在读取仓库地址…",
+    "group.gitError": "仓库读取失败 · 点击 Git 仓库重试",
+    "group.gitNone": "未配置支持的远程仓库",
     "filter.orderPriorityHint": "活动会话、目录可用、近期活跃且经常使用的项目优先",
     "filter.orderGroupedHint": "显示分组，并可拖动调整手动顺序",
     "filter.byInstrument": "按工具筛选",
@@ -966,7 +996,16 @@ const STRINGS = {
     "tui.updateCheckFailed": "版本检查失败",
     "tui.updateAvailable": "可升级到 {version}",
     "tui.upToDate": "已是最新版 {version}",
+    "tui.toolbarUpdate": "可更新",
+    "tui.toolbarUpdateHint": "本机 {tool}：{current} → {latest}，点击打开升级设置",
     "tui.upgrade": "升级",
+    "tui.confirmUpgradeTitle": "升级 {tool}",
+    "tui.confirmInstallTitle": "安装 {tool}",
+    "tui.confirmChangeDescription": "确认后将通过软件包管理器，在所选机器上安装或更新此工具。",
+    "tui.confirmDetails": "软件包详情",
+    "tui.confirmCancel": "取消",
+    "tui.confirmUpgradeAction": "立即升级",
+    "tui.confirmInstallAction": "立即安装",
     "tui.upgrading": "升级中…",
     "tui.upgradeWith": "使用 {manager} 升级 {package}",
     "tui.upgradeConfirm": "要在 {machine} 上使用固定的 {manager} 软件包 {package} 把 {tool} 升级到 {version} 吗？软件包管理器将修改这台机器。",
@@ -1088,6 +1127,13 @@ const STRINGS = {
     "status.readFailed": "读取 {path} 失败。",
 
     // ── terminal inline ──
+    "term.state.ready": "就绪",
+    "term.state.running": "运行中",
+    "term.state.waiting": "等待选择",
+    "term.state.completed": "任务完成",
+    "term.state.ended": "已结束",
+    "term.state.failed": "失败",
+    "term.statusHint": "根据终端画面推断活动；无法识别的输出保留上次状态。",
     "term.sessionEnded": "[会话已结束]",
     "term.sessionEndedCode": "[会话已结束 · 退出码 {code}]",
     "term.streamFailed": "[终端数据流意外关闭]",

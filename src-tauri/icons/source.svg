@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>SessionAtlas</title>
+  <desc>A folded atlas with a transparent terminal prompt cutout.</desc>
+  <defs>
+    <linearGradient id="panels" x1="0" x2="1">
+      <stop offset="50%" stop-color="#087F8C"/>
+      <stop offset="50%" stop-color="#B8EF45"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#panels)" fill-rule="evenodd" d="
+    M512 260 206 113Q136 82 136 162V852Q136 932 206 899L512 752 818 899Q888 932 888 852V162Q888 82 818 113Z
+    M362 360 521 482Q557 512 521 542L362 664Q302 701 302 635Q302 616 321 602L440 512 321 422Q302 408 302 389Q302 323 362 360Z
+    M576 622H704Q728 622 728 646V668Q728 692 704 692H576Q552 692 552 668V646Q552 622 576 622Z
+  "/>
+</svg>

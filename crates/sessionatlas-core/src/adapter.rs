@@ -381,6 +381,7 @@ pub struct RegisteredAdapter {
     pub available_versions: Vec<String>,
     pub rollback_version: Option<String>,
     pub newest_version: String,
+    default_enabled: bool,
 }
 
 impl Deref for RegisteredAdapter {
@@ -392,6 +393,12 @@ impl Deref for RegisteredAdapter {
 }
 
 impl RegisteredAdapter {
+    /// Selection belongs to the adapter identity, not the active version's
+    /// storage location. Imported updates retain the bundled identity's default.
+    pub fn is_enabled_by_default(&self) -> bool {
+        self.default_enabled
+    }
+
     pub fn update_available(&self) -> bool {
         Version::parse(&self.newest_version)
             .is_ok_and(|newest| newest > self.manifest.adapter_semver())
@@ -436,6 +443,9 @@ impl AdapterRegistry {
         }
         let mut adapters = Vec::new();
         for (id, mut versions) in grouped {
+            let default_enabled = versions
+                .iter()
+                .any(|candidate| candidate.source == AdapterSource::Bundled);
             versions.sort_by(|left, right| {
                 right
                     .manifest
@@ -492,6 +502,7 @@ impl AdapterRegistry {
                 available_versions,
                 rollback_version,
                 newest_version,
+                default_enabled,
             });
         }
         adapters.sort_by(|left, right| adapter_order(&left.id).cmp(&adapter_order(&right.id)));
@@ -538,14 +549,14 @@ impl AdapterRegistry {
         config: &'a AppConfig,
     ) -> impl Iterator<Item = &'a RegisteredAdapter> {
         self.adapters.iter().filter(move |adapter| {
-            config.enabled_adapters.as_ref().map_or(
-                adapter.source == AdapterSource::Bundled,
-                |enabled| {
+            config
+                .enabled_adapters
+                .as_ref()
+                .map_or(adapter.is_enabled_by_default(), |enabled| {
                     enabled
                         .iter()
                         .any(|id| id.eq_ignore_ascii_case(&adapter.id))
-                },
-            )
+                })
         })
     }
 }
@@ -993,6 +1004,23 @@ mod tests {
         assert_eq!(codex.source, AdapterSource::Local);
         assert_eq!(codex.rollback_version.as_deref(), Some("1.0.0"));
 
+        // Upgrading, rolling back, and reactivating must retain both implicit
+        // defaults and explicit user selections, regardless of version source.
+        for version in ["1.1.0", "1.0.0", "1.1.0"] {
+            config
+                .active_adapter_versions
+                .insert("codex".to_string(), version.to_string());
+            for selection in [None, Some(vec![]), Some(vec!["codex".to_string()])] {
+                config.enabled_adapters = selection;
+                let registry = AdapterRegistry::load(&root, &config).unwrap();
+                assert!(registry.find("codex").unwrap().is_enabled_by_default());
+                let selected = registry
+                    .enabled(&config)
+                    .any(|adapter| adapter.id == "codex");
+                assert_eq!(selected, config.enabled_adapters != Some(vec![]));
+            }
+        }
+
         let older_source = temporary.path().join("codex-1.0.0.json");
         fs::write(&older_source, BUILTIN_MANIFESTS[2]).unwrap();
         let active_versions = BTreeMap::from([("codex".to_string(), "1.1.0".to_string())]);
@@ -1037,6 +1065,7 @@ mod tests {
         let config = AppConfig::default();
         let registry = AdapterRegistry::load(&root, &config).unwrap();
         assert!(registry.find("demo").is_some());
+        assert!(!registry.find("demo").unwrap().is_enabled_by_default());
         assert!(!registry
             .enabled(&config)
             .any(|adapter| adapter.id == "demo"));

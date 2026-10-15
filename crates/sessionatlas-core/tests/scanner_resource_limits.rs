@@ -1,5 +1,5 @@
 use std::sync::{atomic::AtomicBool, Arc};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 #[cfg(unix)]
 use sessionatlas_core::model::ToolSource;
@@ -9,7 +9,7 @@ use sessionatlas_core::scanner::custom::CustomToolScanner;
 use sessionatlas_core::scanner::kimi::KimiScanner;
 use sessionatlas_core::scanner::{
     bounded_recursive_files, BudgetError, ScanBudget, ScanContext, ScanStatus, Scanner,
-    SCAN_CANCELLED, SCAN_RESOURCE_LIMIT_EXCEEDED,
+    MISSING_PROJECT_PATH, SCAN_CANCELLED, SCAN_RESOURCE_LIMIT_EXCEEDED,
 };
 #[cfg(unix)]
 use sessionatlas_core::scanner::{probe_directory, SourceProbe};
@@ -69,6 +69,206 @@ fn scanner_resource_limit_fails_without_partial_projects() {
     assert_eq!(outcome.status(), ScanStatus::Failed);
     assert!(outcome.projects().is_empty());
     assert_eq!(outcome.diagnostics()[0].code, SCAN_RESOURCE_LIMIT_EXCEEDED);
+}
+
+#[test]
+fn codex_large_append_only_session_reads_only_the_metadata_head() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let metadata = format!(
+        r#"{{"timestamp":"2026-09-19T00:00:00Z","type":"session_meta","payload":{{"id":"large","cwd":{}}}}}
+"#,
+        serde_json::to_string(&project.to_string_lossy()).unwrap()
+    );
+    codex_file(
+        home.path(),
+        &format!("{metadata}{}\n", "x".repeat(300 * 1024)),
+    );
+    let budget = ScanBudget::with_limits(
+        32,
+        200_000,
+        100_000,
+        4 * 1024,
+        4 * 1024,
+        4 * 1024,
+        100,
+        Duration::from_secs(60),
+    );
+
+    let outcome = with_home(home.path(), || {
+        CodexScanner::with_availability(|| true)
+            .with_budget(budget)
+            .scan()
+    });
+
+    assert_eq!(outcome.status(), ScanStatus::Succeeded);
+    assert_eq!(outcome.projects().len(), 1);
+    assert_eq!(outcome.projects()[0].session_id.as_deref(), Some("large"));
+}
+
+#[test]
+fn codex_rollout_over_default_file_budget_keeps_metadata_project() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let record = format!(
+        r#"{{"timestamp":"2026-09-19T00:00:00Z","type":"session_meta","payload":{{"id":"over-default","cwd":{}}}}}
+"#,
+        serde_json::to_string(&project.to_string_lossy()).unwrap()
+    );
+    codex_file(home.path(), &record);
+    let path = home.path().join(".codex/sessions/2026/08/26/session.jsonl");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+
+    let outcome = with_home(home.path(), || {
+        CodexScanner::with_availability(|| true).scan()
+    });
+
+    assert_eq!(outcome.status(), ScanStatus::Succeeded);
+    assert_eq!(outcome.projects().len(), 1);
+    assert_eq!(
+        outcome.projects()[0].session_id.as_deref(),
+        Some("over-default")
+    );
+}
+
+#[test]
+fn codex_large_metadata_head_accepts_a_long_first_record() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let record = serde_json::json!({
+        "timestamp": "2026-09-19T00:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": "long-head",
+            "cwd": project,
+            "padding": "x".repeat(300 * 1024)
+        }
+    });
+    codex_file(
+        home.path(),
+        &format!("{}\n", serde_json::to_string(&record).unwrap()),
+    );
+
+    let outcome = with_home(home.path(), || {
+        CodexScanner::with_availability(|| true).scan()
+    });
+
+    assert_eq!(outcome.status(), ScanStatus::Succeeded);
+    assert_eq!(outcome.projects().len(), 1);
+    assert_eq!(
+        outcome.projects()[0].session_id.as_deref(),
+        Some("long-head")
+    );
+}
+
+#[test]
+fn codex_oversized_rollout_without_metadata_is_bounded_before_next_file() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let sessions = home.path().join(".codex/sessions/2026/08/26");
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let mut prefix = Vec::with_capacity(300 * 1024);
+    while prefix.len() < 300 * 1024 {
+        prefix.extend_from_slice(b"{}\n");
+    }
+    let large = sessions.join("a-large.jsonl");
+    std::fs::write(&large, prefix).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&large)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+
+    let valid = format!(
+        r#"{{"timestamp":"2026-09-19T00:00:00Z","type":"session_meta","payload":{{"id":"valid-after-large","cwd":{}}}}}
+"#,
+        serde_json::to_string(&project.to_string_lossy()).unwrap()
+    );
+    std::fs::write(sessions.join("z-valid.jsonl"), valid).unwrap();
+
+    let outcome = with_home(home.path(), || {
+        CodexScanner::with_availability(|| true).scan()
+    });
+
+    assert_eq!(outcome.status(), ScanStatus::Succeeded);
+    assert_eq!(outcome.projects().len(), 1);
+    assert_eq!(
+        outcome.projects()[0].session_id.as_deref(),
+        Some("valid-after-large")
+    );
+    assert!(outcome
+        .diagnostics()
+        .iter()
+        .any(|diagnostic| diagnostic.code == MISSING_PROJECT_PATH));
+}
+
+#[test]
+fn codex_parser_upgrade_invalidates_v2_cache_for_auxiliary_classification() {
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let record = format!(
+        r#"{{"timestamp":"2026-09-19T00:00:00Z","type":"session_meta","payload":{{"id":"actual-child","cwd":{},"thread_source":"subagent","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"parent"}}}}}}}}}}
+"#,
+        serde_json::to_string(&project.to_string_lossy()).unwrap()
+    );
+    codex_file(home.path(), &record);
+    let source = home.path().join(".codex/sessions/2026/08/26/session.jsonl");
+    let metadata = std::fs::metadata(&source).unwrap();
+    let modified_ns = metadata
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_string();
+    let source_key = if cfg!(windows) {
+        source
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+    } else {
+        source.to_string_lossy().into_owned()
+    };
+    let cache_path = home.path().join(".sessionatlas/scanner-cache-v1.json");
+    std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            format!("codex:{source_key}"): {
+                "parser_version": 2,
+                "size_bytes": metadata.len(),
+                "modified_ns": modified_ns,
+                "projects": [{
+                    "path": "stale-cached-path",
+                    "last_accessed_at": "2026-09-19T00:00:00Z",
+                    "session_id": "stale-v2-id",
+                    "git_branch": null
+                }]
+            }
+        }
+    });
+    std::fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+    let outcome = with_home(home.path(), || {
+        CodexScanner::with_availability(|| true).scan()
+    });
+
+    assert_eq!(outcome.status(), ScanStatus::Succeeded);
+    assert_eq!(outcome.projects().len(), 1);
+    assert_eq!(outcome.projects()[0].path, project.to_string_lossy());
+    assert_eq!(outcome.projects()[0].session_id, None);
 }
 
 #[test]

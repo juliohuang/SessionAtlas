@@ -118,9 +118,14 @@ Adapter activation and TUI installation are separate version domains:
 - the detected command version controls the installed third-party TUI package.
 
 Local adapter selections are stored in `config.json`; remote selections are
-stored per SSH server in `prefs.db`. Bundled adapters are selected by default,
-while newly imported custom adapters start unselected. Selection alone never
-makes a command launchable: the backend requires the adapter to support the
+stored per SSH server in `prefs.db`. Official adapter identities are selected
+by default, including when a local update is active; updating or rolling back
+an adapter preserves explicit enable/disable choices. Newly imported custom
+adapters start unselected. Capability refresh probes all supported active
+adapters independently of selection, so a disabled or manually installed tool
+can be detected and enabled without reinstalling it. Detection does not change
+selection. Unsupported platforms and remote-disabled adapters are not probed.
+Selection alone never makes a command launchable: the backend requires the adapter to support the
 machine and the TUI executable to be detected before it can be enabled.
 
 If a manifest declares a supported fixed package manager, “Install” runs that

@@ -1,6 +1,6 @@
 [package]
 name = "sessionatlas-tauri"
-version = "0.1.0"
+version = "0.1.1"
 description = "SessionAtlas — AI CLI Project Workspace"
 edition = "2021"
 license = "Apache-2.0"

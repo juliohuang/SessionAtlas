@@ -7,6 +7,7 @@
 
 import { t as tr, currentLang, currentLocaleTag } from "./i18n.js";
 import { iconSvg, TOOL_ICONS, FILETYPE_ICONS } from "./icons.js";
+import { createProjectReviewPanel } from "./project-review.js";
 import {
   activateTerminalHttpLink,
   buildPtyAttachRequest,
@@ -29,6 +30,7 @@ import {
   sortProjects,
   sortProjectsForView,
   terminalSessionKey,
+  terminalScreenStatus,
 } from "./core.js";
 
 const { invoke } = window.__TAURI__?.core ?? {};
@@ -63,7 +65,7 @@ function isoDay(n){return new Date(Date.now()-n*86400000).toISOString()}
 
 const LIST_LIMIT = 10000;
 const PROJECT_ORDER_KEY = "sessionatlas.projectOrder";
-const PROJECT_ORDER_MODES = new Set(["priority", "recent", "name", "grouped"]);
+const PROJECT_ORDER_MODES = new Set(["priority", "recent", "name", "grouped", "git"]);
 
 function loadProjectOrder() {
   try {
@@ -172,28 +174,72 @@ const entryTreeGate = createLatestRequestGate();
 const docModalGate = createLatestRequestGate();
 const leftTreeGate = createLatestRequestGate();
 
-/* ── tool visuals ───────────────────────────────────────── */
-const TOOL_DOT = { claude:"dot--claude", codex:"dot--codex", kimi:"dot--kimi", opencode:"dot--opencode", aider:"dot--aider", pi:"dot--pi" };
-const TOOL_COLOR = { claude:"#d97757", codex:"#10a37f", kimi:"#6c8aff", opencode:"#e8b339", aider:"#c6f24e", pi:"#f472b6" };
-// Two-letter monograms used in the .tool-icon tile. Short, all-caps, and
-// distinct so each tool is recognisable in a 16×16 chip. Plain shell
-// gets "SH" so the generic strip is also branded.
-const TOOL_LABEL = { claude:"CL", codex:"CX", kimi:"KM", opencode:"OC", aider:"AI", pi:"PI", shell:"SH" };
-// Small monogram tile used in the right-side commands strip title and
-// the session tab pills. Tools with a collected brand logo (claude/codex/
-// kimi) render as a single-color brand-glyph SVG tinted with the tool's
-// accent colour; the rest keep the 2-letter monogram tile. The coloured
-// .dot indicators elsewhere carry the same accent for consistency.
-function toolIcon(key) {
-  const color = TOOL_COLOR[key] || "var(--bone-mute)";
-  const iconKey = TOOL_ICONS[key];
-  if (iconKey) {
-    return `<span class="tool-icon tool-icon--brand" style="color:${color}" title="${escapeHtml(key || "")}">${iconSvg(iconKey, { size: 13 })}</span>`;
-  }
-  const label = TOOL_LABEL[key] || (key ? key.slice(0, 2).toUpperCase() : "?");
-  return `<span class="tool-icon" style="background:${color}" title="${escapeHtml(key || "")}">${label}</span>`;
+const projectReview = createProjectReviewPanel({
+  invoke, hasTauri: HAS_TAURI, tr,
+  canLaunch: canLaunchTui,
+  launchReason: (project, toolKey) => {
+    const capability = tuiCapabilityForProject(project, toolKey);
+    if (!capability) return "tool_checking";
+    if (capability.supported === false) return "unsupported_platform";
+    if (!capability.installed) return "tool_missing";
+    if (!capability.enabled) return "tool_disabled";
+    return "check_failed";
+  },
+  launch: launchReviewedSession,
+  onError: () => {}, // The panel keeps errors beside the action and offers retry.
+});
+document.addEventListener("click", event => {
+  const button = event.target.closest("[data-project-history], [data-project-changes]");
+  if (!button) return;
+  const id = button.dataset.projectHistory ?? button.dataset.projectChanges;
+  const project = state.all.find(item => String(item.id) === id);
+  if (project) projectReview.open(project, button.hasAttribute("data-project-changes") ? "changes" : "history");
+});
+
+function projectReviewButtons(project) {
+  const id = escapeHtml(String(project.id));
+  return `<div class="entry__expanded__shell">
+    <button class="launch-pill launch-pill--ghost" data-project-history="${id}">${escapeHtml(tr("review.history"))}</button>
+    <button class="launch-pill launch-pill--ghost" data-project-changes="${id}">${escapeHtml(tr("review.changes"))}</button>
+  </div>`;
 }
-function toolDotClass(key){ return TOOL_DOT[key] || ""; }
+
+async function launchReviewedSession(project, usage) {
+  if (HAS_TAURI) {
+    const result = await invoke("check_session_resume", {
+      path: project.path, toolKey: usage.toolKey, sessionId: usage.lastSessionId || null,
+      serverId: project.source === "remote" ? project.remoteServerId : null,
+    });
+    if (!result?.ready) {
+      const reason = result?.reason || "check_failed";
+      const message = tr(`review.resumeReason.${reason}`);
+      throw new Error(`${message}${result?.detail ? `\n${result.detail}` : ""}`);
+    }
+  }
+  const tab = await openTerminalTab(project, usage, project.source !== "remote");
+  if (HAS_TAURI && (!tab || tab.dead || tab.project?.id !== project.id
+      || tab.usage?.toolKey !== usage.toolKey)) throw new Error(tr("review.resumeReason.launch_failed"));
+  return tab;
+}
+
+/* ── tool visuals ───────────────────────────────────────── */
+const TOOL_COLOR = { claude:"#d97757", codex:"#10a37f", kimi:"#6c8aff", opencode:"#e8b339", aider:"#c6f24e", pi:"#f472b6" };
+// Official artwork is bundled locally; unfamiliar adapters retain a safe fallback.
+function toolIcon(key) {
+  const asset = Object.hasOwn(TOOL_ICONS, key) ? TOOL_ICONS[key] : null;
+  const title = escapeHtml(key || "shell");
+  if (asset) {
+    const artwork = key === "pi"
+      ? '<span class="tool-icon__mask" aria-hidden="true"></span>'
+      : `<img src="vendor/tool-icons/${asset}" width="18" height="18" alt="" draggable="false">${key === "opencode" ? '<img class="tool-icon__light" src="vendor/tool-icons/opencode-light.svg" width="18" height="18" alt="" draggable="false">' : ""}`;
+    return `<span class="tool-icon tool-icon--brand tool-icon--${key}" role="img" aria-label="${title}" title="${title}">${artwork}</span>`;
+  }
+  if (!key || key === "shell") {
+    return `<span class="tool-icon tool-icon--brand" role="img" aria-label="${title}" title="${title}">${iconSvg("terminal")}</span>`;
+  }
+  const label = escapeHtml(key.slice(0, 2).toUpperCase());
+  return `<span class="tool-icon" style="background:var(--bone-mute)" role="img" aria-label="${title}" title="${title}">${label}</span>`;
+}
 function toolColor(key){
   if (TOOL_COLOR[key]) return TOOL_COLOR[key];
   let h = 0;
@@ -499,11 +545,16 @@ const DIALOG_FOCUSABLE = [
   "input:not([disabled])",
   "select:not([disabled])",
   "textarea:not([disabled])",
+  "summary",
   "a[href]",
   '[tabindex]:not([tabindex="-1"])',
 ].join(",");
 
 function visibleDialog() {
+  const review = document.querySelector(".project-review:not([hidden])");
+  if (review) return review;
+  const confirmation = document.querySelector("dialog.tool-confirm[open]");
+  if (confirmation) return confirmation;
   return [
     document.getElementById("docModal"),
     entryModal,
@@ -553,6 +604,7 @@ function disabledTuiAttrs(project, toolKey) {
 const _tuiProbeQueue = [];
 const _tuiProbeInflight = new Map();
 let _tuiProbeActive = 0;
+let _localTuiUpdateStarted = false;
 
 function drainTuiProbeQueue() {
   while (_tuiProbeActive < TUI_PROBE_CONCURRENCY && _tuiProbeQueue.length) {
@@ -636,6 +688,13 @@ async function probeTuiMachine(serverId, force, deferRender) {
   } finally {
     state.tuiCapabilityAt[key] = Date.now();
     state.tuiLoadingKeys.delete(key);
+    renderTools();
+    projectReview.refreshCapabilities?.();
+    if (serverId == null && HAS_TAURI && !_localTuiUpdateStarted
+        && state.tuiMachines[key]?.tools?.some(tool => tool.installed)) {
+      _localTuiUpdateStarted = true;
+      void checkTuiMachineUpdates(null, { quiet: true });
+    }
     if (!deferRender) {
       if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
       applyFilters();
@@ -644,16 +703,18 @@ async function probeTuiMachine(serverId, force, deferRender) {
   }
 }
 
-async function checkTuiMachineUpdates(serverId) {
+async function checkTuiMachineUpdates(serverId, { quiet = false } = {}) {
   const key = tuiMachineKey(serverId);
   if (state.tuiCheckingKeys.has(key)) return state.tuiMachines[key] || null;
   if (!state.tuiMachines[key]) await refreshTuiMachine(serverId, { force: true });
+  if (state.tuiCheckingKeys.has(key)) return state.tuiMachines[key] || null;
+  const initialCapabilities = state.tuiMachines[key];
   state.tuiCheckingKeys.add(key);
   if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
   const label = state.tuiMachines[key]?.label
     || (serverId == null ? tr("tui.localMachine") : state.remoteServerById[serverId]?.label)
     || tr("tui.sourceRemote");
-  setStatus(tr("status.tuiCheckingUpdates", { machine: label }));
+  if (!quiet) setStatus(tr("status.tuiCheckingUpdates", { machine: label }));
   try {
     let capabilities;
     if (HAS_TAURI) {
@@ -668,17 +729,21 @@ async function checkTuiMachineUpdates(serverId) {
         updateCheckError: null,
       }));
     }
+    // A delayed check must not undo a more recent install, toggle or probe.
+    if (state.tuiMachines[key] !== initialCapabilities) return state.tuiMachines[key];
+    if (!capabilities?.tools) throw new Error("Missing tool update results");
     state.tuiMachines[key] = { ...capabilities, error: null };
     state.tuiCapabilityAt[key] = Date.now();
     const updates = capabilities.tools?.filter(tool => tool.updateAvailable).length || 0;
     const errors = capabilities.tools?.filter(tool => tool.installed && tool.updateCheckError).length || 0;
-    setStatus(tr("status.tuiUpdatesChecked", { machine: capabilities.label || label, updates, errors }));
+    if (!quiet) setStatus(tr("status.tuiUpdatesChecked", { machine: capabilities.label || label, updates, errors }));
     return capabilities;
   } catch (error) {
-    showActionError(tr("status.tuiUpdateCheckFailed", { err: error }));
+    if (!quiet) showActionError(tr("status.tuiUpdateCheckFailed", { err: error }));
     return state.tuiMachines[key] || null;
   } finally {
     state.tuiCheckingKeys.delete(key);
+    renderTools();
     if (!drawer.hidden && state.settingsView === "tui") renderDrawerBody();
   }
 }
@@ -886,7 +951,7 @@ function groupHeaderHtml(name, count, key) {
   const arrow = collapsed ? "▸" : "▾";
   return `<div class="ledger__group" data-group-toggle data-group-key="${escapeHtml(String(key))}" role="button" tabindex="0" aria-expanded="${!collapsed}">
             <span class="ledger__group__arrow">${arrow}</span>
-            <span class="ledger__group__name">${escapeHtml(name)}</span>
+            <span class="ledger__group__name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
             <span class="ledger__group__count">${count}</span>
           </div>`;
 }
@@ -901,9 +966,62 @@ function activeTabsByProject() {
   return result;
 }
 
+const repositoryGroups = new Map();
+let repositoryGroupsLoading = false;
+function repositoryCacheKey(project) {
+  return JSON.stringify([project.source || "local", project.remoteServerId ?? null, project.path]);
+}
+function repositoryGroupFor(project) {
+  const result = repositoryGroups.get(repositoryCacheKey(project));
+  if (!result) return { key: "git:pending", name: tr("group.gitPending") };
+  if (result.error) return { key: "git:error", name: tr("group.gitError") };
+  if (!result.repository) return { key: "git:none", name: tr("group.gitNone") };
+  return { key: `git:repo:${result.repository}`, name: result.repository };
+}
+async function ensureRepositoryGroups() {
+  if (repositoryGroupsLoading || state.projectOrder !== "git") return;
+  const projects = [...new Map(state.all.map(project => [repositoryCacheKey(project), project])).values()]
+    .filter(project => Date.now() - (repositoryGroups.get(repositoryCacheKey(project))?.at || 0) > 300_000);
+  if (!projects.length) return;
+  repositoryGroupsLoading = true;
+  let cursor = 0;
+  try {
+    await Promise.all(Array.from({ length: 2 }, async () => {
+      while (cursor < projects.length && state.projectOrder === "git") {
+        const project = projects[cursor++];
+        const key = repositoryCacheKey(project);
+        try {
+          const repository = HAS_TAURI
+            ? await invoke("get_git_repository_group", { path: project.path, serverId: project.source === "remote" ? Number(project.remoteServerId) : null })
+            : `github.com/demo/${project.name}`;
+          repositoryGroups.set(key, { repository, at: Date.now() });
+        } catch {
+          repositoryGroups.set(key, { error: true, at: Date.now() });
+        }
+        if (state.projectOrder === "git") applyFilters();
+      }
+    }));
+  } finally {
+    repositoryGroupsLoading = false;
+    if (state.projectOrder === "git") void ensureRepositoryGroups();
+  }
+}
+
 function buildLedgerModel() {
   const matching = state.all.filter(matchesFilters);
   const activeTabs = activeTabsByProject();
+  if (state.projectOrder === "git") {
+    const buckets = new Map();
+    for (const project of matching) {
+      const group = repositoryGroupFor(project);
+      if (!buckets.has(group.key)) buckets.set(group.key, { ...group, items: [] });
+      buckets.get(group.key).items.push(project);
+    }
+    const sections = [...buckets.values()].sort((left, right) => left.name.localeCompare(right.name));
+    for (const section of sections) sortProjectsForView(section.items, "recent", state.sortOrders);
+    const ordered = sections.flatMap(section => isGroupCollapsed(section.key) ? [] : section.items);
+    return { matching, ordered, sections, activeTabs };
+  }
   if (state.projectOrder !== "grouped") {
     const ordered = sortProjectsForView(
       [...matching],
@@ -1018,6 +1136,8 @@ let _ledgerCompactProjectHeight = LEDGER_PROJECT_HEIGHT;
 let ledgerRenderContext = { activeTabs: new Map() };
 
 function ledgerVisibleRows() {
+  if (state.projectOrder === "git") return state.ledgerRows.filter(row =>
+    row.type === "group" || !isGroupCollapsed(repositoryGroupFor(row.project).key));
   if (state.projectOrder !== "grouped") return state.ledgerRows;
   return state.ledgerRows.filter(row =>
     row.type === "group" || !isGroupCollapsed(groupKeyOf(row.project)));
@@ -1347,7 +1467,7 @@ function entryHtml(p, renderContext) {
   const topUsage = (p.toolUsages || [])[0];
   const dotKey = topUsage?.toolKey;
   const dot = dotKey
-    ? `<i class="entry__tool-dot ${toolDotClass(dotKey)}" style="background:${toolColor(dotKey)}"></i>`
+    ? `${toolIcon(dotKey)}`
     : "";
   // Mark projects that have at least one open terminal session, so the
   // user can tell at a glance which rows have a live process running.
@@ -1359,9 +1479,11 @@ function entryHtml(p, renderContext) {
   const sessionTools = hasSession
     ? Array.from(new Set(openTabs.map(t => t.usage?.toolKey || "shell"))).join(", ")
     : "";
-  const sessionMarker = hasSession
-    ? `<span class="entry__session" title="${escapeHtml(tr("entry.sessionMarker", { count: openTabs.length, tools: sessionTools }))}"></span>`
-    : "";
+  const statusTabs = state.tabs.filter(t => t.kind === "pty" && t.project?.id === p.id);
+  const priority = ["waiting", "failed", "running", "completed", "ready", "ended"];
+  const statusTab = statusTabs.sort((a, b) => priority.indexOf(a.taskStatus || "ready") - priority.indexOf(b.taskStatus || "ready"))[0];
+  const sessionMarker = statusTab ? terminalStatusBadge(statusTab,
+    hasSession ? tr("entry.sessionMarker", { count: openTabs.length, tools: sessionTools }) : "") : "";
   const isMenuOpen = state.menuOpenId === p.id;
   const isExpanded = state.expandedId === p.id;
   // Per-tool session panel — one card per recorded tool usage. The Resume
@@ -1383,19 +1505,21 @@ function entryHtml(p, renderContext) {
         </button>
         <span class="entry__folder" aria-hidden="true">${folderIconSvg()}</span>
         <div class="entry__identity">
-          <div class="entry__name">${escapeHtml(p.name)}</div>
+          <div class="entry__name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div>
           ${contentMatch}
         </div>
         ${missingBadge}
-        ${projectSourceBadgeHtml(p, "entry__source")}
-        ${projectGitSyncBadgeHtml(p)}
       </div>
       <div class="entry__meta-col">
+        <button class="entry__tree-btn" data-tree-btn draggable="false" aria-label="${escapeHtml(tr("entry.showFileTree"))}" title="${escapeHtml(tr("entry.showFileTree"))}">${ICON_FILES}</button>
+        <button class="entry__menu-btn" data-menu-toggle draggable="false" aria-label="${escapeHtml(tr("entry.more"))}" title="${escapeHtml(tr("entry.more"))}">⋯</button>
+      </div>
+      <div class="entry__details">
+        ${projectSourceBadgeHtml(p, "entry__source")}
         ${sessionMarker}
         ${dot}
         <div class="entry__time">${t}</div>
-        <button class="entry__tree-btn" data-tree-btn draggable="false" aria-label="${escapeHtml(tr("entry.showFileTree"))}" title="${escapeHtml(tr("entry.showFileTree"))}">${ICON_FILES}</button>
-        <button class="entry__menu-btn" data-menu-toggle draggable="false" aria-label="${escapeHtml(tr("entry.more"))}" title="${escapeHtml(tr("entry.more"))}">⋯</button>
+        ${projectGitSyncBadgeHtml(p)}
       </div>
       ${expandedPanel}
     </article>`;
@@ -1416,7 +1540,7 @@ function entryExpandedPanelHtml(p) {
     const actionClass = canResume ? "" : " launch-pill--ghost";
     return `
       <div class="session-card${activityOnlyClass}">
-        <i class="session-card__dot ${toolDotClass(u.toolKey)}" style="background:${toolColor(u.toolKey)}"></i>
+        ${toolIcon(u.toolKey)}
         <div class="session-card__info">
           <div class="session-card__name">${escapeHtml(u.toolName)}</div>
           <div class="session-card__meta">
@@ -1465,6 +1589,7 @@ function entryExpandedPanelHtml(p) {
         ${existingQueueTab ? `<div class="entry__expanded__queue-status">${escapeHtml(tr("queue.queueOpen", { idx: existingQueueTab.queueIdx + 1, total: existingQueueTab.queueTotal }))}</div>` : ""}
       </div>` : "";
   return `<div class="entry__expanded">
+      ${projectReviewButtons(p)}
       <div class="entry__expanded__label">${escapeHtml(tr("entry.label.openSession"))}</div>
       ${sessionCards || `<div class="entry__expanded__empty">${escapeHtml(tr("entry.noInstrumentsHint"))}</div>`}
       ${newToolPills ? `<div class="entry__expanded__new">
@@ -1498,13 +1623,13 @@ function entryMenuHtml(p, isOpen) {
   const usages = p.toolUsages || [];
   const sessAbbr = tr("entry.sessAbbr");
   const tags = usages.map(u =>
-    `<span class="tag"><i class="dot ${toolDotClass(u.toolKey)}" style="background:${toolColor(u.toolKey)}"></i>${escapeHtml(u.toolName)}<small>${u.sessionCount}${escapeHtml(sessAbbr).slice(0,1)}</small></span>`).join("");
+    `<span class="tag">${toolIcon(u.toolKey)}${escapeHtml(u.toolName)}<small>${u.sessionCount}${escapeHtml(sessAbbr).slice(0,1)}</small></span>`).join("");
   const branch = p.gitBranch
     ? `<span class="tag tag--branch">⎇ ${escapeHtml(p.gitBranch)}</span>` : "";
 
   const pills = usages.map(u =>
     `<button class="launch-pill" data-project-id="${escapeHtml(String(p.id))}" data-tool="${escapeHtml(u.toolKey)}" ${disabledTuiAttrs(p, u.toolKey)}>
-       <i class="dot ${toolDotClass(u.toolKey)}" style="background:${toolColor(u.toolKey)}"></i>
+       ${toolIcon(u.toolKey)}
        ${escapeHtml(u.toolName)}<small>${u.sessionCount} ${escapeHtml(sessAbbr)}</small>
      </button>`).join("");
 
@@ -1707,6 +1832,7 @@ function renderCommonCommands() {
 function sendToActivePty(cmd) {
   const tab = state.tabs.find(t => t.ptyId === state.activeTabId);
   if (!tab || tab.dead) { setStatus(tr("status.noActiveSession")); return; }
+  noteTerminalInput(tab, "\r");
   invoke("pty_write", { id: tab.ptyId, data: cmd + "\r" }).catch(e => setStatus(tr("status.writeFailed", { err: e })));
   // Focus the receiving terminal so the user sees the output appear.
   try { tab.term.focus(); } catch {}
@@ -2865,21 +2991,26 @@ function openProjectDefault(project) {
   openTerminalTab(project, usage);
 }
 
-function openTerminalTab(project, usage) {
+function openTerminalTab(project, usage, exactSession = false) {
   const toolKey = usage?.toolKey || "shell";
-  const existing = findOpenTerminalTab(state.tabs, project?.id, toolKey);
+  const findExisting = () => exactSession
+    ? state.tabs.find(tab => tab.kind === "pty" && !tab.dead && !tab.isQueue
+      && tab.project?.id === project?.id && tab.usage?.toolKey === toolKey
+      && (tab.usage?.lastSessionId || null) === (usage?.lastSessionId || null))
+    : findOpenTerminalTab(state.tabs, project?.id, toolKey);
+  const existing = findExisting();
   if (existing) {
     switchTab(existing.tabId);
     return Promise.resolve(existing);
   }
 
-  const key = terminalSessionKey(project?.id, toolKey);
+  const key = exactSession ? JSON.stringify([project?.id, toolKey, usage?.lastSessionId || null]) : terminalSessionKey(project?.id, toolKey);
   return coalescePending(
     state.openingPtys,
     key,
     () => {
       const openOrSwitch = () => {
-        const current = findOpenTerminalTab(state.tabs, project?.id, toolKey);
+        const current = findExisting();
         if (current) {
           switchTab(current.tabId);
           return current;
@@ -2903,9 +3034,7 @@ function openTerminalTab(project, usage) {
 }
 
 async function switchRemoteTerminalTab(tab, project, usage) {
-  const toolKey = usage?.toolKey || "shell";
-  const isShell = toolKey === "shell";
-  const title = isShell ? project.name : `${project.name} · ${toolKey}`;
+  const title = project.name;
   const serverLabel = state.remoteServerById[project.remoteServerId]?.label
     || project.remoteServerId;
   setStatus(tr("status.switchingRemoteSession", {
@@ -2930,6 +3059,8 @@ async function switchRemoteTerminalTab(tab, project, usage) {
 
   tab.project = project;
   tab.usage = usage;
+  tab.statusScreen = null;
+  setTerminalStatus(tab, "ready");
   tab.title = title;
   refreshTabButton(tab);
   switchTab(tab.tabId);
@@ -2953,8 +3084,7 @@ async function openTerminalTabOnce(project, usage) {
     showActionError(message);
     return;
   }
-  const isShell = toolKey === "shell";
-  const title = isShell ? project.name : `${project.name} · ${toolKey}`;
+  const title = project.name;
   setStatus(tr("status.openingTool", { tool: toolKey, name: project.name }));
 
   if (HAS_TAURI && !state.ptyEventsReady) {
@@ -3047,6 +3177,7 @@ async function openTerminalTabOnce(project, usage) {
   // Forward keystrokes to the PTY.
   term.onData((data) => {
     if (tab.dead || tab.switching) return;
+    noteTerminalInput(tab, data);
     invoke("pty_write", { id: ptyId, data }).catch(() => {});
   });
 
@@ -3067,6 +3198,7 @@ async function openTerminalTabOnce(project, usage) {
     // not a startup failure that should overwrite the current UI status.
     if (!state.tabs.includes(tab)) return;
     tab.dead = true;
+    setTerminalStatus(tab, "failed");
     try {
       term.write(`\r\n\x1b[31m${tr("term.startFailed", { err: e })}\x1b[0m\r\n`);
     } catch {}
@@ -3267,8 +3399,56 @@ function openWebTab(url, titleOverride = "") {
   return tab;
 }
 
+function terminalStatusBadge(tab, detail = "") {
+  const status = tab.taskStatus || (tab.dead ? "ended" : "ready");
+  const label = tr(`term.state.${status}`);
+  const title = [label, detail, tr("term.statusHint")].filter(Boolean).join(" · ");
+  const icon = `state${status[0].toUpperCase()}${status.slice(1)}`;
+  return `<span class="terminal-status terminal-status--${status}" data-terminal-status="${status}" role="img" aria-label="${escapeHtml(label)}" title="${escapeHtml(title)}">${iconSvg(icon, { size: 16 })}</span>`;
+}
+
+function setTerminalStatus(tab, status) {
+  if (tab.taskStatus === status) return;
+  tab.taskStatus = status;
+  if (!state.tabs.includes(tab)) return;
+  const badge = termsBar.querySelector(`.term-tab[data-tab-id="${CSS.escape(String(tab.tabId))}"] [data-terminal-status]`);
+  if (badge) badge.outerHTML = terminalStatusBadge(tab);
+  // Output-driven updates must never rebuild editable project rows.
+  const row = ledger.querySelector(projectEntrySelector(tab.project?.id));
+  if (!row) return;
+  const tabs = state.tabs.filter(t => t.kind === "pty" && t.project?.id === tab.project?.id);
+  const priority = ["waiting", "failed", "running", "completed", "ready", "ended"];
+  const leading = tabs.sort((a, b) => priority.indexOf(a.taskStatus || "ready") - priority.indexOf(b.taskStatus || "ready"))[0];
+  const live = tabs.filter(t => !t.dead);
+  row.classList.toggle("has-session", live.length > 0);
+  const projectBadge = row.querySelector("[data-terminal-status]");
+  if (projectBadge && leading) projectBadge.outerHTML = terminalStatusBadge(leading,
+    live.length ? tr("entry.sessionMarker", { count: live.length, tools: [...new Set(live.map(t => t.usage?.toolKey || "shell"))].join(", ") }) : "");
+}
+
+function observeTerminalScreen(tab) {
+  if (tab.dead || tab.switching || !state.tabs.includes(tab)) return;
+  const buffer = tab.term.buffer.active;
+  const lines = [];
+  for (let row = buffer.baseY; row < buffer.baseY + tab.term.rows; row++) {
+    lines.push(buffer.getLine(row)?.translateToString(true) || "");
+  }
+  const screen = lines.join("\n").trimEnd();
+  // Do not reuse a previous turn's prompt immediately after input submission.
+  if (screen === tab.statusScreen) return;
+  tab.statusScreen = screen;
+  const status = terminalScreenStatus(tab.usage?.toolKey, screen, tab.completionBaseline);
+  if (status) setTerminalStatus(tab, status);
+}
+
+function noteTerminalInput(tab, data) {
+  if (tab.composing) return;
+  if (/\r|\n|\x1b|\x03/.test(data)) tab.completionBaseline = tab.statusScreen || "";
+  if (/\r|\n/.test(data)) setTerminalStatus(tab, "running");
+}
+
 function tabButtonContent(tab) {
-  // Icon: tool monogram for pty tabs, VS Code-style file-type tile for
+  // Icon: official tool artwork for pty tabs, VS Code-style file-type tile for
   // file tabs, an "WB" tile for browser tabs.
   let icon;
   if (tab.kind === "file") {
@@ -3281,6 +3461,7 @@ function tabButtonContent(tab) {
   return `
     ${icon}
     <span class="term-tab__name">${escapeHtml(tab.title)}</span>
+    ${tab.kind === "pty" ? terminalStatusBadge(tab) : ""}
     <button class="term-tab__close" title="${escapeHtml(tr("terms.closeTab"))}">✕</button>`;
 }
 
@@ -3464,6 +3645,8 @@ function renderTermsTitle() {
 // active. It combines project facts, per-tool activity, launch actions,
 // group assignment, and links to every open workspace tab.
 function renderSelectedLaunchPanel() {
+  projectReview.refreshCapabilities?.();
+  renderTools();
   const project = state.selectedId
     ? state.all.find(p => p.id === state.selectedId)
     : null;
@@ -3544,13 +3727,14 @@ function renderSelectedLaunchPanel() {
     const projName = t.project?.name || t.title || "";
     const activeClass = t.tabId === state.activeTabId ? "is-active" : "";
     return `<button class="terms__other-tab ${activeClass}" data-switch-tab="${escapeHtml(String(t.tabId))}">
-              <i class="dot ${toolDotClass(dotKey)}" style="background:${toolColor(dotKey)}"></i>
+              ${toolIcon(dotKey)}
               <span class="terms__other-tab__name">${escapeHtml(t.title)}</span>
               <span class="terms__other-tab__proj">${escapeHtml(projName)}</span>
             </button>`;
   }).join("");
 
   termsSelectedLaunch.innerHTML = `
+    ${projectReviewButtons(project)}
     <div class="overview__hero">
       <div class="overview__project-mark">${escapeHtml(projectMark)}</div>
       <div class="overview__identity">
@@ -3690,23 +3874,24 @@ async function wirePtyEvents() {
       const { id, data } = ev.payload;
       const tab = state.tabs.find(t => t.ptyId === id);
       if (!tab) return;
-      try { tab.term.write(data); } catch {}
+      try { tab.term.write(data, () => observeTerminalScreen(tab)); } catch {}
     }),
     listen("pty-exit", (ev) => {
       const tab = state.tabs.find(t => t.ptyId === ev.payload.id);
       if (!tab) return;
-      // Queue tab: a pty-exit means the current prompt finished (claude -p
+      // Queue tab: only a clean zero exit finishes the current prompt (claude -p
       // runs to completion then exits). Fire a notification and, if more
       // prompts remain, spawn the next one into the SAME tab/terminal so
       // the user watches a continuous log. Only when the queue is drained
       // do we mark the tab dead like an ordinary session. This runs BEFORE
       // the dead guard so a finished prompt (which sets dead) still advances.
       if (tab.isQueue) {
-        advanceQueue(tab);
+        advanceQueue(tab, ev.payload);
         return;
       }
       if (tab.dead) return;
       tab.dead = true;
+      setTerminalStatus(tab, ev.payload.readError || (ev.payload.exitCode != null && ev.payload.exitCode !== 0) ? "failed" : "ended");
       const ended = ev.payload.exitCode == null
         ? tr("term.sessionEnded")
         : tr("term.sessionEndedCode", { code: ev.payload.exitCode });
@@ -3714,7 +3899,6 @@ async function wirePtyEvents() {
       try { tab.term.write(`\r\n\x1b[90m${ended}${suffix}\x1b[0m\r\n`); } catch {}
       const btn = termsBar.querySelector(`.term-tab[data-tab-id="${CSS.escape(String(tab.ptyId))}"]`);
       btn?.classList.add("is-dead");
-      renderLedger();
       updateCommonCommandsEnabled();
     }),
   ]);
@@ -3727,7 +3911,7 @@ async function wirePtyEvents() {
 // via pty_spawn with `claudePrint`); when it exits, advanceQueue() is
 // called from the pty-exit handler, which fires a notification and
 // spawns the next prompt into the SAME terminal so the output reads as
-// one continuous log. The tab title carries progress like "name · claude (2/5)".
+// one continuous log. The tab title carries progress like "name (2/5)".
 //
 // Detection reliability is the crux: print mode (`claude -p`) exits on
 // its own when the prompt is answered, so pty-exit == "task done" with
@@ -3830,6 +4014,8 @@ async function spawnQueuePrompt(tab) {
   });
   tab.ptyId = id;
   tab.started = true;
+  tab.statusScreen = null;
+  setTerminalStatus(tab, "running");
   tab.dead = false;
   // Re-bind keystrokes to the new process id. term.onData returns a
   // disposable; we hold the previous one and dispose it so we don't
@@ -3841,7 +4027,7 @@ async function spawnQueuePrompt(tab) {
 }
 
 // Refresh the tab button label to show queue progress, e.g.
-// "name · claude (2/5)". Called on each spawn and each advance.
+// "name (2/5)". Called on each spawn and each advance.
 function updateQueueTabTitle(tab) {
   const btn = termsBar.querySelector(`.term-tab[data-tab-id="${CSS.escape(String(tab.tabId))}"]`);
   if (!btn) return;
@@ -3852,7 +4038,12 @@ function updateQueueTabTitle(tab) {
 // Called from the pty-exit handler for queue tabs. Fires a notification,
 // advances to the next prompt (or finishes the queue), and keeps the
 // terminal alive across prompts.
-async function advanceQueue(tab) {
+async function advanceQueue(tab, result) {
+  if (tab.dead) return;
+  if (result.readError || result.exitCode !== 0) {
+    failQueue(tab, tr("term.sessionEndedCode", { code: result.exitCode ?? "?" }));
+    return;
+  }
   const doneIdx = tab.queueIdx + 1;
   const projectName = tab.project?.name || "";
   // Native notification for the just-finished prompt.
@@ -3869,7 +4060,7 @@ async function advanceQueue(tab) {
       setStatus(tr("queue.running", { idx: tab.queueIdx + 1, total: tab.queueTotal, name: projectName }));
     } catch (e) {
       try { tab.term.write(`\x1b[31m${escapeHtml(tr("queue.advanceFailed", { err: e }))}\x1b[0m\r\n`); } catch {}
-      finishQueue(tab);
+      failQueue(tab, String(e));
     }
   } else {
     finishQueue(tab);
@@ -3879,6 +4070,13 @@ async function advanceQueue(tab) {
 // Drain the queue: final notification + mark the tab dead (same visual
 // treatment as an ordinary ended session). New prompts can still be
 // appended later via appendQueuePrompts, which re-spawns.
+function failQueue(tab, error) {
+  tab.dead = true;
+  setTerminalStatus(tab, "failed");
+  updateCommonCommandsEnabled();
+  setStatus(tr("queue.advanceFailed", { err: error }));
+}
+
 function finishQueue(tab) {
   const projectName = tab.project?.name || "";
   fireNotify(
@@ -3886,6 +4084,7 @@ function finishQueue(tab) {
     tr("queue.notifyAllDoneBody", { count: tab.queueTotal })
   );
   tab.dead = true;
+  setTerminalStatus(tab, "completed");
   try {
     tab.term.write(`\r\n\x1b[1;32m${escapeHtml(tr("queue.allDone", { count: tab.queueTotal }))}\x1b[0m\r\n`);
     tab.term.write(`\x1b[90m${escapeHtml(tr("term.sessionEnded"))}\x1b[0m\r\n`);
@@ -3918,7 +4117,7 @@ async function appendQueuePrompts(tab, prompts) {
       setStatus(tr("queue.running", { idx: tab.queueIdx + 1, total: tab.queueTotal, name: tab.project?.name || "" }));
     } catch (e) {
       try { tab.term.write(`\x1b[31m${escapeHtml(tr("queue.advanceFailed", { err: e }))}\x1b[0m\r\n`); } catch {}
-      finishQueue(tab);
+      failQueue(tab, String(e));
     }
   } else {
     updateQueueTabTitle(tab);
@@ -4151,6 +4350,57 @@ function wireEntryMenuDelegation() {
 /* ── settings drawer ────────────────────────────────────── */
 const drawer = document.getElementById("drawer");
 const drawerBody = document.getElementById("drawerBody");
+const drawerActionAlert = document.createElement("div");
+drawerActionAlert.className = "drawer__action-alert";
+drawerActionAlert.hidden = true;
+drawerBody.before(drawerActionAlert);
+
+function clearDrawerActionError() {
+  drawerActionAlert.textContent = "";
+  drawerActionAlert.hidden = true;
+  drawerActionAlert.removeAttribute("role");
+}
+
+function confirmToolChange(tool, machine, upgrading) {
+  if (document.querySelector("dialog.tool-confirm")) return Promise.resolve(false);
+  const dialog = document.createElement("dialog");
+  dialog.className = "tool-confirm";
+  dialog.setAttribute("aria-labelledby", "toolConfirmTitle");
+  dialog.setAttribute("aria-describedby", "toolConfirmDescription");
+  const machineLabel = machine.source === "local" || machine.serverId == null
+    ? tr("tui.localMachine") : machine.label;
+  dialog.innerHTML = `
+    <form method="dialog">
+      <div class="tool-confirm__heading">${toolIcon(tool.toolKey)}<div>
+        <h2 id="toolConfirmTitle">${escapeHtml(tr(upgrading ? "tui.confirmUpgradeTitle" : "tui.confirmInstallTitle", { tool: tool.toolName }))}</h2>
+        <p>${escapeHtml(machineLabel)}</p>
+      </div></div>
+      ${upgrading ? `<div class="tool-confirm__versions"><span>${escapeHtml(tool.version || tr("tui.versionUnknown"))}</span><span aria-hidden="true">→</span><strong>${escapeHtml(tool.latestVersion || tr("tui.versionUnknown"))}</strong></div>` : ""}
+      <p class="tool-confirm__description" id="toolConfirmDescription">${escapeHtml(tr("tui.confirmChangeDescription"))}</p>
+      <details class="tool-confirm__details"><summary>${escapeHtml(tr("tui.confirmDetails"))}</summary><code>${escapeHtml(tool.installManager || "")} · ${escapeHtml(tool.installPackage || "")}</code></details>
+      <footer><button value="cancel" autofocus>${escapeHtml(tr("tui.confirmCancel"))}</button><button class="tool-confirm__primary" value="confirm">${escapeHtml(tr(upgrading ? "tui.confirmUpgradeAction" : "tui.confirmInstallAction"))}</button></footer>
+    </form>`;
+  document.body.appendChild(dialog);
+  return new Promise(resolve => {
+    dialog.addEventListener("keydown", event => {
+      // Let the dialog's native Escape cancellation run without closing settings.
+      if (event.key === "Escape") event.stopPropagation();
+    });
+    dialog.addEventListener("click", event => {
+      if (event.target === dialog) {
+        const bounds = dialog.getBoundingClientRect();
+        if (event.clientX < bounds.left || event.clientX > bounds.right
+            || event.clientY < bounds.top || event.clientY > bounds.bottom) dialog.close("cancel");
+      }
+    });
+    dialog.addEventListener("close", () => {
+      const confirmed = dialog.returnValue === "confirm";
+      dialog.remove();
+      resolve(confirmed);
+    }, { once: true });
+    dialog.showModal();
+  });
+}
 
 function openSettings() {
   if (!drawer.hidden) return; // already open; don't double-bind listeners
@@ -4165,6 +4415,7 @@ function openSettings() {
 }
 function closeSettings() {
   if (drawer.hidden) return; // already closed
+  clearDrawerActionError();
   drawer.hidden = true;
   state.settingsView = "menu";
   deactivateDialog(drawer);
@@ -4182,6 +4433,7 @@ function escCloseDrawer(e) {
   if (!drawer.hidden) {
     e.stopPropagation();
     if (state.settingsView !== "menu") {
+      clearDrawerActionError();
       state.settingsView = "menu";
       renderDrawerBody();
       focusDialogStart(drawer, "[data-settings-view]");
@@ -4213,6 +4465,7 @@ function renderDrawerHead() {
 // Switch to a sub-page (or "menu" to go back to the main menu). Each
 // invocation re-renders the body and updates the header.
 function setSettingsView(view) {
+  if (view !== state.settingsView) clearDrawerActionError();
   state.settingsView = view;
   renderDrawerBody();
   if (view === "tui") void refreshAllTuiCapabilities({ includeRemote: true });
@@ -4393,6 +4646,7 @@ function renderSettingsMenuBody() {
           <div class="settings-menu__blurb">${escapeHtml(tr(v.blurbKey))}</div>
         </div>
         <div class="settings-menu__count">${count}</div>
+        <span class="settings-menu__arrow" aria-hidden="true">›</span>
       </div>`;
   }).join("");
   return items;
@@ -5333,12 +5587,7 @@ function wireDrawerDelegation() {
       const machine = state.tuiMachines[machineKey];
       const tool = machine?.tools?.find(item => item.toolKey === toolKey);
       if (!tool) return;
-      if (!window.confirm(tr("tui.installConfirm", {
-        tool: tool.toolName,
-        package: tool.installPackage,
-        manager: tool.installManager,
-        machine: machine.label || tr("tui.localMachine"),
-      }))) return;
+      if (!await confirmToolChange(tool, machine, false)) return;
       const installKey = `${machineKey}:${toolKey}`;
       state.tuiInstallingKeys.add(installKey);
       renderDrawerBody();
@@ -5372,13 +5621,7 @@ function wireDrawerDelegation() {
       const machine = state.tuiMachines[machineKey];
       const tool = machine?.tools?.find(item => item.toolKey === toolKey);
       if (!tool?.installed || !tool.updateAvailable) return;
-      if (!window.confirm(tr("tui.upgradeConfirm", {
-        tool: tool.toolName,
-        machine: machine.label || tr("tui.localMachine"),
-        version: tool.latestVersion || tr("tui.versionUnknown"),
-        package: tool.installPackage,
-        manager: tool.installManager,
-      }))) return;
+      if (!await confirmToolChange(tool, machine, true)) return;
       const upgradeKey = `${machineKey}:${toolKey}`;
       state.tuiUpgradingKeys.add(upgradeKey);
       renderDrawerBody();
@@ -5522,6 +5765,7 @@ function wireDrawerBackButton() {
 // drawerBody contents, so per-form listeners would be lost). Dispatch
 // by the closest <form>'s id to the right submit handler.
 async function submitDrawerForm(form, e) {
+  clearDrawerActionError();
   const fd = new FormData(form);
   if (form.matches("[data-web-development-form]")) {
     const rawId = form.dataset.webDevelopmentId || "";
@@ -5777,6 +6021,7 @@ function buildLedgerRows(matching, { includeCollapsed = true } = {}) {
 }
 
 function applyFilters() {
+  if (state.projectOrder === "git") void ensureRepositoryGroups();
   const model = buildLedgerModel();
   state.filtered = model.ordered;
   state.matchingCount = model.matching.length;
@@ -6004,18 +6249,20 @@ const _gitInflight = new Map();
 function patchGitSyncBadge(projectId) {
   const entry = ledger.querySelector(projectEntrySelector(projectId));
   if (!entry) return;
-  const body = entry.querySelector(".entry__body");
-  if (!body) return;
-  const current = body.querySelector(".entry__git-sync");
+  const details = entry.querySelector(".entry__details");
+  if (!details) return;
+  const current = details.querySelector(".entry__git-sync");
   const project = state.all.find(item => item.id === projectId);
   const html = project ? projectGitSyncBadgeHtml(project) : "";
   if (current) {
     if (html) current.outerHTML = html;
     else current.remove();
   } else if (html) {
-    const source = body.querySelector(".entry__source");
-    source?.insertAdjacentHTML("afterend", html);
+    details.insertAdjacentHTML("beforeend", html);
   }
+  // Badges may wrap onto a third line in a narrow ledger. Refresh geometry
+  // without replacing editable row nodes or losing the current scroll anchor.
+  requestAnimationFrame(renderVirtualLedger);
 }
 
 function renderCachedFootGit(project, info) {
@@ -6484,6 +6731,12 @@ function showFirstRunError(msg) {
 function showActionError(msg) {
   const text = String(msg ?? "");
   setStatus(tr("status.errorPrefix", { text }));
+  if (!drawer.hidden) {
+    drawerActionAlert.textContent = text;
+    drawerActionAlert.hidden = !text;
+    if (text) drawerActionAlert.setAttribute("role", "alert");
+    else drawerActionAlert.removeAttribute("role");
+  }
 }
 
 /* ── auto-refresh ───────────────────────────────────────── */
@@ -6656,6 +6909,7 @@ function setLanguage(lang) {
 // guard against empty arrays). Also re-localizes dynamic inputs that the
 // drawer injects via `data-i18n-placeholder`.
 function applyLocalizedUI() {
+  projectReview.localize();
   localizeStaticHtml();
   // Re-apply placeholders to dynamically-injected form inputs (drawer is
   // rebuilt by renderDrawerBody, which runs below, so this mostly covers
@@ -6686,18 +6940,35 @@ function pushLangToTray() {
 // strip on every tick when state.tools is unchanged.
 let _lastToolsSig = null;
 function renderTools() {
-  const sig = JSON.stringify(state.tools) + "|" + state.tool;
+  const updates = new Map((state.tuiMachines.local?.tools || [])
+    .filter(tool => tool.installed && tool.updateChecked && !tool.updateCheckError && tool.updateAvailable)
+    .map(tool => [tool.toolKey, tool]));
+  const sig = JSON.stringify([state.tools, state.tool, [...updates], currentLang()]);
   if (sig === _lastToolsSig) return;
   _lastToolsSig = sig;
   const nav = document.getElementById("filters");
-  const chips = state.tools.map(t =>
-    `<button class="chip" data-tool="${escapeHtml(t.toolKey)}"><i class="dot ${toolDotClass(t.toolKey)}" style="background:${toolColor(t.toolKey)}"></i>${escapeHtml(t.toolName)}</button>`
-  ).join("");
+  const chips = state.tools.map(t => {
+    const update = updates.get(t.toolKey);
+    const hint = update ? tr("tui.toolbarUpdateHint", {
+      tool: t.toolName, current: update.version || tr("tui.versionUnknown"),
+      latest: update.latestVersion || tr("tui.versionUnknown"),
+    }) : "";
+    return `<span class="tool-filter"><button class="chip ${state.tool === t.toolKey ? "is-active" : ""}" data-tool="${escapeHtml(t.toolKey)}">${toolIcon(t.toolKey)}${escapeHtml(t.toolName)}</button>${update ? `<button class="tool-filter__update" data-tool-update="${escapeHtml(t.toolKey)}" title="${escapeHtml(hint)}" aria-label="${escapeHtml(hint)}">${escapeHtml(tr("tui.toolbarUpdate"))}</button>` : ""}</span>`;
+  }).join("");
   nav.innerHTML = `<button class="chip ${state.tool==="all"?"is-active":""}" data-tool="all">ALL</button>${chips}`;
 }
 
 /* ── wire UI ────────────────────────────────────────────── */
 const searchInput = document.getElementById("searchInput");
+document.getElementById("filters").addEventListener("click", event => {
+  const update = event.target.closest("[data-tool-update]");
+  if (!update) return;
+  openSettings();
+  setSettingsView("tui");
+  const row = drawer.querySelector(`[data-tui-machine="local"] [data-tui-tool="${CSS.escape(update.dataset.toolUpdate)}"]`);
+  row?.scrollIntoView({ block: "nearest" });
+  row?.querySelector("[data-tui-upgrade]")?.focus();
+});
 searchInput.addEventListener("input", e => {
   state.query = e.target.value;
   reloadCoordinator.invalidateFull();
@@ -6727,6 +6998,9 @@ wireChipGroup("filters", "tool", renderTools);
 document.getElementById("projectOrderFilters").addEventListener("click", e => {
   const chip = e.target.closest(".chip");
   if (!chip || !PROJECT_ORDER_MODES.has(chip.dataset.projectOrder)) return;
+  if (chip.dataset.projectOrder === "git") {
+    for (const [key, result] of repositoryGroups) if (result.error) repositoryGroups.delete(key);
+  }
   state.projectOrder = chip.dataset.projectOrder;
   try { localStorage.setItem(PROJECT_ORDER_KEY, state.projectOrder); } catch {}
   renderProjectOrder();

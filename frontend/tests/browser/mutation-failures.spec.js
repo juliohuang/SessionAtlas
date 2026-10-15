@@ -263,6 +263,14 @@ test("failed group rename and create preserve canonical name and form draft", as
   await expect(page.locator('#groupForm [name="name"]')).toHaveValue("Draft group");
   await expect(page.locator('.group-row[data-id="3"]')).toBeVisible();
   await expect(page.locator("#footStatus")).toContainText("create_group denied");
+  const drawerAlert = page.locator('#drawer [role="alert"]');
+  await expect(drawerAlert).toBeVisible();
+  await expect(drawerAlert).toContainText("create_group denied");
+
+  await page.evaluate(() => { window.__rejectCommands = window.__rejectCommands.filter(command => command !== "create_group"); });
+  await page.locator('#groupForm [type="submit"]').click();
+  await expect(page.locator('#groupForm [name="name"]')).toHaveValue("");
+  await expect(drawerAlert).toBeHidden();
 });
 
 test("server add followed by scan failure is explicit partial success", async ({ page }) => {

@@ -4,7 +4,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sessionatlas_core::adapter::{
-    adapter_root_for_home, install_manifest_upgrade_file, AdapterRegistry, AdapterSource,
+    adapter_root_for_home, install_manifest_upgrade_file, AdapterRegistry,
 };
 use sessionatlas_core::config as core_config;
 use sessionatlas_core::content_index::content_match_snippet;
@@ -28,9 +28,12 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_notification::NotificationExt;
 
 mod content_controls;
+mod git_group;
+mod git_review;
 mod process;
 mod pty;
 mod security;
+mod session_access;
 mod session_cleanup;
 mod tui_tools;
 
@@ -136,16 +139,7 @@ fn adapter_selected(
             .enabled(config)
             .any(|candidate| candidate.id.eq_ignore_ascii_case(&adapter.id)));
     }
-    Ok(tui_preference(server_id, &adapter.id)?.unwrap_or(adapter.source == AdapterSource::Bundled))
-}
-
-fn adapter_probe_selected(
-    server_id: Option<i64>,
-    config: &core_config::AppConfig,
-    registry: &AdapterRegistry,
-    adapter: &TuiDefinition,
-) -> Result<bool, String> {
-    adapter_selected(server_id, config, registry, adapter)
+    Ok(tui_preference(server_id, &adapter.id)?.unwrap_or(adapter.is_enabled_by_default()))
 }
 
 fn write_local_adapter_selection(tool_key: &str, enabled: bool) -> Result<(), String> {
@@ -2202,6 +2196,7 @@ fn local_shell_command(path: &str) -> CommandBuilder {
     let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
     let mut command = CommandBuilder::new(program);
+    command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
     command.cwd(path);
     command
 }
@@ -3913,37 +3908,58 @@ fn preserve_tui_update_metadata(
     }
 }
 
+fn probe_local_tui_tools(
+    config: &core_config::AppConfig,
+    registry: &AdapterRegistry,
+    mut detect: impl FnMut(&TuiDefinition) -> tui_tools::DetectedTui,
+) -> Vec<TuiCapability> {
+    registry
+        .adapters()
+        .iter()
+        .map(|definition| {
+            let support_error = adapter_support_error(definition, false, std::env::consts::OS);
+            // Discovery must also see disabled and newly imported adapters:
+            // the UI requires an installed command before allowing enablement.
+            let detected = if support_error.is_none() {
+                detect(definition)
+            } else {
+                tui_tools::DetectedTui {
+                    installed: false,
+                    version: None,
+                }
+            };
+            let selected = registry
+                .enabled(config)
+                .any(|adapter| adapter.id == definition.id);
+            make_tui_capability(
+                definition,
+                detected,
+                selected,
+                support_error.is_none() && tui_tools::local_manager_path(definition).is_some(),
+                support_error,
+            )
+        })
+        .collect()
+}
+
+fn remote_tui_probe_catalog(registry: &AdapterRegistry, os_family: &str) -> Vec<TuiDefinition> {
+    registry
+        .adapters()
+        .iter()
+        .filter(|definition| adapter_support_error(definition, true, os_family).is_none())
+        .cloned()
+        .collect()
+}
+
 fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, String> {
     let (config, registry) = load_adapter_context()?;
     let catalog = registry.adapters().to_vec();
     match server_id {
         None => {
             let runner = TimeoutProcessRunner::new(TUI_LOCAL_PROBE_TIMEOUT);
-            let tools = catalog
-                .iter()
-                .map(|definition| {
-                    let support_error =
-                        adapter_support_error(definition, false, std::env::consts::OS);
-                    let probe_selected =
-                        adapter_probe_selected(None, &config, &registry, definition)?;
-                    let detected = if support_error.is_none() && probe_selected {
-                        tui_tools::detect_local(definition, &runner)
-                    } else {
-                        tui_tools::DetectedTui {
-                            installed: false,
-                            version: None,
-                        }
-                    };
-                    Ok::<TuiCapability, String>(make_tui_capability(
-                        definition,
-                        detected,
-                        adapter_selected(None, &config, &registry, definition)?,
-                        support_error.is_none()
-                            && tui_tools::local_manager_path(definition).is_some(),
-                        support_error,
-                    ))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let tools = probe_local_tui_tools(&config, &registry, |definition| {
+                tui_tools::detect_local(definition, &runner)
+            });
             Ok(TuiMachineCapabilities {
                 source: "local".to_string(),
                 server_id: None,
@@ -3954,19 +3970,7 @@ fn probe_tui_machine(server_id: Option<i64>) -> Result<TuiMachineCapabilities, S
         }
         Some(server_id) => {
             let server = load_remote_server(server_id)?;
-            let probe_catalog = catalog
-                .iter()
-                .filter(|definition| {
-                    adapter_support_error(definition, true, &server.os_family).is_none()
-                })
-                .map(|definition| {
-                    adapter_probe_selected(Some(server_id), &config, &registry, definition)
-                        .map(|selected| selected.then(|| definition.clone()))
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+            let probe_catalog = remote_tui_probe_catalog(&registry, &server.os_family);
             let remote_command = tui_tools::remote_probe_script(&probe_catalog)?;
             let command = build_ssh_command(
                 &server.user,
@@ -4334,9 +4338,7 @@ fn selected_adapter_ids(
 ) -> Vec<String> {
     config.enabled_adapters.clone().unwrap_or_else(|| {
         registry
-            .adapters()
-            .iter()
-            .filter(|adapter| adapter.source == AdapterSource::Bundled)
+            .enabled(config)
             .map(|adapter| adapter.id.clone())
             .collect()
     })
@@ -6042,6 +6044,129 @@ async fn get_git_info(path: String) -> Result<GitInfo, String> {
         .map_err(|error| format!("git info worker panicked: {error}"))?
 }
 
+#[tauri::command]
+async fn list_git_changes(path: String) -> Result<git_review::GitReview, String> {
+    tauri::async_runtime::spawn_blocking(move || git_review::list_changes(&path))
+        .await
+        .map_err(|error| format!("Git review worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn list_project_sessions(
+    path: String,
+) -> Result<sessionatlas_core::session_history::SessionHistory, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if core_path::normalize_native(&path).is_none() {
+            return Err("Project path must be absolute".to_string());
+        }
+        let (_, registry) = load_adapter_context()?;
+        Ok(session_access::project_history(&path, &registry))
+    })
+    .await
+    .map_err(|error| format!("History worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn check_session_resume(
+    path: String,
+    tool_key: String,
+    session_id: Option<String>,
+    server_id: Option<i64>,
+) -> Result<session_access::ResumeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        check_session_resume_inner(&path, &tool_key, session_id.as_deref(), server_id)
+    })
+    .await
+    .map_err(|error| format!("Resume check worker failed: {error}"))?
+}
+
+fn check_session_resume_inner(
+    path: &str,
+    tool_key: &str,
+    session_id: Option<&str>,
+    server_id: Option<i64>,
+) -> Result<session_access::ResumeStatus, String> {
+    use session_access::ResumeStatus;
+    validate_tool_key(tool_key)?;
+    if let Some(id) = session_id {
+        validate_session_id(id)?;
+    }
+    let (config, registry) = load_adapter_context()?;
+    let Some(adapter) = registry.find(tool_key) else {
+        return Ok(ResumeStatus::blocked("unsupported_adapter", ""));
+    };
+    if let Err(error) = ensure_adapter_supports_machine(adapter, server_id) {
+        return Ok(ResumeStatus::blocked("unsupported_platform", error));
+    }
+    if !adapter_selected(server_id, &config, &registry, adapter)? {
+        return Ok(ResumeStatus::blocked("tool_disabled", ""));
+    }
+    if adapter.launch_argv(session_id).is_err() {
+        return Ok(ResumeStatus::blocked("unsupported_resume", ""));
+    }
+    if let Some(server_id) = server_id {
+        let server = load_remote_server(server_id)?;
+        let port = u16::try_from(server.port).map_err(|_| "Invalid SSH port")?;
+        let command = format!("if [ -d {} ]; then printf SESSIONATLAS_RESUME_DIR_OK; else printf SESSIONATLAS_RESUME_DIR_MISSING; fi", quote_remote_path(path)?);
+        let spec = build_ssh_command(
+            &server.user,
+            &server.host,
+            port,
+            server.identity_file.as_deref(),
+            &command,
+        )?;
+        let output = match TimeoutProcessRunner::with_limits(Duration::from_secs(10), 16 * 1024)
+            .output(&spec)
+        {
+            Ok(output) if output.success => output,
+            Ok(output) => {
+                return Ok(ResumeStatus::blocked(
+                    "ssh_unavailable",
+                    classify_ssh_failure(
+                        &server.user,
+                        &server.host,
+                        port,
+                        &String::from_utf8_lossy(&output.stderr),
+                    ),
+                ))
+            }
+            Err(error) => return Ok(ResumeStatus::blocked("ssh_unavailable", error)),
+        };
+        if !String::from_utf8_lossy(&output.stdout).contains("SESSIONATLAS_RESUME_DIR_OK") {
+            return Ok(ResumeStatus::blocked("path_missing", ""));
+        }
+        // Existing capability discovery owns executable and platform checks.
+        // A native remote session ID is not inspected by the local history reader.
+        return Ok(ResumeStatus::ready(false));
+    }
+    if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
+        return Ok(ResumeStatus::blocked("path_missing", ""));
+    }
+    if !tui_tools::local_command_available(adapter) {
+        return Ok(ResumeStatus::blocked("tool_missing", ""));
+    }
+    match session_id {
+        None => Ok(ResumeStatus::ready(true)),
+        Some(id) => {
+            let history = session_access::project_history_for(path, &registry, Some(tool_key));
+            Ok(session_access::history_resume_status(
+                &history, tool_key, id,
+            ))
+        }
+    }
+}
+
+#[tauri::command]
+async fn read_git_diff(
+    path: String,
+    file_path: String,
+    staged: bool,
+) -> Result<git_review::GitDiff, String> {
+    tauri::async_runtime::spawn_blocking(move || git_review::read_diff(&path, &file_path, staged))
+        .await
+        .map_err(|error| format!("Git diff worker failed: {error}"))?
+}
+
 fn get_git_info_inner(
     path: String,
     remote_checked: bool,
@@ -6974,6 +7099,10 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            list_project_sessions,
+            check_session_resume,
+            list_git_changes,
+            read_git_diff,
             list_projects,
             search_projects,
             list_project_ignores,
@@ -7017,6 +7146,7 @@ pub fn run() {
             read_text_file,
             list_dir,
             get_git_info,
+            git_group::get_git_repository_group,
             refresh_git_sync,
             refresh_remote_git_info,
             analyze_session_cleanup,
@@ -7998,8 +8128,7 @@ mod baseline_tests {
         );
     }
 
-    #[test]
-    fn adapter_probe_selection_defaults_to_official_and_requires_extension_enablement() {
+    fn adapter_probe_test_registry() -> AdapterRegistry {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("adapters");
         let source = temporary.path().join("demo.json");
@@ -8012,28 +8141,109 @@ mod baseline_tests {
               "adapterVersion": "1.0.0",
               "command": "demo",
               "launch": { "newArgs": [], "resumeArgs": [] },
-              "scanner": { "handler": "metadata-v1", "dataDirectory": "~/.demo/sessions" }
+              "scanner": { "handler": "metadata-v1", "dataDirectory": "~/.demo/sessions" },
+              "supportsRemote": true
             }"#,
         )
         .unwrap();
         sessionatlas_core::adapter::install_manifest_file(&source, &root).unwrap();
 
-        let config = core_config::AppConfig::default();
-        let registry = AdapterRegistry::load(&root, &config).unwrap();
-        let official = registry.find("codex").unwrap();
-        let extension = registry.find("demo").unwrap();
-        assert!(adapter_probe_selected(None, &config, &registry, official).unwrap());
-        assert!(!adapter_probe_selected(None, &config, &registry, extension).unwrap());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&source).unwrap()).unwrap();
+        manifest["id"] = serde_json::json!("local-only");
+        manifest["supportsRemote"] = serde_json::json!(false);
+        std::fs::write(&source, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        sessionatlas_core::adapter::install_manifest_file(&source, &root).unwrap();
 
-        let mut extension_only = config.clone();
-        extension_only.enabled_adapters = Some(vec!["demo".to_string()]);
-        assert!(!adapter_probe_selected(None, &extension_only, &registry, official).unwrap());
-        assert!(adapter_probe_selected(None, &extension_only, &registry, extension).unwrap());
+        manifest["id"] = serde_json::json!("other-os");
+        manifest["supportsRemote"] = serde_json::json!(true);
+        // The fixture is unsupported on the local test host and on remote Linux.
+        manifest["platforms"] = serde_json::json!([if std::env::consts::OS == "windows" {
+            "macos"
+        } else {
+            "windows"
+        }]);
+        std::fs::write(&source, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        sessionatlas_core::adapter::install_manifest_file(&source, &root).unwrap();
+        AdapterRegistry::load(&root, &core_config::AppConfig::default()).unwrap()
+    }
 
-        let mut enabled = config.clone();
-        enabled.enabled_adapters = Some(vec!["codex".to_string(), "demo".to_string()]);
-        assert!(adapter_probe_selected(None, &enabled, &registry, official).unwrap());
-        assert!(adapter_probe_selected(None, &enabled, &registry, extension).unwrap());
+    #[test]
+    fn local_discovery_finds_disabled_adapters_without_enabling_them() {
+        let registry = adapter_probe_test_registry();
+        for selection in [
+            None,
+            Some(vec![]),
+            Some(vec!["codex".to_string(), "demo".to_string()]),
+        ] {
+            let mut config = core_config::AppConfig::default();
+            config.enabled_adapters = selection;
+            let mut probed = Vec::new();
+            let tools = probe_local_tui_tools(&config, &registry, |adapter| {
+                probed.push(adapter.id.clone());
+                tui_tools::DetectedTui {
+                    installed: true,
+                    version: Some("1.2.3".to_string()),
+                }
+            });
+            assert!(probed.iter().any(|id| id == "codex"));
+            assert!(probed.iter().any(|id| id == "demo"));
+            assert!(!probed.iter().any(|id| id == "other-os"));
+            for id in ["codex", "demo"] {
+                let tool = tools.iter().find(|tool| tool.tool_key == id).unwrap();
+                assert!(tool.installed && tool.supported);
+                assert_eq!(tool.version.as_deref(), Some("1.2.3"));
+                let expected = config
+                    .enabled_adapters
+                    .as_ref()
+                    .map_or(id == "codex", |ids| {
+                        ids.iter().any(|selected| selected == id)
+                    });
+                assert_eq!(tool.adapter_enabled, expected);
+                assert_eq!(tool.enabled, expected);
+            }
+            let demo = tools.iter().find(|tool| tool.tool_key == "demo").unwrap();
+            assert!(!demo.install_available);
+            assert!(demo.install_manager.is_empty());
+            let unsupported = tools
+                .iter()
+                .find(|tool| tool.tool_key == "other-os")
+                .unwrap();
+            assert!(!unsupported.supported && !unsupported.installed && !unsupported.enabled);
+        }
+
+        let tools = probe_local_tui_tools(&core_config::AppConfig::default(), &registry, |_| {
+            tui_tools::DetectedTui {
+                installed: false,
+                version: None,
+            }
+        });
+        assert!(tools.iter().all(|tool| !tool.installed && !tool.enabled));
+    }
+
+    #[test]
+    fn remote_discovery_includes_unselected_manual_adapters_and_enforces_support() {
+        let registry = adapter_probe_test_registry();
+        let catalog = remote_tui_probe_catalog(&registry, "Linux");
+        assert!(catalog.iter().any(|adapter| adapter.id == "codex"));
+        assert!(catalog.iter().any(|adapter| adapter.id == "demo"));
+        assert!(!catalog.iter().any(|adapter| adapter.id == "local-only"));
+        assert!(!catalog.iter().any(|adapter| adapter.id == "other-os"));
+        assert!(remote_tui_probe_catalog(&registry, "unknown").is_empty());
+
+        let script = tui_tools::remote_probe_script(&catalog).unwrap();
+        assert!(script.contains("SESSIONATLAS_TUI:demo:1:"));
+        assert!(!script.contains("SESSIONATLAS_TUI:local-only:"));
+        let (detected, _) =
+            tui_tools::parse_remote_probe(&catalog, "SESSIONATLAS_TUI:demo:1:demo 1.2.3\n");
+        let demo = registry.find("demo").unwrap();
+        for selected in [false, true] {
+            let capability =
+                make_tui_capability(demo, detected["demo"].clone(), selected, false, None);
+            assert!(capability.installed);
+            assert_eq!(capability.enabled, selected);
+            assert!(!capability.install_available);
+        }
     }
 
     #[test]
@@ -8090,6 +8300,14 @@ mod baseline_tests {
             command.get_env("TERM"),
             Some(std::ffi::OsStr::new("xterm-256color"))
         );
+    }
+
+    #[test]
+    fn local_shell_pty_inherits_the_process_path() {
+        let expected = std::env::var_os("PATH").unwrap_or_default();
+        let command = local_shell_command(".");
+
+        assert_eq!(command.get_env("PATH"), Some(expected.as_os_str()));
     }
 
     #[test]

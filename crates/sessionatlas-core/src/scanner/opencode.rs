@@ -146,7 +146,7 @@ fn is_link_candidate(path: &Path) -> bool {
 /// Candidate database paths in probe order: `~/.local/share/opencode`,
 /// `~/.opencode`, and (only when `SESSIONATLAS_HOME` is blank) the XDG data
 /// home.
-fn candidate_database_paths() -> Vec<PathBuf> {
+pub fn candidate_database_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(home) = home_directory() {
         paths.push(

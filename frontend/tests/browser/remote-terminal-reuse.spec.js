@@ -78,7 +78,7 @@ async function installRemoteTerminalFixture(page) {
           return null;
         },
       },
-      event: { listen: async () => () => {} },
+      event: { listen: async (name, callback) => { (window.__ptyListeners ||= {})[name] = callback; return () => {}; } },
       window: { getCurrentWindow: () => ({ isMaximized: async () => false }) },
     };
   });
@@ -91,13 +91,13 @@ test("same remote server reuses one SSH PTY and switches its tmux target", async
   await page.locator('article.entry[data-id="remote-one"]').click();
   await page.locator('#termsSelectedLaunch [data-tool="codex"]').click();
   await expect(page.locator(".term-tab")).toHaveCount(1);
-  await expect(page.locator(".term-tab__name")).toHaveText("project-one · codex");
+  await expect(page.locator(".term-tab__name")).toHaveText("project-one");
 
   await page.locator('article.entry[data-id="remote-two"]').click();
   await page.locator('#termsSelectedLaunch [data-tool="claude"]').click();
 
   await expect(page.locator(".term-tab")).toHaveCount(1);
-  await expect(page.locator(".term-tab__name")).toHaveText("project-two · claude");
+  await expect(page.locator(".term-tab__name")).toHaveText("project-two");
   await expect(page.locator("#footStatus")).toContainText("development-box");
 
   const calls = await page.evaluate(() => window.__invokeCalls);
@@ -122,14 +122,14 @@ test("failed remote tmux switch keeps the original tab target", async ({ page })
 
   await page.locator('article.entry[data-id="remote-one"]').click();
   await page.locator('#termsSelectedLaunch [data-tool="codex"]').click();
-  await expect(page.locator(".term-tab__name")).toHaveText("project-one · codex");
+  await expect(page.locator(".term-tab__name")).toHaveText("project-one");
 
   await page.evaluate(() => { window.__rejectRemoteSwitch = true; });
   await page.locator('article.entry[data-id="remote-two"]').click();
   await page.locator('#termsSelectedLaunch [data-tool="claude"]').click();
 
   await expect(page.locator(".term-tab")).toHaveCount(1);
-  await expect(page.locator(".term-tab__name")).toHaveText("project-one · codex");
+  await expect(page.locator(".term-tab__name")).toHaveText("project-one");
   await expect(page.locator("#footStatus")).toContainText("switch rejected");
 });
 
@@ -186,4 +186,62 @@ test("IME composition cannot horizontally shift the terminal workspace", async (
   expect(result.resizeCountAfterEnd).toBeGreaterThan(result.resizeCountBeforeEnd);
   expect(workspaceAfter.x).toBe(workspaceBefore.x);
   expect(workspaceAfter.width).toBe(workspaceBefore.width);
+});
+
+test("terminal and project show waiting, running, completion and failure", async ({ page }) => {
+  await installRemoteTerminalFixture(page);
+  await page.goto("/index.html");
+  await page.locator('article.entry[data-id="remote-two"]').click();
+  await page.locator('#termsSelectedLaunch [data-tool="claude"]').click();
+  const badge = page.locator('.term-tab [data-terminal-status]');
+  await expect(badge).toHaveAttribute("data-terminal-status", "ready");
+  const output = async (data) => page.evaluate(data => window.__ptyListeners["pty-data"]({payload:{id:101,data}}), data);
+  await output("Do you want to pro");
+  await output("ceed?\r\n> 1. Yes\r\n 2. No\r\nEsc to cancel ? Tab to amend");
+  await expect(badge).toHaveAttribute("data-terminal-status", "waiting");
+  await expect(page.locator('article[data-id="remote-two"] [data-terminal-status]')).toHaveAttribute("data-terminal-status", "waiting");
+  await output("\x1b[2J\x1b[HWorking (esc to interrupt)");
+  await expect(badge).toHaveAttribute("data-terminal-status", "running");
+  await output("\x1b[2J\x1b[HWorked for 2m 3s\r\n\u276f ");
+  await expect(badge).toHaveAttribute("data-terminal-status", "completed");
+  await page.evaluate(() => window.__ptyListeners["pty-exit"]({payload:{id:101,exitCode:1,readError:null}}));
+  await expect(badge).toHaveAttribute("data-terminal-status", "failed");
+  await output("\x1b[2J\x1b[HWorked for 1m\r\n\u276f ");
+  await expect(badge).toHaveAttribute("data-terminal-status", "failed");
+});
+
+test("status updates preserve unfocused drafts and reject stale completion", async ({ page }) => {
+  await installRemoteTerminalFixture(page);
+  await page.goto("/index.html");
+  const entry = page.locator('article.entry[data-id="remote-two"]');
+  await entry.click();
+  await page.locator('#termsSelectedLaunch [data-tool="claude"]').click();
+  await entry.locator('[data-expand-toggle]').click();
+  const draft = entry.locator('[data-queue-input]');
+  await draft.fill("Keep my unsubmitted task");
+  const input = page.locator('.term-pane.is-active .xterm-helper-textarea');
+  await input.focus();
+  const badge = page.locator('.term-tab [data-terminal-status]');
+  const output = async data => page.evaluate(data => window.__ptyListeners['pty-data']({payload:{id:101,data}}), data);
+  await output("Do you want to proceed?\r\n1. Yes\r\n2. No\r\nEsc to cancel");
+  await expect(badge).toHaveAttribute('data-terminal-status', 'waiting');
+  await expect(draft).toHaveValue("Keep my unsubmitted task");
+  await input.press('Escape');
+  await output("\x1b[2J\x1b[H❯ ");
+  await expect(badge).toHaveAttribute('data-terminal-status', 'ready');
+  await output("\x1b[2J\x1b[HWorked for 2m 3s\r\n❯ ");
+  await expect(badge).toHaveAttribute('data-terminal-status', 'completed');
+  await input.press('Enter');
+  await expect(badge).toHaveAttribute('data-terminal-status', 'running');
+  await output("\r\nNew request\r\nReading files...");
+  await expect(badge).toHaveAttribute('data-terminal-status', 'running');
+  // A redraw of the old completed screen is not a new completion event.
+  await output("\x1b[2J\x1b[HWorked for 2m 3s\r\n❯ ");
+  await expect(badge).toHaveAttribute('data-terminal-status', 'running');
+  await output("\x1b[2J\x1b[HWorked for 3m 4s\r\n❯ ");
+  await expect(badge).toHaveAttribute('data-terminal-status', 'completed');
+  await page.evaluate(() => window.__ptyListeners['pty-exit']({payload:{id:101,exitCode:1}}));
+  await expect(badge).toHaveAttribute('data-terminal-status', 'failed');
+  await expect(draft).toHaveValue("Keep my unsubmitted task");
+  await expect(input).toBeFocused();
 });

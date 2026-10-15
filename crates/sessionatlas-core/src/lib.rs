@@ -32,4 +32,5 @@ pub mod process;
 pub mod scan_coordinator;
 pub mod scanner;
 pub mod security;
+pub mod session_history;
 pub mod store;

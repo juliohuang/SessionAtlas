@@ -1,6 +1,43 @@
 import { expect, test } from "@playwright/test";
 
-test("local and remote TUI settings gate launch and install from an allowlisted action", async ({ page }) => {
+test("toolbar update notices require a successful local check", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("sessionatlas.lang", "zh");
+    const tools = [
+      { toolKey: "codex", toolName: "Codex CLI", installed: true, updateChecked: true, updateAvailable: true, latestVersion: "2.0.0" },
+      { toolKey: "claude", toolName: "Claude Code", installed: true, updateChecked: false, updateAvailable: true },
+      { toolKey: "pi", toolName: "Pi Coding Agent", installed: true, updateChecked: true, updateAvailable: true, updateCheckError: "offline" },
+      { toolKey: "kimi", toolName: "Kimi CLI", installed: false, updateChecked: true, updateAvailable: true },
+      { toolKey: "aider", toolName: "Aider", installed: true, updateChecked: true, updateAvailable: false },
+    ].map(tool => ({ enabled: true, version: "1.0.0", ...tool }));
+    const capabilities = { source: "local", label: "Local", tools };
+    window.__updateCalls = 0;
+    window.__TAURI__ = {
+      core: { invoke: async command => {
+        if (command === "local_index_exists") return true;
+        if (command === "list_projects") return [];
+        if (command === "list_tools") return tools.map(({ toolKey, toolName }) => ({ toolKey, toolName }));
+        if (command === "probe_tui_capabilities") return { ...capabilities, tools: tools.map(tool => ({ ...tool, updateChecked: false })) };
+        if (command === "check_tui_updates") { window.__updateCalls++; return capabilities; }
+        if (command === "list_group_assignments") return {};
+        if (command === "get_group_revision") return 0;
+        return [];
+      } },
+      event: { listen: async () => () => {} },
+      window: { getCurrentWindow: () => ({ isMaximized: async () => false }) },
+    };
+  });
+  await page.goto("/index.html");
+  await expect(page.locator("[data-tool-update]")).toHaveCount(1);
+  await expect(page.locator('[data-tool-update="codex"]')).toHaveText("可更新");
+  await expect(page.locator('[data-tool-update="codex"]')).toHaveAttribute("title", /本机.*1\.0\.0.*2\.0\.0/);
+  await page.locator('#filters [data-tool="codex"]').click();
+  await expect(page.locator('#filters [data-tool="codex"]')).toHaveClass(/is-active/);
+  expect(await page.evaluate(() => window.__updateCalls)).toBe(1);
+  await page.locator("#filters").screenshot({ path: testInfo.outputPath("updates.png"), animations: "disabled" });
+});
+
+test("local and remote TUI settings gate launch and install from an allowlisted action", async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     window.__codexAdapter = {
       adapterEnabled: true,
@@ -88,6 +125,9 @@ test("local and remote TUI settings gate launch and install from an allowlisted 
             const result = capabilities(true);
             result.tools[0] = { ...result.tools[0], latestVersion: "1.3.0", updateChecked: true, updateAvailable: true };
             result.tools[1] = { ...result.tools[1], installed: true, enabled: true, adapterEnabled: true, version: "2.0.0", latestVersion: "2.0.0", updateChecked: true };
+            if (window.__tuiCalls.filter(call => call.command === "check_tui_updates").length === 1) {
+              result.tools[1] = capabilities(true).tools[1];
+            }
             return new Promise(resolve => {
               window.__finishTuiCheck = () => resolve(result);
             });
@@ -109,8 +149,15 @@ test("local and remote TUI settings gate launch and install from an allowlisted 
 
   page.on("dialog", dialog => dialog.accept());
   await page.goto("/index.html");
-  await page.locator("#settingsBtn").click();
-  await page.locator('[data-settings-view="tui"]').click();
+  await expect.poll(() => page.evaluate(() => typeof window.__finishTuiCheck)).toBe("function");
+  await expect(page.locator('[data-tool-update="codex"]')).toHaveCount(0);
+  await page.evaluate(() => window.__finishTuiCheck());
+  const toolbarUpdate = page.locator('[data-tool-update="codex"]');
+  await expect(toolbarUpdate).toBeVisible();
+  await expect(toolbarUpdate).toHaveAttribute("title", /1\.2\.3.*1\.3\.0/);
+  await toolbarUpdate.click();
+  await expect(page.locator('[data-tui-machine="local"]')).toBeVisible();
+  await expect(page.locator('#filters [data-tool="all"]')).toHaveClass(/is-active/);
 
   const codex = page.locator('[data-tui-tool="codex"]');
   await expect(codex).toContainText("1.2.3");
@@ -121,6 +168,7 @@ test("local and remote TUI settings gate launch and install from an allowlisted 
   await expect(claude).toContainText("Not installed");
   await expect(claude.locator("[data-tui-toggle]")).toBeDisabled();
   await claude.locator("[data-tui-install]").click();
+  await page.locator('.tool-confirm button[value="confirm"]').click();
   await expect(claude).toContainText("2.0.0");
 
   await codex.locator("[data-tui-adapter-rollback]").click();
@@ -142,10 +190,28 @@ test("local and remote TUI settings gate launch and install from an allowlisted 
   await page.evaluate(() => window.__finishTuiCheck());
   await expect(codex).toContainText("Version 1.3.0 is available");
   await codex.locator("[data-tui-upgrade]").click();
+  const confirmation = page.locator("dialog.tool-confirm");
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation).toContainText("1.2.3");
+  await expect(confirmation).toContainText("1.3.0");
+  await expect(confirmation.locator('[value="cancel"]')).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(confirmation.locator('[value="confirm"]')).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(confirmation.locator("summary")).toBeFocused();
+  await confirmation.screenshot({ path: testInfo.outputPath("upgrade-confirm.png"), animations: "disabled" });
+  await page.keyboard.press("Escape");
+  await expect(confirmation).toHaveCount(0);
+  await expect(codex).toBeVisible();
+  expect(await page.evaluate(() => window.__tuiCalls.filter(call => call.command === "upgrade_tui"))).toEqual([]);
+  await codex.locator("[data-tui-upgrade]").click();
+  await page.locator('.tool-confirm button[value="confirm"]').click();
   await expect(codex).toContainText("Latest version 1.3.0");
+  await expect(toolbarUpdate).toHaveCount(0);
 
   const calls = await page.evaluate(() => window.__tuiCalls);
   expect(calls).toEqual([
+    { command: "check_tui_updates", payload: { serverId: null } },
     { command: "set_tui_enabled", payload: { serverId: null, toolKey: "codex", enabled: false } },
     { command: "install_tui", payload: { serverId: null, toolKey: "claude" } },
     { command: "rollback_tui_adapter", payload: { toolKey: "codex" } },

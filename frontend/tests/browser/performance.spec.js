@@ -147,8 +147,10 @@ test("2000-project ledger keeps a bounded DOM and fast filtering", async ({ page
   await expect(groups.first()).toHaveAttribute("aria-expanded", "true");
   const firstExpand = page.locator("#ledger article.entry").first().locator("[data-expand-toggle]");
   const disclosureBox = await firstExpand.boundingBox();
-  expect(disclosureBox?.width || 0).toBeGreaterThanOrEqual(30);
-  expect(disclosureBox?.height || 0).toBeGreaterThanOrEqual(30);
+  // Chromium can report 29.999984 CSS px for a 30px control at fractional
+  // virtual-row offsets. Keep the 30px contract, ignoring only subpixel noise.
+  expect(Math.round((disclosureBox?.width || 0) * 1000) / 1000).toBeGreaterThanOrEqual(30);
+  expect(Math.round((disclosureBox?.height || 0) * 1000) / 1000).toBeGreaterThanOrEqual(30);
   const controlDragCanceled = await firstExpand.evaluate(button => {
     const event = new DragEvent("dragstart", {
       bubbles: true,

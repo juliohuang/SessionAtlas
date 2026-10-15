@@ -115,7 +115,7 @@ impl KimiScanner {
 /// Resolves the Kimi Code home, mirroring `KimiScanner.ResolveKimiHome`: a
 /// non-blank `SESSIONATLAS_HOME` pins `~/.kimi-code` under it; otherwise a
 /// non-blank `KIMI_CODE_HOME` wins; otherwise `~/.kimi-code`.
-fn resolve_kimi_home() -> Option<PathBuf> {
+pub fn resolve_kimi_home() -> Option<PathBuf> {
     let application_home = home_directory()?;
     if env_var_non_blank("SESSIONATLAS_HOME") {
         return Some(application_home.join(".kimi-code"));

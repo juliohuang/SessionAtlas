@@ -175,6 +175,15 @@ enum ResolveSessionsError {
     SourceRead,
 }
 
+/// Resolve the same bounded, configured history location used by the scanner.
+/// This reads only Pi's settings and does not write scanner caches.
+pub fn history_source_directory() -> Result<PathBuf, String> {
+    let agent_dir = resolve_agent_dir().ok_or("Pi home directory is unavailable")?;
+    let context = ScanBudget::default().context();
+    resolve_sessions_dir_bounded(&agent_dir, &context)
+        .map_err(|_| "Pi session directory settings could not be read safely".to_string())
+}
+
 fn resolve_sessions_dir_bounded(
     agent_dir: &Path,
     context: &ScanContext,
